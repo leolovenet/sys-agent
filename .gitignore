@@ -6,3 +6,6 @@ build
 *.nso
 *.nsp
 *.npdm
+__pycache__/
+*.pyc
+sys-botbase/430000000000000B/

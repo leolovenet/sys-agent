@@ -19,6 +19,7 @@ HiddbgHdlsState controllerState = { 0 };
 HiddbgKeyboardAutoPilotState dummyKeyboardState = { 0 };
 
 Handle debughandle = 0;
+static Mutex debugMutex;
 u64 buttonClickSleepTime = 50;
 u64 keyPressSleepTime = 25;
 u64 pollRate = 17; // polling is linked to screen refresh rate (system UI) or game framerate. Most cases this is 1/60 or 1/30
@@ -28,24 +29,53 @@ bool initflag = 0;
 u8* workmem = NULL;
 size_t workmem_size = 0x1000;
 
-void attach()
+void initDebugMutex(void)
 {
+    mutexInit(&debugMutex);
+}
+
+static Result attachInternal(bool reportErrors)
+{
+    mutexLock(&debugMutex);
     u64 pid = 0;
     Result rc = pmdmntGetApplicationProcessId(&pid);
-    if (R_FAILED(rc) && debugResultCodes)
-        printf("pmdmntGetApplicationProcessId: %d\n", rc);
+    if (R_FAILED(rc)) {
+        debughandle = 0;
+        if (reportErrors && debugResultCodes)
+            printf("pmdmntGetApplicationProcessId: %d\n", rc);
+        return rc;
+    }
 
-    if (debughandle != 0)
+    if (debughandle != 0) {
         svcCloseHandle(debughandle);
+        debughandle = 0;
+    }
 
     rc = svcDebugActiveProcess(&debughandle, pid);
-    if (R_FAILED(rc) && debugResultCodes)
-        printf("svcDebugActiveProcess: %d\n", rc);
+    if (R_FAILED(rc)) {
+        debughandle = 0;
+        if (reportErrors && debugResultCodes)
+            printf("svcDebugActiveProcess: %d\n", rc);
+    }
+    return rc;
+}
+
+Result attach(void)
+{
+    return attachInternal(true);
+}
+
+Result attachQuiet(void)
+{
+    return attachInternal(false);
 }
 
 void detach() {
-    if (debughandle != 0)
+    if (debughandle != 0) {
         svcCloseHandle(debughandle);
+        debughandle = 0;
+    }
+    mutexUnlock(&debugMutex);
 }
 
 u64 getMainNsoBase(u64 pid) {

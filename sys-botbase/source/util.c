@@ -84,6 +84,29 @@ u64 parseStringToInt(char* arg) {
     return ret;
 }
 
+bool tryParseStringToInt(const char* arg, u64* value)
+{
+    if (arg == NULL || value == NULL || arg[0] == 0 || arg[0] == '-')
+        return false;
+
+    int base = 10;
+    const char* digits = arg;
+    if (arg[0] == '0' && (arg[1] == 'x' || arg[1] == 'X')) {
+        base = 16;
+        digits += 2;
+        if (digits[0] == 0)
+            return false;
+    }
+
+    char* end = NULL;
+    errno = 0;
+    const unsigned long long parsed = strtoull(digits, &end, base);
+    if (errno != 0 || end == digits || *end != 0)
+        return false;
+    *value = (u64)parsed;
+    return true;
+}
+
 s64 parseStringToSignedLong(char* arg) {
     if (strlen(arg) > 2) {
         if (arg[1] == 'x' || arg[2] == 'x') {

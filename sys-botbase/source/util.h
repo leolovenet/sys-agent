@@ -6,6 +6,7 @@ extern bool debugResultCodes;
 
 int setupServerSocket();
 u64 parseStringToInt(char* arg);
+bool tryParseStringToInt(const char* arg, u64* value);
 s64 parseStringToSignedLong(char* arg);
 u8* parseStringToByteBuffer(char* arg, u64* size);
 HidNpadButton parseStringToButton(char* arg);

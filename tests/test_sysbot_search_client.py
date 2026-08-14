@@ -1,0 +1,130 @@
+from __future__ import annotations
+
+import socketserver
+import threading
+import unittest
+
+from client.sysbot_search import SysBotProtocolError, SysBotSearchClient, parse_response
+
+
+class FakeState:
+    def __init__(self) -> None:
+        self.status_calls = 0
+        self.cancelled = False
+        self.addresses = [0x80000010, 0x80000120, 0x80000230]
+
+
+class FakeHandler(socketserver.StreamRequestHandler):
+    def handle(self) -> None:
+        state: FakeState = self.server.state  # type: ignore[attr-defined]
+        for raw in self.rfile:
+            command = raw.decode("ascii").strip().split()
+            if not command:
+                continue
+            if command[0] == "searchCapabilities":
+                response = "OK version=2 modes=bytes,u8,u16,u32,u64 regions=absolute,heap,main alignment=powerOfTwo,max256 endian=little maxPattern=256 chunk=0x40000 maxResults=65536 maxPage=256"
+            elif command[0] in {"searchStart", "searchStartRegion"}:
+                response = "OK session=7 state=queued"
+            elif command[0] == "searchStatus":
+                state.status_calls += 1
+                status = "running" if state.status_calls == 1 else "done"
+                response = (
+                    f"OK session=7 state={status} start=0000000080000000 end=0000000080001000 "
+                    f"scanned={2048 if status == 'running' else 4096} total=4096 matches=3 stored=3 "
+                    "truncated=0 readErrors=1 error=0x0"
+                )
+            elif command[0] == "searchResults":
+                offset, count = int(command[2]), min(int(command[3]), 256)
+                values = state.addresses[offset : offset + count]
+                encoded = ",".join(f"{value:016X}" for value in values)
+                response = f"OK session=7 offset={offset} count={len(values)} stored=3 addresses={encoded}"
+            elif command[0] == "searchCancel":
+                state.cancelled = True
+                response = "OK session=7 cancel=requested"
+            elif command[0] == "searchClose":
+                response = "OK session=7 state=closed"
+            else:
+                response = "ERR code=UNKNOWN_COMMAND"
+            # Split the response to verify that the client handles TCP fragmentation.
+            payload = (response + "\n").encode("ascii")
+            midpoint = len(payload) // 2
+            self.wfile.write(payload[:midpoint])
+            self.wfile.flush()
+            self.wfile.write(payload[midpoint:])
+            self.wfile.flush()
+
+
+class FakeServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), FakeHandler)
+        self.state = FakeState()
+
+
+class ClientTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = FakeServer()
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+    def client(self) -> SysBotSearchClient:
+        return SysBotSearchClient("127.0.0.1", self.server.server_address[1], timeout=1)
+
+    def test_complete_search_and_pagination(self) -> None:
+        with self.client() as client:
+            self.assertEqual(client.capabilities()["maxPattern"], "256")
+            session = client.start(0x80000000, 0x80001000, bytes.fromhex("DEADBEEF"))
+            self.assertEqual(session, 7)
+            status = client.wait(session, poll_interval=0)
+            self.assertEqual(status.state, "done")
+            self.assertEqual(status.read_errors, 1)
+            self.assertFalse(status.truncated)
+            self.assertEqual(list(client.iter_results(session, page_size=2)), self.server.state.addresses)
+            client.close_session(session)
+
+    def test_region_and_typed_start(self) -> None:
+        with self.client() as client:
+            self.assertEqual(client.capabilities()["endian"], "little")
+            self.assertEqual(client.start_region("u32", "heap", 0x20, 0x1000, "0x12345678"), 7)
+            self.assertEqual(client.start_region("bytes", "main", 0, 0x100, b"\xDE\xAD", 1), 7)
+            with self.assertRaises(ValueError):
+                client.start_region("u16", "invalid", 0, 16, 1)
+
+    def test_cancel(self) -> None:
+        with self.client() as client:
+            client.cancel(7)
+        self.assertTrue(self.server.state.cancelled)
+
+    def test_rejects_malformed_response(self) -> None:
+        with self.assertRaises(SysBotProtocolError):
+            parse_response("not-a-response")
+        with self.assertRaises(SysBotProtocolError):
+            parse_response("OK duplicate=1 duplicate=2")
+
+    def test_page_size_validation(self) -> None:
+        with self.client() as client:
+            with self.assertRaises(ValueError):
+                list(client.iter_results(7, page_size=257))
+
+    def test_truncated_status_parsing(self) -> None:
+        response = parse_response(
+            "OK session=9 state=done start=0000000000001000 end=0000000000002000 "
+            "scanned=4096 total=4096 matches=70000 stored=65536 truncated=1 "
+            "readErrors=0 error=0x0"
+        )
+        from client.sysbot_search import SearchStatus
+
+        status = SearchStatus.from_response(response)
+        self.assertTrue(status.truncated)
+        self.assertEqual(status.matches, 70000)
+        self.assertEqual(status.stored, 65536)
+
+
+if __name__ == "__main__":
+    unittest.main()

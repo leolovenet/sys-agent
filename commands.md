@@ -1,5 +1,40 @@
 # Available Commands
 
+## Asynchronous exact memory search
+
+The search extension is additive: existing commands and responses are unchanged. Legacy search
+ranges use absolute addresses and an exclusive end address. Region searches accept an offset
+and size relative to `absolute`, `heap`, or `main`. Integer values are encoded in Switch-native
+little-endian byte order. Only one search may be queued or running at a time.
+
+The worker scans readable process mappings in 256 KiB chunks, preserves cross-chunk matches,
+and yields between chunks. It stores the first 65,536 matching addresses, continues counting
+after that limit, and reports `truncated=1`. A result page is limited to 256 addresses.
+
+|Command|Description|Parameters|Usage|
+|--|--|--|--|
+|searchCapabilities|Reports protocol limits and supported modes|none|`searchCapabilities`|
+|searchStart|Starts an asynchronous exact byte search|1. absolute start address<br>2. exclusive absolute end address<br>3. even-length hex byte pattern|`searchStart 0x80000000 0x88000000 DEADBEEF`|
+|searchExact|Alias for `searchStart`|same as `searchStart`|`searchExact 0x80000000 0x88000000 0xDEADBEEF`|
+|searchStartRegion|Starts a byte or typed region search|1. `bytes`, `u8`, `u16`, `u32`, or `u64`<br>2. `absolute`, `heap`, or `main`<br>3. region-relative offset<br>4. size in bytes<br>5. byte pattern or unsigned integer value<br>6. optional alignment|`searchStartRegion u32 heap 0x0 0x100000 0x12345678 4`|
+|searchStatus|Reports state, progress, matches, truncation and read errors|session ID|`searchStatus 1`|
+|searchResults|Returns a page of stored absolute addresses|1. session ID<br>2. zero-based result offset<br>3. count, capped at 256|`searchResults 1 0 100`|
+|searchCancel|Requests cancellation; the worker observes it no later than the current chunk boundary|session ID|`searchCancel 1`|
+|searchClose|Releases a completed, cancelled or failed session|session ID|`searchClose 1`|
+
+Search commands return one newline-terminated `OK ...` or `ERR code=...` response. Progress is
+polled with `searchStatus`; the worker never writes unsolicited data to a client socket.
+The dependency-free macOS client and examples are in `client/sysbot_search.py` and
+`client/README.md`. Deployment constraints and the concurrency/memory audit are recorded in
+`docs/search-a-level-design.md`.
+
+For typed searches, alignment defaults to the integer width. Byte searches default to one-byte
+alignment. An explicit alignment must be a power of two from 1 through 256 and is applied to
+the absolute candidate address. `searchStatus` always reports resolved absolute `start`/`end`
+and additionally reports `type`, `region`, `base`, `regionOffset`, and `alignment`. Region bases
+are captured when the session starts; a game restart still terminates the session through the
+existing process-ID check.
+
 ## RAM reading
 ### Single Read
 |Command|Description|Parameters|Usage|
@@ -114,9 +149,6 @@ The configure command allows setting of some timing values in sys-botbase:
 |freezeRate|How often frozen values shall be rewritten to RAM<br>default 3ms|1. new freezerate in ms|configure freezeRate 10|
 |controllerType|controllerType to use for controller input commands<br>default 3|See HidDeviceType on https://switchbrew.github.io/libnx/hid_8h.html|configure controllerType 12|
  
-
-
-
 
 
 

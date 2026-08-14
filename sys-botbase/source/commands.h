@@ -37,7 +37,9 @@ typedef struct {
 #define JOYSTICK_LEFT 0
 #define JOYSTICK_RIGHT 1
 
-void attach();
+void initDebugMutex(void);
+Result attach(void);
+Result attachQuiet(void);
 void detach();
 void detachController();
 u64 getMainNsoBase(u64 pid);

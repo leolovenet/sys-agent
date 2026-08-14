@@ -12,6 +12,7 @@
 #include "args.h"
 #include "util.h"
 #include "freeze.h"
+#include "search.h"
 #include <poll.h>
 
 #define TITLE_ID 0x430000000000000B
@@ -153,6 +154,168 @@ int argmain(int argc, char** argv)
 {
     if (argc == 0)
         return 0;
+
+    if (!strcmp(argv[0], "searchCapabilities"))
+    {
+        printf("OK version=2 modes=bytes,u8,u16,u32,u64 regions=absolute,heap,main alignment=powerOfTwo,max256 endian=little maxPattern=%d chunk=0x40000 maxResults=%d maxPage=%d\n",
+            SEARCH_MAX_PATTERN_SIZE, SEARCH_MAX_RESULTS, SEARCH_MAX_PAGE_RESULTS);
+        return 0;
+    }
+
+    if (!strcmp(argv[0], "searchStart") || !strcmp(argv[0], "searchExact"))
+    {
+        if (argc != 4) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        u64 start = 0;
+        u64 end = 0;
+        if (!tryParseStringToInt(argv[1], &start) || !tryParseStringToInt(argv[2], &end)) {
+            printf("ERR code=INVALID_RANGE\n");
+            return 0;
+        }
+        u64 sessionId = 0;
+        SearchStartResult result = searchStart(start, end, argv[3], &sessionId);
+        switch (result) {
+        case SearchStartOk:
+            printf("OK session=%lu state=queued\n", sessionId);
+            break;
+        case SearchStartBusy:
+            printf("ERR code=BUSY\n");
+            break;
+        case SearchStartInvalidRange:
+            printf("ERR code=INVALID_RANGE\n");
+            break;
+        case SearchStartInvalidPattern:
+            printf("ERR code=INVALID_PATTERN\n");
+            break;
+        case SearchStartInvalidType:
+            printf("ERR code=INVALID_TYPE\n");
+            break;
+        case SearchStartInvalidRegion:
+            printf("ERR code=INVALID_REGION\n");
+            break;
+        case SearchStartInvalidAlignment:
+            printf("ERR code=INVALID_ALIGNMENT\n");
+            break;
+        case SearchStartBaseUnavailable:
+            printf("ERR code=BASE_UNAVAILABLE\n");
+            break;
+        case SearchStartNoMemory:
+            printf("ERR code=NO_MEMORY\n");
+            break;
+        case SearchStartNoProcess:
+            printf("ERR code=NO_PROCESS\n");
+            break;
+        case SearchStartUnavailable:
+            printf("ERR code=UNAVAILABLE\n");
+            break;
+        }
+        return 0;
+    }
+
+    if (!strcmp(argv[0], "searchStartRegion"))
+    {
+        u64 offset = 0;
+        u64 size = 0;
+        u64 alignment = 0;
+        if ((argc != 6 && argc != 7) || !tryParseStringToInt(argv[3], &offset)
+            || !tryParseStringToInt(argv[4], &size)
+            || (argc == 7 && !tryParseStringToInt(argv[6], &alignment))) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        u64 sessionId = 0;
+        SearchStartResult result = searchStartRegion(argv[1], argv[2], offset, size,
+            argv[5], alignment, &sessionId);
+        switch (result) {
+        case SearchStartOk: printf("OK session=%lu state=queued\n", sessionId); break;
+        case SearchStartBusy: printf("ERR code=BUSY\n"); break;
+        case SearchStartInvalidRange: printf("ERR code=INVALID_RANGE\n"); break;
+        case SearchStartInvalidPattern: printf("ERR code=INVALID_VALUE\n"); break;
+        case SearchStartInvalidType: printf("ERR code=INVALID_TYPE\n"); break;
+        case SearchStartInvalidRegion: printf("ERR code=INVALID_REGION\n"); break;
+        case SearchStartInvalidAlignment: printf("ERR code=INVALID_ALIGNMENT\n"); break;
+        case SearchStartBaseUnavailable: printf("ERR code=BASE_UNAVAILABLE\n"); break;
+        case SearchStartNoMemory: printf("ERR code=NO_MEMORY\n"); break;
+        case SearchStartNoProcess: printf("ERR code=NO_PROCESS\n"); break;
+        case SearchStartUnavailable: printf("ERR code=UNAVAILABLE\n"); break;
+        }
+        return 0;
+    }
+
+    if (!strcmp(argv[0], "searchStatus"))
+    {
+        u64 sessionId = 0;
+        SearchStatus status;
+        if (argc != 2 || !tryParseStringToInt(argv[1], &sessionId)) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        if (!searchGetStatus(sessionId, &status)) {
+            printf("ERR code=SESSION_NOT_FOUND\n");
+            return 0;
+        }
+        printf("OK session=%lu state=%s start=%016lX end=%016lX scanned=%lu total=%lu matches=%lu stored=%lu truncated=%d readErrors=%lu error=0x%X type=%s region=%s base=%016lX regionOffset=%016lX alignment=%lu\n",
+            status.sessionId, searchStateName(status.state), status.start, status.end,
+            status.scanned, status.end - status.start, status.totalMatches,
+            status.storedMatches, status.truncated, status.readErrors, status.error,
+            searchTypeName(status.type), searchRegionName(status.region), status.regionBase,
+            status.regionOffset, status.alignment);
+        return 0;
+    }
+
+    if (!strcmp(argv[0], "searchResults"))
+    {
+        u64 sessionId = 0;
+        u64 offset = 0;
+        u64 count = 0;
+        if (argc != 4 || !tryParseStringToInt(argv[1], &sessionId)
+            || !tryParseStringToInt(argv[2], &offset) || !tryParseStringToInt(argv[3], &count)) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        u64 addresses[SEARCH_MAX_PAGE_RESULTS];
+        u64 copied = 0;
+        u64 totalStored = 0;
+        if (!searchCopyResults(sessionId, offset, count, addresses, &copied, &totalStored)) {
+            printf("ERR code=SESSION_NOT_FOUND\n");
+            return 0;
+        }
+        printf("OK session=%lu offset=%lu count=%lu stored=%lu addresses=", sessionId, offset, copied, totalStored);
+        for (u64 index = 0; index < copied; index++)
+            printf("%s%016lX", index == 0 ? "" : ",", addresses[index]);
+        printf("\n");
+        return 0;
+    }
+
+    if (!strcmp(argv[0], "searchCancel"))
+    {
+        u64 sessionId = 0;
+        if (argc != 2 || !tryParseStringToInt(argv[1], &sessionId)) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        if (!searchCancel(sessionId))
+            printf("ERR code=SESSION_NOT_FOUND\n");
+        else
+            printf("OK session=%lu cancel=requested\n", sessionId);
+        return 0;
+    }
+
+    if (!strcmp(argv[0], "searchClose"))
+    {
+        u64 sessionId = 0;
+        if (argc != 2 || !tryParseStringToInt(argv[1], &sessionId)) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        if (!searchClose(sessionId))
+            printf("ERR code=SESSION_ACTIVE_OR_NOT_FOUND\n");
+        else
+            printf("OK session=%lu state=closed\n", sessionId);
+        return 0;
+    }
 
 
     //peek <address in hex or dec> <amount of bytes in hex or dec>
@@ -998,6 +1161,8 @@ int main()
     int fr_count = 0;
 
     initFreezes();
+    initDebugMutex();
+    searchInitialize();
 
     // freeze thread
     mutexInit(&freezeMutex);
@@ -1064,6 +1229,12 @@ int main()
                         else
                         {
                             readBytesSoFar += len;
+                            if (readBytesSoFar >= MAX_LINE_LENGTH) {
+                                close(pfds[i].fd);
+                                del_from_pfds(pfds, i, &fd_count);
+                                readEnd = true;
+                                continue;
+                            }
                             if (linebuf[readBytesSoFar - 1] == '\n') {
                                 readEnd = true;
                                 linebuf[readBytesSoFar - 1] = 0;
@@ -1106,6 +1277,7 @@ int main()
 
     clearFreezes();
     freeFreezes();
+    searchShutdown();
 
     return 0;
 }

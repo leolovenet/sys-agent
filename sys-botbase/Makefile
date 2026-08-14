@@ -13,6 +13,8 @@ SOURCES		:=	source
 DATA		:=	data
 INCLUDES	:=	include
 EXEFS_SRC	:=	exefs_src
+ATMOSPHERE_TITLE_ID := 430000000000000B
+SD_LAYOUT_DIR := $(CURDIR)/$(ATMOSPHERE_TITLE_ID)
 
 ARCH	:=	-march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
 
@@ -77,9 +79,15 @@ else
 	export APP_JSON := $(TOPDIR)/$(CONFIG_JSON)
 endif
 
-.PHONY: $(BUILD) clean all
+.PHONY: $(BUILD) clean all sd-layout
 
-all: $(BUILD)
+all: sd-layout
+
+sd-layout: $(BUILD)
+	@mkdir -p "$(SD_LAYOUT_DIR)/flags"
+	@[ -e "$(SD_LAYOUT_DIR)/flags/boot2.flag" ] || touch "$(SD_LAYOUT_DIR)/flags/boot2.flag"
+	@cp -f "$(TARGET).nsp" "$(SD_LAYOUT_DIR)/exefs.nsp"
+	@echo updated ... $(ATMOSPHERE_TITLE_ID)/exefs.nsp
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
@@ -87,7 +95,7 @@ $(BUILD):
 
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).nsp $(TARGET).npdm $(TARGET).nso $(TARGET).elf
+	@rm -fr $(BUILD) $(TARGET).nsp $(TARGET).npdm $(TARGET).nso $(TARGET).elf "$(SD_LAYOUT_DIR)"
 
 #---------------------------------------------------------------------------------
 else
