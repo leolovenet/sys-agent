@@ -11,6 +11,7 @@ class FakeState:
     def __init__(self) -> None:
         self.status_calls = 0
         self.cancelled = False
+        self.search_active = False
         self.addresses = [0x80000010, 0x80000120, 0x80000230]
 
 
@@ -24,7 +25,22 @@ class FakeHandler(socketserver.StreamRequestHandler):
             if command[0] == "searchCapabilities":
                 response = "OK version=2 modes=bytes,u8,u16,u32,u64 regions=absolute,heap,main alignment=powerOfTwo,max256 endian=little maxPattern=256 chunk=0x40000 maxResults=65536 maxPage=256"
             elif command[0] in {"searchStart", "searchStartRegion"}:
+                state.search_active = True
                 response = "OK session=7 state=queued"
+            elif command[0] == "memoryBackend":
+                if len(command) == 2 and state.search_active:
+                    response = "ERR code=BUSY"
+                else:
+                    policy = command[1] if len(command) == 2 else "auto"
+                    response = (
+                        f"OK policy={policy} active=dmnt dmntAvailable=1 dmntAttached=1 "
+                        "pid=0000000000001234 titleId=01006F8002326000 lastError=0x0"
+                    )
+            elif command[0] == "memoryBackendProbe":
+                response = (
+                    "OK policy=auto active=dmnt dmntAvailable=1 dmntAttached=1 "
+                    "pid=0000000000001234 titleId=01006F8002326000 lastError=0x0"
+                )
             elif command[0] == "searchStatus":
                 state.status_calls += 1
                 status = "running" if state.status_calls == 1 else "done"
@@ -32,6 +48,8 @@ class FakeHandler(socketserver.StreamRequestHandler):
                     f"OK session=7 state={status} start=0000000080000000 end=0000000080001000 "
                     f"scanned={2048 if status == 'running' else 4096} total=4096 matches=3 stored=3 "
                     "truncated=0 readErrors=1 error=0x0"
+                    " type=bytes region=absolute base=0000000000000000 "
+                    "regionOffset=0000000080000000 alignment=1 backend=dmnt"
                 )
             elif command[0] == "searchResults":
                 offset, count = int(command[2]), min(int(command[3]), 256)
@@ -42,6 +60,7 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 state.cancelled = True
                 response = "OK session=7 cancel=requested"
             elif command[0] == "searchClose":
+                state.search_active = False
                 response = "OK session=7 state=closed"
             else:
                 response = "ERR code=UNKNOWN_COMMAND"
@@ -85,6 +104,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(status.state, "done")
             self.assertEqual(status.read_errors, 1)
             self.assertFalse(status.truncated)
+            self.assertEqual(status.backend, "dmnt")
             self.assertEqual(list(client.iter_results(session, page_size=2)), self.server.state.addresses)
             client.close_session(session)
 
@@ -95,6 +115,23 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(client.start_region("bytes", "main", 0, 0x100, b"\xDE\xAD", 1), 7)
             with self.assertRaises(ValueError):
                 client.start_region("u16", "invalid", 0, 16, 1)
+
+    def test_backend_status_policy_and_probe(self) -> None:
+        with self.client() as client:
+            status = client.backend_status()
+            self.assertEqual(status.active, "dmnt")
+            self.assertTrue(status.dmnt_attached)
+            self.assertEqual(status.title_id, 0x01006F8002326000)
+            self.assertEqual(client.set_backend_policy("direct").policy, "direct")
+            self.assertEqual(client.probe_backend().process_id, 0x1234)
+            with self.assertRaises(ValueError):
+                client.set_backend_policy("invalid")
+
+    def test_backend_policy_change_reports_busy_during_search(self) -> None:
+        with self.client() as client:
+            client.start(0x80000000, 0x80001000, b"\x00")
+            with self.assertRaisesRegex(SysBotProtocolError, "BUSY"):
+                client.set_backend_policy("direct")
 
     def test_cancel(self) -> None:
         with self.client() as client:

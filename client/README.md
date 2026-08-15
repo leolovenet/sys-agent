@@ -9,6 +9,17 @@ Check capabilities:
 python3 client/sysbot_search.py --host switch capabilities
 ```
 
+Inspect or select the shared process-memory backend and probe it:
+
+```bash
+python3 client/sysbot_search.py --host switch backend
+python3 client/sysbot_search.py --host switch backend auto
+python3 client/sysbot_search.py --host switch backend-probe
+```
+
+`auto` prefers Atmosphere `dmnt:cht`; `dmnt` requires it; `direct` preserves the original
+standalone debugger behavior and will fail if dmnt already owns the game's debug handle.
+
 Run an exact search over an exclusive absolute range, poll until completion, and print all
 stored matching addresses:
 

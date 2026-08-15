@@ -22,14 +22,14 @@ queues a session, then returns immediately. The worker never writes to stdout or
 clients poll from the main command thread. This avoids the process-wide `dup2()` stdout routing
 used by the original multi-client server.
 
-`debugMutex` serializes every `attach()`/`detach()` pair used by legacy reads, writes, pointer
-commands, freezes, and the search worker. Search holds this mutex for one mapping query or one
-256 KiB debug read, not for the whole scan. Controller, touch, keyboard, and click-sequence work
-does not require this mutex.
+The unified process-memory backend mutex serializes dmnt IPC or direct-debug sessions used by
+legacy reads, writes, pointer commands, freezes, and the search worker. Search holds this mutex
+for one mapping query or one 256 KiB read, not for the whole scan. Controller, touch, keyboard,
+and click-sequence work does not require this mutex.
 
-The search worker never holds the search-session mutex while acquiring `debugMutex`. The
-existing main/freeze path may hold `freezeMutex` before `debugMutex`, but no path takes those
-locks in reverse order. Pattern comparison holds only the session mutex for the current chunk;
+The search worker never holds the search-session mutex while acquiring the process-memory
+mutex. The existing main/freeze path may hold `freezeMutex` before the process-memory mutex,
+but no path takes those locks in reverse order. Pattern comparison holds only the session mutex for the current chunk;
 therefore status and cancellation may wait for that comparison, but other TCP/controller
 commands remain independent. Cancellation is observed no later than the current chunk boundary.
 
@@ -92,8 +92,9 @@ mapping changes, or interaction with Atmosphere's debug manager. Before deployme
 
 1. Back up the exact currently installed official sys-botbase directory and hashes.
 2. Prepare a tested SD-card rollback path before replacing `exefs.nsp`.
-3. Disable the conflicting ACNH Atmosphere contents directory and restart the game, as recorded
-   in the workspace ACNH sys-botbase notes.
+3. With the unified backend build, keep ACNH cheats enabled and require
+   `memoryBackendProbe` to report `active=dmnt`. Disable the title contents directory only when
+   intentionally testing the legacy/direct backend.
 4. Start with a known readable range of only a few KiB and a known pattern.
 5. Verify capabilities, completion, addresses, paging, cancellation, controller commands, a
    normal `peek`, and reconnect behavior.

@@ -15,4 +15,6 @@ test:
 	/tmp/sys-botbase-search-range-test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-botbase/source tests/search_value_test.c sys-botbase/source/search_value.c -o /tmp/sys-botbase-search-value-test
 	/tmp/sys-botbase-search-value-test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-botbase/source tests/process_memory_select_test.c sys-botbase/source/process_memory_select.c -o /tmp/sys-botbase-process-memory-select-test
+	/tmp/sys-botbase-process-memory-select-test
 	python3 -m unittest -v tests/test_sysbot_search_client.py

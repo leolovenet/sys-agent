@@ -61,6 +61,7 @@ class SearchStatus:
     base: int = 0
     region_offset: int = 0
     alignment: int = 1
+    backend: str = "none"
 
     @classmethod
     def from_response(cls, response: dict[str, str]) -> "SearchStatus":
@@ -82,6 +83,31 @@ class SearchStatus:
             base=int(response.get("base", "0"), 16),
             region_offset=int(response.get("regionOffset", response["start"]), 16),
             alignment=parse_int(response.get("alignment", "1")),
+            backend=response.get("backend", "none"),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class BackendStatus:
+    policy: str
+    active: str
+    dmnt_available: bool
+    dmnt_attached: bool
+    process_id: int
+    title_id: int
+    last_error: int
+
+    @classmethod
+    def from_response(cls, response: dict[str, str]) -> "BackendStatus":
+        require_ok(response)
+        return cls(
+            policy=response["policy"],
+            active=response["active"],
+            dmnt_available=response["dmntAvailable"] == "1",
+            dmnt_attached=response["dmntAttached"] == "1",
+            process_id=int(response["pid"], 16),
+            title_id=int(response["titleId"], 16),
+            last_error=parse_int(response["lastError"]),
         )
 
 
@@ -137,6 +163,17 @@ class SysBotSearchClient:
 
     def capabilities(self) -> dict[str, str]:
         return require_ok(self.command("searchCapabilities"))
+
+    def backend_status(self) -> BackendStatus:
+        return BackendStatus.from_response(self.command("memoryBackend"))
+
+    def set_backend_policy(self, policy: str) -> BackendStatus:
+        if policy not in {"auto", "dmnt", "direct"}:
+            raise ValueError("policy must be auto, dmnt, or direct")
+        return BackendStatus.from_response(self.command(f"memoryBackend {policy}"))
+
+    def probe_backend(self) -> BackendStatus:
+        return BackendStatus.from_response(self.command("memoryBackendProbe"))
 
     def start(self, start: int, end: int, pattern: bytes) -> int:
         if start < 0 or end <= start:
@@ -236,6 +273,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=10.0)
     subparsers = parser.add_subparsers(dest="action", required=True)
     subparsers.add_parser("capabilities")
+    backend = subparsers.add_parser("backend")
+    backend.add_argument("policy", nargs="?", choices=("auto", "dmnt", "direct"))
+    subparsers.add_parser("backend-probe")
 
     start = subparsers.add_parser("start")
     start.add_argument("start", type=lambda value: int(value, 0))
@@ -274,6 +314,12 @@ def main(argv: list[str] | None = None) -> int:
         with SysBotSearchClient(args.host, args.port, args.timeout) as client:
             if args.action == "capabilities":
                 print_fields(client.capabilities())
+            elif args.action == "backend":
+                status = client.backend_status() if args.policy is None \
+                    else client.set_backend_policy(args.policy)
+                print(dataclasses.asdict(status))
+            elif args.action == "backend-probe":
+                print(dataclasses.asdict(client.probe_backend()))
             elif args.action == "start":
                 print(client.start(args.start, args.end, args.pattern))
             elif args.action == "start-region":

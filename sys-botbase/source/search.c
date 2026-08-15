@@ -6,6 +6,7 @@
 #include "search_match.h"
 #include "search_range.h"
 #include "search_value.h"
+#include "process_memory.h"
 
 #define SEARCH_CHUNK_SIZE 0x40000
 #define SEARCH_THREAD_STACK_SIZE 0x10000
@@ -19,6 +20,7 @@ typedef struct {
     bool cancelRequested;
     u64 nextSessionId;
     u64 processId;
+    ProcessMemoryBackendKind backend;
     SearchStatus status;
     u8 pattern[SEARCH_MAX_PATTERN_SIZE];
     size_t patternSize;
@@ -83,21 +85,23 @@ static bool processIsCurrent(void)
 
 static Result queryMapping(u64 address, MemoryInfo* info)
 {
-    Result rc = attachQuiet();
+    ProcessMemorySession session;
+    Result rc = processMemoryOpenBackend(&session, manager.backend, manager.processId, false);
     if (R_SUCCEEDED(rc)) {
-        u32 pageInfo = 0;
-        rc = svcQueryDebugProcessMemory(info, &pageInfo, debughandle, address);
+        rc = processMemoryQuery(&session, info, address);
+        processMemoryClose(&session);
     }
-    detach();
     return rc;
 }
 
 static Result readProcessMemoryQuiet(void* output, u64 address, size_t size)
 {
-    Result rc = attachQuiet();
-    if (R_SUCCEEDED(rc))
-        rc = svcReadDebugProcessMemory(output, debughandle, address, size);
-    detach();
+    ProcessMemorySession session;
+    Result rc = processMemoryOpenBackend(&session, manager.backend, manager.processId, false);
+    if (R_SUCCEEDED(rc)) {
+        rc = processMemoryRead(&session, output, address, size);
+        processMemoryClose(&session);
+    }
     return rc;
 }
 
@@ -265,7 +269,7 @@ void searchShutdown(void)
 
 static SearchStartResult queueSearch(u64 processId, u64 start, u64 end, const u8* pattern,
     size_t patternSize, SearchType type, SearchRegion region, u64 regionBase, u64 regionOffset,
-    u64 alignment, u64* sessionId)
+    u64 alignment, ProcessMemoryBackendKind backend, u64* sessionId)
 {
     mutexLock(&manager.mutex);
     if (!manager.threadStarted) {
@@ -288,6 +292,7 @@ static SearchStartResult queueSearch(u64 processId, u64 start, u64 end, const u8
     manager.patternSize = patternSize;
     manager.alignment = alignment;
     manager.processId = processId;
+    manager.backend = backend;
     manager.cancelRequested = false;
     memset(&manager.status, 0, sizeof(manager.status));
     manager.status.sessionId = manager.nextSessionId++;
@@ -301,6 +306,7 @@ static SearchStartResult queueSearch(u64 processId, u64 start, u64 end, const u8
     manager.status.regionBase = regionBase;
     manager.status.regionOffset = regionOffset;
     manager.status.alignment = alignment;
+    manager.status.backend = backend;
     *sessionId = manager.status.sessionId;
     mutexUnlock(&manager.mutex);
     return SearchStartOk;
@@ -315,11 +321,14 @@ SearchStartResult searchStart(u64 start, u64 end, const char* hexPattern, u64* s
     if (!parsePattern(hexPattern, pattern, &patternSize) || patternSize > end - start)
         return SearchStartInvalidPattern;
 
-    u64 processId = 0;
-    if (R_FAILED(pmdmntGetApplicationProcessId(&processId)) || processId == 0)
+    ProcessMemorySession memorySession;
+    if (R_FAILED(processMemoryOpen(&memorySession, false)))
         return SearchStartNoProcess;
+    const u64 processId = memorySession.processId;
+    const ProcessMemoryBackendKind backend = memorySession.backend;
+    processMemoryClose(&memorySession);
     return queueSearch(processId, start, end, pattern, patternSize, SearchTypeBytes,
-        SearchRegionAbsolute, 0, start, 1, sessionId);
+        SearchRegionAbsolute, 0, start, 1, backend, sessionId);
 }
 
 static bool parseSearchType(const char* text, SearchType* type, size_t* width)
@@ -370,32 +379,41 @@ SearchStartResult searchStartRegion(const char* typeText, const char* regionText
     if (size < patternSize)
         return SearchStartInvalidRange;
 
-    u64 processId = 0;
-    if (R_FAILED(pmdmntGetApplicationProcessId(&processId)) || processId == 0)
+    ProcessMemorySession memorySession;
+    if (R_FAILED(processMemoryOpen(&memorySession, false)))
         return SearchStartNoProcess;
+    const ProcessMemoryMetadata* metadata = processMemoryGetMetadata(&memorySession);
+    const u64 processId = metadata->processId;
+    const ProcessMemoryBackendKind backend = memorySession.backend;
 
     u64 base = 0;
     if (region == SearchRegionMain) {
-        base = getMainNsoBase(processId);
+        base = metadata->mainBase;
         if (base == 0)
-            return SearchStartBaseUnavailable;
+            goto baseUnavailable;
     }
     else if (region == SearchRegionHeap) {
-        Result rc = attachQuiet();
-        if (R_SUCCEEDED(rc))
-            base = getHeapBase(debughandle);
-        detach();
-        if (R_FAILED(rc) || base == 0)
-            return SearchStartBaseUnavailable;
+        base = metadata->heapBase;
+        if (base == 0)
+            goto baseUnavailable;
     }
 
-    if (offset > UINT64_MAX - base)
+    if (offset > UINT64_MAX - base) {
+        processMemoryClose(&memorySession);
         return SearchStartInvalidRange;
+    }
     const u64 start = base + offset;
-    if (size > UINT64_MAX - start)
+    if (size > UINT64_MAX - start) {
+        processMemoryClose(&memorySession);
         return SearchStartInvalidRange;
+    }
+    processMemoryClose(&memorySession);
     return queueSearch(processId, start, start + size, pattern, patternSize, type, region,
-        base, offset, alignment, sessionId);
+        base, offset, alignment, backend, sessionId);
+
+baseUnavailable:
+    processMemoryClose(&memorySession);
+    return SearchStartBaseUnavailable;
 }
 
 bool searchGetStatus(u64 sessionId, SearchStatus* status)
@@ -452,6 +470,15 @@ bool searchClose(u64 sessionId)
     }
     mutexUnlock(&manager.mutex);
     return closed;
+}
+
+bool searchIsActive(void)
+{
+    mutexLock(&manager.mutex);
+    const bool active = manager.status.state == SearchStateQueued
+        || manager.status.state == SearchStateRunning;
+    mutexUnlock(&manager.mutex);
+    return active;
 }
 
 const char* searchStateName(SearchState state)

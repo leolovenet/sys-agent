@@ -6,6 +6,7 @@
 #include <math.h>
 #include "commands.h"
 #include "util.h"
+#include "process_memory.h"
 
 
 //Controller:
@@ -18,8 +19,6 @@ HiddbgHdlsState controllerState = { 0 };
 //Keyboard:
 HiddbgKeyboardAutoPilotState dummyKeyboardState = { 0 };
 
-Handle debughandle = 0;
-static Mutex debugMutex;
 u64 buttonClickSleepTime = 50;
 u64 keyPressSleepTime = 25;
 u64 pollRate = 17; // polling is linked to screen refresh rate (system UI) or game framerate. Most cases this is 1/60 or 1/30
@@ -28,84 +27,6 @@ HiddbgHdlsSessionId sessionId = { 0 };
 bool initflag = 0;
 u8* workmem = NULL;
 size_t workmem_size = 0x1000;
-
-void initDebugMutex(void)
-{
-    mutexInit(&debugMutex);
-}
-
-static Result attachInternal(bool reportErrors)
-{
-    mutexLock(&debugMutex);
-    u64 pid = 0;
-    Result rc = pmdmntGetApplicationProcessId(&pid);
-    if (R_FAILED(rc)) {
-        debughandle = 0;
-        if (reportErrors && debugResultCodes)
-            printf("pmdmntGetApplicationProcessId: %d\n", rc);
-        return rc;
-    }
-
-    if (debughandle != 0) {
-        svcCloseHandle(debughandle);
-        debughandle = 0;
-    }
-
-    rc = svcDebugActiveProcess(&debughandle, pid);
-    if (R_FAILED(rc)) {
-        debughandle = 0;
-        if (reportErrors && debugResultCodes)
-            printf("svcDebugActiveProcess: %d\n", rc);
-    }
-    return rc;
-}
-
-Result attach(void)
-{
-    return attachInternal(true);
-}
-
-Result attachQuiet(void)
-{
-    return attachInternal(false);
-}
-
-void detach() {
-    if (debughandle != 0) {
-        svcCloseHandle(debughandle);
-        debughandle = 0;
-    }
-    mutexUnlock(&debugMutex);
-}
-
-u64 getMainNsoBase(u64 pid) {
-    LoaderModuleInfo proc_modules[2];
-    s32 numModules = 0;
-    Result rc = ldrDmntGetProcessModuleInfo(pid, proc_modules, 2, &numModules);
-    if (R_FAILED(rc)) {
-        if (debugResultCodes)
-            printf("ldrDmntGetProcessModuleInfo: %d\n", rc);
-        return 0;
-    }
-
-    LoaderModuleInfo* proc_module = 0;
-    if (numModules == 2) {
-        proc_module = &proc_modules[1];
-    }
-    else {
-        proc_module = &proc_modules[0];
-    }
-    return proc_module->base_address;
-}
-
-u64 getHeapBase(Handle handle) {
-    u64 heap_base = 0;
-    Result rc = svcGetInfo(&heap_base, InfoType_HeapRegionAddress, debughandle, 0);
-    if (R_FAILED(rc) && debugResultCodes)
-        printf("svcGetInfo: %d\n", rc);
-
-    return heap_base;
-}
 
 u64 getTitleId(u64 pid) {
     u64 titleId = 0;
@@ -180,25 +101,18 @@ void getBuildID(MetaData* meta, u64 pid) {
 }
 
 MetaData getMetaData() {
-    MetaData meta;
-    attach();
-    u64 pid = 0;
-    Result rc = pmdmntGetApplicationProcessId(&pid);
-    if (R_FAILED(rc)) {
-        if (debugResultCodes)
-            printf("pmdmntGetApplicationProcessId: %d\n", rc);
-        detach();
-        memset(&meta, 0, sizeof(meta));
+    MetaData meta = { 0 };
+    ProcessMemorySession session;
+    Result rc = processMemoryOpen(&session, debugResultCodes);
+    if (R_FAILED(rc))
         return meta;
-    }
-
-    meta.main_nso_base = getMainNsoBase(pid);
-    meta.heap_base = getHeapBase(debughandle);
-    meta.titleID = getTitleId(pid);
-    meta.titleVersion = GetTitleVersion(pid);
-    getBuildID(&meta, pid);
-
-    detach();
+    const ProcessMemoryMetadata* metadata = processMemoryGetMetadata(&session);
+    meta.main_nso_base = metadata->mainBase;
+    meta.heap_base = metadata->heapBase;
+    meta.titleID = metadata->titleId;
+    meta.titleVersion = GetTitleVersion(metadata->processId);
+    memcpy(meta.buildID, metadata->buildId, sizeof(meta.buildID));
+    processMemoryClose(&session);
     return meta;
 }
 
@@ -278,16 +192,14 @@ void detachController()
 
 void poke(u64 offset, u64 size, u8* val)
 {
-    attach();
-    writeMem(offset, size, val);
-    detach();
-}
-
-void writeMem(u64 offset, u64 size, u8* val)
-{
-    Result rc = svcWriteDebugProcessMemory(debughandle, val, offset, size);
+    ProcessMemorySession session;
+    Result rc = processMemoryOpen(&session, debugResultCodes);
+    if (R_SUCCEEDED(rc)) {
+        rc = processMemoryWrite(&session, val, offset, size);
+        processMemoryClose(&session);
+    }
     if (R_FAILED(rc) && debugResultCodes)
-        printf("svcWriteDebugProcessMemory: %d\n", rc);
+        printf("processMemoryWrite: %d\n", rc);
 }
 
 void peek(u64 offset, u64 size)
@@ -297,12 +209,15 @@ void peek(u64 offset, u64 size)
         printf("\n");
         return;
     }
-    attach();
-    Result rc = readMem(out, offset, size);
+    ProcessMemorySession session;
+    Result rc = processMemoryOpen(&session, debugResultCodes);
+    if (R_SUCCEEDED(rc))
+        rc = processMemoryRead(&session, out, offset, size);
     if (R_FAILED(rc))
     {
         printf("\n");
-        detach();
+        if (session.open)
+            processMemoryClose(&session);
         free(out);
         return;
     }
@@ -313,7 +228,7 @@ void peek(u64 offset, u64 size)
         printf("%02X", out[i]);
     }
     printf("\n");
-    detach();
+    processMemoryClose(&session);
     free(out);
 }
 
@@ -328,16 +243,22 @@ void peekInfinite(u64 offset, u64 size)
         return;
     }
 
-    attach();
+    ProcessMemorySession session;
+    Result rc = processMemoryOpen(&session, debugResultCodes);
+    if (R_FAILED(rc)) {
+        printf("\n");
+        free(out);
+        return;
+    }
     while (sizeRemainder > 0)
     {
         u64 thisBuffersize = sizeRemainder > MAX_LINE_LENGTH ? MAX_LINE_LENGTH : sizeRemainder;
         sizeRemainder -= thisBuffersize;
-        Result rc = readMem(out, offset + totalFetched, thisBuffersize);
+        rc = processMemoryRead(&session, out, offset + totalFetched, thisBuffersize);
         if (R_FAILED(rc))
         {
             printf("\n");
-            detach();
+            processMemoryClose(&session);
             free(out);
             return;
         }
@@ -350,7 +271,7 @@ void peekInfinite(u64 offset, u64 size)
         totalFetched += thisBuffersize;
     }
     printf("\n");
-    detach();
+    processMemoryClose(&session);
     free(out);
 }
 
@@ -362,14 +283,20 @@ void peekMulti(u64* offset, u64* size, u64 count)
 
     u8* out = malloc(sizeof(u8) * totalSize);
     u64 ofs = 0;
-    attach();
+    ProcessMemorySession session;
+    Result rc = processMemoryOpen(&session, debugResultCodes);
+    if (R_FAILED(rc)) {
+        printf("\n");
+        free(out);
+        return;
+    }
     for (int i = 0; i < count; i++)
     {
-        Result rc = readMem(out + ofs, offset[i], size[i]);
+        rc = processMemoryRead(&session, out + ofs, offset[i], size[i]);
         if (R_FAILED(rc))
         {
             printf("\n");
-            detach();
+            processMemoryClose(&session);
             free(out);
             return;
         }
@@ -382,16 +309,8 @@ void peekMulti(u64* offset, u64* size, u64 count)
         printf("%02X", out[i]);
     }
     printf("\n");
-    detach();
+    processMemoryClose(&session);
     free(out);
-}
-
-Result readMem(u8* out, u64 offset, u64 size)
-{
-    Result rc = svcReadDebugProcessMemory(out, debughandle, offset, size);
-    if (R_FAILED(rc) && debugResultCodes)
-        printf("svcReadDebugProcessMemory: %d\n", rc);
-    return rc;
 }
 
 void click(HidNpadButton btn)
@@ -454,15 +373,21 @@ u64 followMainPointer(s64* jumps, size_t count)
     u64 offset;
     u64 size = sizeof offset;
     u8* out = malloc(size);
-    MetaData meta = getMetaData();
-    if (meta.main_nso_base == 0)
+    if (out == NULL || count == 0) {
+        free(out);
         return 0;
+    }
 
-    attach();
-    Result rc = readMem(out, meta.main_nso_base + jumps[0], size);
+    ProcessMemorySession session;
+    Result rc = processMemoryOpen(&session, debugResultCodes);
+    if (R_SUCCEEDED(rc)) {
+        const ProcessMemoryMetadata* metadata = processMemoryGetMetadata(&session);
+        rc = processMemoryRead(&session, out, metadata->mainBase + jumps[0], size);
+    }
     if (R_FAILED(rc))
     {
-        detach();
+        if (session.open)
+            processMemoryClose(&session);
         free(out);
         return 0;
     }
@@ -471,10 +396,10 @@ u64 followMainPointer(s64* jumps, size_t count)
     int i;
     for (i = 1; i < count; ++i)
     {
-        rc = readMem(out, offset + jumps[i], size);
+        rc = processMemoryRead(&session, out, offset + jumps[i], size);
         if (R_FAILED(rc))
         {
-            detach();
+            processMemoryClose(&session);
             free(out);
             return 0;
         }
@@ -483,7 +408,7 @@ u64 followMainPointer(s64* jumps, size_t count)
         if (offset == 0)
             break;
     }
-    detach();
+    processMemoryClose(&session);
     free(out);
     return offset;
 }

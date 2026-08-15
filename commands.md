@@ -1,5 +1,27 @@
 # Available Commands
 
+## Process memory backend
+
+All memory commands, pointer traversal, freezes, and asynchronous searches use one shared
+process-memory backend. The default `auto` policy prefers Atmosphere `dmnt:cht`, asks dmnt to
+open the current application when necessary, and falls back to direct debug only before dmnt
+ownership has been observed. Once dmnt owns the debug handle, an IPC error is returned instead
+of attempting a conflicting second `svcDebugActiveProcess`.
+
+|Command|Description|Parameters|Usage|
+|--|--|--|--|
+|memoryBackend|Reports the configured policy, last selected backend, dmnt state, process identity, and last open error|optional `auto`, `dmnt`, or `direct` policy|`memoryBackend`<br>`memoryBackend dmnt`|
+|memoryBackendProbe|Opens and closes the configured backend once, then reports its resolved state|none|`memoryBackendProbe`|
+
+Policies are runtime-only and reset to `auto` when the sysmodule restarts. `dmnt` never falls
+back to direct; `direct` never contacts dmnt. Policy changes are rejected with `BUSY` while a
+search is queued or running. sys-botbase never force-closes dmnt's cheat process.
+
+Turning off individual cheat entries does not disable `dmnt:cht`. In auto mode sys-botbase may
+still ask dmnt to attach, and Atmosphere retains ownership of that shared debug handle. In
+direct mode, sys-botbase owns the handle only for the current command, freeze cycle, mapping
+query, or search read and closes it immediately afterward.
+
 ## Asynchronous exact memory search
 
 The search extension is additive: existing commands and responses are unchanged. Legacy search
@@ -34,6 +56,8 @@ the absolute candidate address. `searchStatus` always reports resolved absolute 
 and additionally reports `type`, `region`, `base`, `regionOffset`, and `alignment`. Region bases
 are captured when the session starts; a game restart still terminates the session through the
 existing process-ID check.
+Each search captures one process-memory backend at start and reports it as `backend=dmnt` or
+`backend=direct`; it never changes backend in the middle of a session.
 
 ## RAM reading
 ### Single Read
@@ -149,8 +173,6 @@ The configure command allows setting of some timing values in sys-botbase:
 |freezeRate|How often frozen values shall be rewritten to RAM<br>default 3ms|1. new freezerate in ms|configure freezeRate 10|
 |controllerType|controllerType to use for controller input commands<br>default 3|See HidDeviceType on https://switchbrew.github.io/libnx/hid_8h.html|configure controllerType 12|
  
-
-
 
 
 

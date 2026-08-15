@@ -13,6 +13,7 @@
 #include "util.h"
 #include "freeze.h"
 #include "search.h"
+#include "process_memory.h"
 #include <poll.h>
 
 #define TITLE_ID 0x430000000000000B
@@ -155,6 +156,55 @@ int argmain(int argc, char** argv)
     if (argc == 0)
         return 0;
 
+    if (!strcmp(argv[0], "memoryBackend"))
+    {
+        if (argc == 2) {
+            ProcessMemoryPolicy policy;
+            if (!processMemoryParsePolicy(argv[1], &policy)) {
+                printf("ERR code=INVALID_POLICY\n");
+                return 0;
+            }
+            if (searchIsActive()) {
+                printf("ERR code=BUSY\n");
+                return 0;
+            }
+            processMemorySetPolicy(policy);
+        }
+        else if (argc != 1) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        ProcessMemoryStatus status;
+        processMemoryGetStatus(&status);
+        printf("OK policy=%s active=%s dmntAvailable=%d dmntAttached=%d pid=%016lX titleId=%016lX lastError=0x%X\n",
+            processMemoryPolicyName(status.policy), processMemoryBackendName(status.active),
+            status.dmntAvailable, status.dmntAttached, status.processId, status.titleId,
+            status.lastError);
+        return 0;
+    }
+
+    if (!strcmp(argv[0], "memoryBackendProbe"))
+    {
+        if (argc != 1) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        ProcessMemorySession session;
+        Result rc = processMemoryOpen(&session, false);
+        if (R_FAILED(rc)) {
+            printf("ERR code=BACKEND_UNAVAILABLE result=0x%X\n", rc);
+            return 0;
+        }
+        processMemoryClose(&session);
+        ProcessMemoryStatus status;
+        processMemoryGetStatus(&status);
+        printf("OK policy=%s active=%s dmntAvailable=%d dmntAttached=%d pid=%016lX titleId=%016lX lastError=0x%X\n",
+            processMemoryPolicyName(status.policy), processMemoryBackendName(status.active),
+            status.dmntAvailable, status.dmntAttached, status.processId, status.titleId,
+            status.lastError);
+        return 0;
+    }
+
     if (!strcmp(argv[0], "searchCapabilities"))
     {
         printf("OK version=2 modes=bytes,u8,u16,u32,u64 regions=absolute,heap,main alignment=powerOfTwo,max256 endian=little maxPattern=%d chunk=0x40000 maxResults=%d maxPage=%d\n",
@@ -256,12 +306,12 @@ int argmain(int argc, char** argv)
             printf("ERR code=SESSION_NOT_FOUND\n");
             return 0;
         }
-        printf("OK session=%lu state=%s start=%016lX end=%016lX scanned=%lu total=%lu matches=%lu stored=%lu truncated=%d readErrors=%lu error=0x%X type=%s region=%s base=%016lX regionOffset=%016lX alignment=%lu\n",
+        printf("OK session=%lu state=%s start=%016lX end=%016lX scanned=%lu total=%lu matches=%lu stored=%lu truncated=%d readErrors=%lu error=0x%X type=%s region=%s base=%016lX regionOffset=%016lX alignment=%lu backend=%s\n",
             status.sessionId, searchStateName(status.state), status.start, status.end,
             status.scanned, status.end - status.start, status.totalMatches,
             status.storedMatches, status.truncated, status.readErrors, status.error,
             searchTypeName(status.type), searchRegionName(status.region), status.regionBase,
-            status.regionOffset, status.alignment);
+            status.regionOffset, status.alignment, processMemoryBackendName(status.backend));
         return 0;
     }
 
@@ -1161,7 +1211,7 @@ int main()
     int fr_count = 0;
 
     initFreezes();
-    initDebugMutex();
+    processMemoryInitialize();
     searchInitialize();
 
     // freeze thread
@@ -1278,6 +1328,7 @@ int main()
     clearFreezes();
     freeFreezes();
     searchShutdown();
+    processMemoryExit();
 
     return 0;
 }
@@ -1286,7 +1337,6 @@ void sub_freeze(void* arg)
 {
     u64 heap_base;
     u64 tid_now = 0;
-    u64 pid = 0;
     bool wait_su = false;
     int freezecount = 0;
 
@@ -1321,15 +1371,21 @@ while (1)
     }
 
     mutexLock(&freezeMutex);
-    attach();
-    heap_base = getHeapBase(debughandle);
-    pmdmntGetApplicationProcessId(&pid);
-    tid_now = getTitleId(pid);
-    detach();
+    ProcessMemorySession memorySession;
+    Result memoryRc = processMemoryOpen(&memorySession, false);
+    if (R_FAILED(memoryRc)) {
+        mutexUnlock(&freezeMutex);
+        svcSleepThread(1e+9L);
+        continue;
+    }
+    const ProcessMemoryMetadata* metadata = processMemoryGetMetadata(&memorySession);
+    heap_base = metadata->heapBase;
+    tid_now = metadata->titleId;
 
     // don't freeze on startup of new tid to remove any chance of save corruption
     if (tid_now == 0)
     {
+        processMemoryClose(&memorySession);
         mutexUnlock(&freezeMutex);
         svcSleepThread(1e+10L);
         wait_su = true;
@@ -1338,29 +1394,29 @@ while (1)
 
     if (wait_su)
     {
+        processMemoryClose(&memorySession);
         mutexUnlock(&freezeMutex);
         svcSleepThread(3e+10L);
         wait_su = false;
-        mutexLock(&freezeMutex);
+        continue;
     }
 
     if (heap_base > 0)
     {
-        attach();
         for (int j = 0; j < FREEZE_DIC_LENGTH; j++)
         {
             if (freezes[j].state == 1 && freezes[j].titleId == tid_now)
             {
-                writeMem(heap_base + freezes[j].address, freezes[j].size, freezes[j].vData);
+                processMemoryWrite(&memorySession, freezes[j].vData,
+                    heap_base + freezes[j].address, freezes[j].size);
             }
         }
-        detach();
     }
+    processMemoryClose(&memorySession);
 
     mutexUnlock(&freezeMutex);
     svcSleepThread(freezeRate * 1e+6L);
     tid_now = 0;
-    pid = 0;
 }
 }
 

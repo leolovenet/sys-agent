@@ -1,6 +1,5 @@
 #include <switch.h>
 
-extern Handle debughandle;
 extern bool bControllerIsInitialised;
 extern HidDeviceType controllerInitializedType;
 extern HiddbgHdlsHandle controllerHandle;
@@ -37,13 +36,7 @@ typedef struct {
 #define JOYSTICK_LEFT 0
 #define JOYSTICK_RIGHT 1
 
-void initDebugMutex(void);
-Result attach(void);
-Result attachQuiet(void);
-void detach();
 void detachController();
-u64 getMainNsoBase(u64 pid);
-u64 getHeapBase(Handle handle);
 u64 getTitleId(u64 pid);
 u64 GetTitleVersion(u64 pid);
 u64 getoutsize(NsApplicationControlData* buf);
@@ -52,11 +45,9 @@ MetaData getMetaData(void);
 bool getIsProgramOpen(u64 id);
 
 void poke(u64 offset, u64 size, u8* val);
-void writeMem(u64 offset, u64 size, u8* val);
 void peek(u64 offset, u64 size);
 void peekInfinite(u64 offset, u64 size);
 void peekMulti(u64* offset, u64* size, u64 count);
-Result readMem(u8* out, u64 offset, u64 size);
 void click(HidNpadButton btn);
 void press(HidNpadButton btn);
 void release(HidNpadButton btn);

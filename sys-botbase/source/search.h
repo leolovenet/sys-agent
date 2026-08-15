@@ -1,6 +1,7 @@
 #pragma once
 
 #include <switch.h>
+#include "process_memory.h"
 
 #define SEARCH_MAX_PATTERN_SIZE 256
 #define SEARCH_MAX_RESULTS 65536
@@ -57,6 +58,7 @@ typedef struct {
     u64 alignment;
     SearchType type;
     SearchRegion region;
+    ProcessMemoryBackendKind backend;
     bool truncated;
     Result error;
 } SearchStatus;
@@ -70,6 +72,7 @@ bool searchGetStatus(u64 sessionId, SearchStatus* status);
 bool searchCopyResults(u64 sessionId, u64 offset, u64 count, u64* addresses, u64* copied, u64* totalStored);
 bool searchCancel(u64 sessionId);
 bool searchClose(u64 sessionId);
+bool searchIsActive(void);
 const char* searchStateName(SearchState state);
 const char* searchTypeName(SearchType type);
 const char* searchRegionName(SearchRegion region);
