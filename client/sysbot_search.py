@@ -62,6 +62,15 @@ class SearchStatus:
     region_offset: int = 0
     alignment: int = 1
     backend: str = "none"
+    kind: str = "exact"
+    generation: int = 0
+    candidates: int = 0
+    operation: str = "scan"
+    disk_bytes: int = 0
+    pause: bool = False
+    committed: bool = False
+    resumable: bool = False
+    failure: str = "NONE"
 
     @classmethod
     def from_response(cls, response: dict[str, str]) -> "SearchStatus":
@@ -84,6 +93,15 @@ class SearchStatus:
             region_offset=int(response.get("regionOffset", response["start"]), 16),
             alignment=parse_int(response.get("alignment", "1")),
             backend=response.get("backend", "none"),
+            kind=response.get("kind", "exact"),
+            generation=parse_int(response.get("generation", "0")),
+            candidates=parse_int(response.get("candidates", response["stored"])),
+            operation=response.get("operation", "scan"),
+            disk_bytes=parse_int(response.get("diskBytes", "0")),
+            pause=response.get("pause", "0") == "1",
+            committed=response.get("committed", "0") == "1",
+            resumable=response.get("resumable", "0") == "1",
+            failure=response.get("failure", "NONE"),
         )
 
 
@@ -216,6 +234,52 @@ class SysBotSearchClient:
 
     def status(self, session: int) -> SearchStatus:
         return SearchStatus.from_response(self.command(f"searchStatus {session}"))
+
+    def begin_unknown(
+        self,
+        value_type: str,
+        region: str,
+        offset: int,
+        size: int,
+        alignment: int | None = None,
+        pause: bool = False,
+    ) -> int:
+        if value_type not in {"u8", "u16", "u32", "u64"}:
+            raise ValueError("type must be u8, u16, u32, or u64")
+        if region not in {"absolute", "heap", "main", "alias", "addressSpace"}:
+            raise ValueError("unsupported unknown-search region")
+        if offset < 0 or size <= 0:
+            raise ValueError("offset must be non-negative and size must be positive")
+        if alignment is None:
+            alignment = {"u8": 1, "u16": 2, "u32": 4, "u64": 8}[value_type]
+        if alignment <= 0:
+            raise ValueError("alignment must be positive")
+        response = require_ok(self.command(
+            f"searchBegin {value_type} {region} 0x{offset:X} 0x{size:X} "
+            f"{alignment} {1 if pause else 0}"
+        ))
+        return parse_int(response["session"])
+
+    def refine(self, session: int, mode: str, value: str | int | None = None,
+               pause: bool = False) -> None:
+        commands = {
+            "exact": "searchRefineExact",
+            "changed": "searchRefineChanged",
+            "unchanged": "searchRefineUnchanged",
+            "increased": "searchRefineIncreased",
+            "decreased": "searchRefineDecreased",
+        }
+        if mode not in commands:
+            raise ValueError("unsupported refine mode")
+        if mode == "exact":
+            if value is None:
+                raise ValueError("exact refine requires a value")
+            command = f"{commands[mode]} {session} {value} {1 if pause else 0}"
+        else:
+            if value is not None:
+                raise ValueError(f"{mode} refine does not accept a value")
+            command = f"{commands[mode]} {session} {1 if pause else 0}"
+        require_ok(self.command(command))
 
     def results(self, session: int, offset: int, count: int) -> tuple[list[int], int]:
         response = require_ok(self.command(f"searchResults {session} {offset} {count}"))

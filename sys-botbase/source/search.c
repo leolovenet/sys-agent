@@ -7,6 +7,7 @@
 #include "search_range.h"
 #include "search_value.h"
 #include "process_memory.h"
+#include "unknown_search.h"
 
 #define SEARCH_CHUNK_SIZE 0x40000
 #define SEARCH_THREAD_STACK_SIZE 0x10000
@@ -230,17 +231,18 @@ static void searchWorker(void* unused)
 
         if (shouldRun)
             runSearch();
-        else
+        else if (!unknownSearchRunQueued())
             svcSleepThread(10000000L);
     }
 }
 
-void searchInitialize(void)
+void searchInitialize(bool storageAvailable)
 {
     memset(&manager, 0, sizeof(manager));
     mutexInit(&manager.mutex);
     manager.nextSessionId = 1;
     manager.status.state = SearchStateIdle;
+    unknownSearchInitialize(storageAvailable);
     Result rc = threadCreate(&manager.thread, searchWorker, NULL, NULL,
         SEARCH_THREAD_STACK_SIZE, SEARCH_THREAD_PRIORITY, -2);
     if (R_SUCCEEDED(rc)) {
@@ -255,6 +257,7 @@ void searchInitialize(void)
 
 void searchShutdown(void)
 {
+    unknownSearchShutdown();
     mutexLock(&manager.mutex);
     manager.exitRequested = true;
     manager.cancelRequested = true;
@@ -265,6 +268,7 @@ void searchShutdown(void)
     }
     free(manager.results);
     manager.results = NULL;
+    unknownSearchCleanup();
 }
 
 static SearchStartResult queueSearch(u64 processId, u64 start, u64 end, const u8* pattern,
@@ -275,6 +279,10 @@ static SearchStartResult queueSearch(u64 processId, u64 start, u64 end, const u8
     if (!manager.threadStarted) {
         mutexUnlock(&manager.mutex);
         return SearchStartUnavailable;
+    }
+    if (unknownSearchHasSession()) {
+        mutexUnlock(&manager.mutex);
+        return SearchStartBusy;
     }
     if (manager.status.state == SearchStateQueued || manager.status.state == SearchStateRunning) {
         mutexUnlock(&manager.mutex);
@@ -307,6 +315,8 @@ static SearchStartResult queueSearch(u64 processId, u64 start, u64 end, const u8
     manager.status.regionOffset = regionOffset;
     manager.status.alignment = alignment;
     manager.status.backend = backend;
+    manager.status.kind = SearchKindExact;
+    manager.status.operation = SearchOperationExactScan;
     *sessionId = manager.status.sessionId;
     mutexUnlock(&manager.mutex);
     return SearchStartOk;
@@ -423,11 +433,14 @@ bool searchGetStatus(u64 sessionId, SearchStatus* status)
     if (found)
         *status = manager.status;
     mutexUnlock(&manager.mutex);
-    return found;
+    return found || unknownSearchGetStatus(sessionId, status);
 }
 
-bool searchCopyResults(u64 sessionId, u64 offset, u64 count, u64* addresses, u64* copied, u64* totalStored)
+SearchResultsResult searchCopyResults(u64 sessionId, u64 offset, u64 count, u64* addresses,
+    u64* copied, u64* totalStored)
 {
+    if ((sessionId & 0x8000000000000000ULL) != 0)
+        return unknownSearchCopyResults(sessionId, offset, count, addresses, copied, totalStored);
     if (count > SEARCH_MAX_PAGE_RESULTS)
         count = SEARCH_MAX_PAGE_RESULTS;
     mutexLock(&manager.mutex);
@@ -443,11 +456,13 @@ bool searchCopyResults(u64 sessionId, u64 offset, u64 count, u64* addresses, u64
         *copied = count;
     }
     mutexUnlock(&manager.mutex);
-    return found;
+    return found ? SearchResultsOk : SearchResultsNotFound;
 }
 
 bool searchCancel(u64 sessionId)
 {
+    if ((sessionId & 0x8000000000000000ULL) != 0)
+        return unknownSearchCancel(sessionId);
     mutexLock(&manager.mutex);
     const bool found = sessionId != 0 && manager.status.sessionId == sessionId;
     if (found && (manager.status.state == SearchStateQueued || manager.status.state == SearchStateRunning))
@@ -458,6 +473,8 @@ bool searchCancel(u64 sessionId)
 
 bool searchClose(u64 sessionId)
 {
+    if ((sessionId & 0x8000000000000000ULL) != 0)
+        return unknownSearchClose(sessionId);
     mutexLock(&manager.mutex);
     const bool found = sessionId != 0 && manager.status.sessionId == sessionId;
     bool closed = false;
@@ -478,7 +495,31 @@ bool searchIsActive(void)
     const bool active = manager.status.state == SearchStateQueued
         || manager.status.state == SearchStateRunning;
     mutexUnlock(&manager.mutex);
-    return active;
+    return active || unknownSearchIsActive();
+}
+
+bool searchLocksBackend(void)
+{
+    return searchIsActive() || unknownSearchHasSession();
+}
+
+bool searchMemoryAccessBlocked(void)
+{
+    return unknownSearchBlocksMemoryAccess();
+}
+
+SearchStartResult searchBeginUnknown(const char* type, const char* region, u64 offset, u64 size,
+    u64 alignment, bool pause, u64* sessionId)
+{
+    if (searchIsActive())
+        return SearchStartBusy;
+    return unknownSearchBegin(type, region, offset, size, alignment, pause, sessionId);
+}
+
+SearchStartResult searchRefine(u64 sessionId, SearchOperation operation, const char* value,
+    bool pause)
+{
+    return unknownSearchRefine(sessionId, operation, value, pause);
 }
 
 const char* searchStateName(SearchState state)
@@ -512,6 +553,41 @@ const char* searchRegionName(SearchRegion region)
     case SearchRegionAbsolute: return "absolute";
     case SearchRegionHeap: return "heap";
     case SearchRegionMain: return "main";
+    case SearchRegionAlias: return "alias";
+    case SearchRegionAddressSpace: return "addressSpace";
     default: return "unknown";
+    }
+}
+
+const char* searchKindName(SearchKind kind)
+{
+    return kind == SearchKindUnknown ? "unknown" : "exact";
+}
+
+const char* searchOperationName(SearchOperation operation)
+{
+    switch (operation) {
+    case SearchOperationExactScan: return "scan";
+    case SearchOperationBegin: return "begin";
+    case SearchOperationRefineExact: return "exact";
+    case SearchOperationRefineChanged: return "changed";
+    case SearchOperationRefineUnchanged: return "unchanged";
+    case SearchOperationRefineIncreased: return "increased";
+    case SearchOperationRefineDecreased: return "decreased";
+    default: return "unknown";
+    }
+}
+
+const char* searchFailureName(SearchFailure failure)
+{
+    switch (failure) {
+    case SearchFailureNone: return "NONE";
+    case SearchFailureSdUnavailable: return "SD_UNAVAILABLE";
+    case SearchFailureInsufficientStorage: return "INSUFFICIENT_STORAGE";
+    case SearchFailureCorruptSession: return "CORRUPT_SESSION";
+    case SearchFailureProcessChanged: return "PROCESS_CHANGED";
+    case SearchFailurePauseFailed: return "PAUSE_FAILED";
+    case SearchFailureIoError: return "IO_ERROR";
+    default: return "UNKNOWN";
     }
 }

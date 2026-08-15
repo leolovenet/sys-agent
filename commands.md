@@ -59,6 +59,47 @@ existing process-ID check.
 Each search captures one process-memory backend at start and reports it as `backend=dmnt` or
 `backend=direct`; it never changes backend in the middle of a session.
 
+## Unknown-value and multi-pass search
+
+Protocol version 3 adds one SD-backed unknown-value session. It supports unsigned
+`u8`/`u16`/`u32`/`u64` values over explicit `absolute`, `heap`, `main`, `alias`, or
+`addressSpace` ranges. The default alignment is the value width. The optional `pause` argument
+is `0` or `1` and defaults to `0`.
+
+|Command|Description|Parameters|Usage|
+|--|--|--|--|
+|searchBegin|Captures all aligned readable values as generation 0|type, region, offset, size, optional alignment, optional pause|`searchBegin u32 heap 0 0x100000 4 0`|
+|searchRefineExact|Keeps candidates whose current value equals the supplied value|session, value, optional pause|`searchRefineExact 0x8000000000000001 100 0`|
+|searchRefineChanged|Keeps candidates different from the previous generation|session, optional pause|`searchRefineChanged 0x8000000000000001 0`|
+|searchRefineUnchanged|Keeps candidates equal to the previous generation|session, optional pause|`searchRefineUnchanged 0x8000000000000001 0`|
+|searchRefineIncreased|Keeps candidates greater than the previous generation|session, optional pause|`searchRefineIncreased 0x8000000000000001 0`|
+|searchRefineDecreased|Keeps candidates less than the previous generation|session, optional pause|`searchRefineDecreased 0x8000000000000001 0`|
+
+Every successful refine stores current values as the next baseline. `searchResults` pages all
+committed candidates from disk and has no 65,536-result cap for this session type. It returns
+`BUSY` while a generation is being written. Cancellation or a runtime error discards the
+temporary generation and preserves the last committed generation for retry.
+
+The session pins PID, Title ID, Build ID, and memory backend until `searchClose`. Backend policy
+changes return `BUSY` during that lifetime. Status appends `kind`, `generation`, `candidates`,
+`operation`, `diskBytes`, `pause`, `committed`, `resumable`, and `failure`. Temporary files live
+only in `/switch/sys-botbase/search`; startup and `searchClose` clean that dedicated directory.
+
+Before writing a generation, sys-botbase checks that the SD has room for the estimated output
+plus a 64 MiB reserve. C-level search can return `SD_UNAVAILABLE`, `INSUFFICIENT_STORAGE`,
+`CORRUPT_SESSION`, `PROCESS_CHANGED`, `PAUSE_FAILED`, or `IO_ERROR`. A requested pause never
+silently falls back to a live scan, and every successfully paused operation attempts to resume
+the game on completion, cancellation, or error.
+The sys-botbase freeze worker temporarily skips writes during every active C-level operation;
+it resumes automatically when that operation completes, is cancelled, or fails.
+
+C-level scans process memory in 256 KiB blocks and yield the sysmodule's only permitted CPU
+core for 20 ms between blocks. This keeps controller and TCP commands responsive during long
+live scans. Finalizing a large generation still performs a synchronous SD flush: on the tested
+128 MiB snapshot, ordinary status requests remained responsive during scanning, while one
+request at final commit took about 2.3 seconds. This bounded commit delay is not a stalled
+search; wait for the terminal status before retrying or closing the session.
+
 ## RAM reading
 ### Single Read
 |Command|Description|Parameters|Usage|
@@ -173,8 +214,5 @@ The configure command allows setting of some timing values in sys-botbase:
 |freezeRate|How often frozen values shall be rewritten to RAM<br>default 3ms|1. new freezerate in ms|configure freezeRate 10|
 |controllerType|controllerType to use for controller input commands<br>default 3|See HidDeviceType on https://switchbrew.github.io/libnx/hid_8h.html|configure controllerType 12|
  
-
-
-
 
 

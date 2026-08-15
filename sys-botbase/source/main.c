@@ -15,6 +15,7 @@
 #include "search.h"
 #include "process_memory.h"
 #include <poll.h>
+#include <switch/runtime/devices/fs_dev.h>
 
 #define TITLE_ID 0x430000000000000B
 #define HEAP_SIZE 0x00480000
@@ -57,6 +58,7 @@ int fd_size = 5;
 
 // we aren't an applet
 u32 __nx_applet_type = AppletType_None;
+static bool searchSdMounted = false;
 
 // we override libnx internals to do a minimal init
 void __libnx_initheap(void)
@@ -77,6 +79,13 @@ void __appInit(void)
     rc = smInitialize();
     if (R_FAILED(rc))
         fatalThrow(rc);
+    rc = fsInitialize();
+    if (R_SUCCEEDED(rc)) {
+        rc = fsdevMountSdmc();
+        searchSdMounted = R_SUCCEEDED(rc);
+        if (!searchSdMounted)
+            fsExit();
+    }
     if (hosversionGet() == 0) {
         rc = setsysInitialize();
         if (R_SUCCEEDED(rc)) {
@@ -109,6 +118,11 @@ void __appInit(void)
 
 void __appExit(void)
 {
+    if (searchSdMounted) {
+        fsdevUnmountDevice("sdmc");
+        fsExit();
+        searchSdMounted = false;
+    }
     smExit();
     nsExit();
     audoutExit();
@@ -151,6 +165,30 @@ void makeClickSeq(char* seq)
     mutexUnlock(&clickMutex);
 }
 
+static void printSearchStartResponse(SearchStartResult result, u64 sessionId)
+{
+    switch (result) {
+    case SearchStartOk: printf("OK session=%lu state=queued\n", sessionId); break;
+    case SearchStartBusy: printf("ERR code=BUSY\n"); break;
+    case SearchStartInvalidRange: printf("ERR code=INVALID_RANGE\n"); break;
+    case SearchStartInvalidPattern: printf("ERR code=INVALID_VALUE\n"); break;
+    case SearchStartInvalidType: printf("ERR code=INVALID_TYPE\n"); break;
+    case SearchStartInvalidRegion: printf("ERR code=INVALID_REGION\n"); break;
+    case SearchStartInvalidAlignment: printf("ERR code=INVALID_ALIGNMENT\n"); break;
+    case SearchStartBaseUnavailable: printf("ERR code=BASE_UNAVAILABLE\n"); break;
+    case SearchStartNoMemory: printf("ERR code=NO_MEMORY\n"); break;
+    case SearchStartNoProcess: printf("ERR code=NO_PROCESS\n"); break;
+    case SearchStartUnavailable: printf("ERR code=UNAVAILABLE\n"); break;
+    case SearchStartSdUnavailable: printf("ERR code=SD_UNAVAILABLE\n"); break;
+    case SearchStartInsufficientStorage: printf("ERR code=INSUFFICIENT_STORAGE\n"); break;
+    case SearchStartCorruptSession: printf("ERR code=CORRUPT_SESSION\n"); break;
+    case SearchStartProcessChanged: printf("ERR code=PROCESS_CHANGED\n"); break;
+    case SearchStartPauseFailed: printf("ERR code=PAUSE_FAILED\n"); break;
+    case SearchStartIoError: printf("ERR code=IO_ERROR\n"); break;
+    case SearchStartSessionNotReady: printf("ERR code=SESSION_NOT_READY\n"); break;
+    }
+}
+
 int argmain(int argc, char** argv)
 {
     if (argc == 0)
@@ -164,7 +202,7 @@ int argmain(int argc, char** argv)
                 printf("ERR code=INVALID_POLICY\n");
                 return 0;
             }
-            if (searchIsActive()) {
+            if (searchLocksBackend()) {
                 printf("ERR code=BUSY\n");
                 return 0;
             }
@@ -207,7 +245,7 @@ int argmain(int argc, char** argv)
 
     if (!strcmp(argv[0], "searchCapabilities"))
     {
-        printf("OK version=2 modes=bytes,u8,u16,u32,u64 regions=absolute,heap,main alignment=powerOfTwo,max256 endian=little maxPattern=%d chunk=0x40000 maxResults=%d maxPage=%d\n",
+        printf("OK version=3 modes=bytes,u8,u16,u32,u64 regions=absolute,heap,main alignment=powerOfTwo,max256 endian=little maxPattern=%d chunk=0x40000 maxResults=%d maxPage=%d refine=exact,changed,unchanged,increased,decreased persistent=runtime storage=sd cRegions=absolute,heap,main,alias,addressSpace\n",
             SEARCH_MAX_PATTERN_SIZE, SEARCH_MAX_RESULTS, SEARCH_MAX_PAGE_RESULTS);
         return 0;
     }
@@ -226,41 +264,10 @@ int argmain(int argc, char** argv)
         }
         u64 sessionId = 0;
         SearchStartResult result = searchStart(start, end, argv[3], &sessionId);
-        switch (result) {
-        case SearchStartOk:
-            printf("OK session=%lu state=queued\n", sessionId);
-            break;
-        case SearchStartBusy:
-            printf("ERR code=BUSY\n");
-            break;
-        case SearchStartInvalidRange:
-            printf("ERR code=INVALID_RANGE\n");
-            break;
-        case SearchStartInvalidPattern:
+        if (result == SearchStartInvalidPattern)
             printf("ERR code=INVALID_PATTERN\n");
-            break;
-        case SearchStartInvalidType:
-            printf("ERR code=INVALID_TYPE\n");
-            break;
-        case SearchStartInvalidRegion:
-            printf("ERR code=INVALID_REGION\n");
-            break;
-        case SearchStartInvalidAlignment:
-            printf("ERR code=INVALID_ALIGNMENT\n");
-            break;
-        case SearchStartBaseUnavailable:
-            printf("ERR code=BASE_UNAVAILABLE\n");
-            break;
-        case SearchStartNoMemory:
-            printf("ERR code=NO_MEMORY\n");
-            break;
-        case SearchStartNoProcess:
-            printf("ERR code=NO_PROCESS\n");
-            break;
-        case SearchStartUnavailable:
-            printf("ERR code=UNAVAILABLE\n");
-            break;
-        }
+        else
+            printSearchStartResponse(result, sessionId);
         return 0;
     }
 
@@ -278,19 +285,51 @@ int argmain(int argc, char** argv)
         u64 sessionId = 0;
         SearchStartResult result = searchStartRegion(argv[1], argv[2], offset, size,
             argv[5], alignment, &sessionId);
-        switch (result) {
-        case SearchStartOk: printf("OK session=%lu state=queued\n", sessionId); break;
-        case SearchStartBusy: printf("ERR code=BUSY\n"); break;
-        case SearchStartInvalidRange: printf("ERR code=INVALID_RANGE\n"); break;
-        case SearchStartInvalidPattern: printf("ERR code=INVALID_VALUE\n"); break;
-        case SearchStartInvalidType: printf("ERR code=INVALID_TYPE\n"); break;
-        case SearchStartInvalidRegion: printf("ERR code=INVALID_REGION\n"); break;
-        case SearchStartInvalidAlignment: printf("ERR code=INVALID_ALIGNMENT\n"); break;
-        case SearchStartBaseUnavailable: printf("ERR code=BASE_UNAVAILABLE\n"); break;
-        case SearchStartNoMemory: printf("ERR code=NO_MEMORY\n"); break;
-        case SearchStartNoProcess: printf("ERR code=NO_PROCESS\n"); break;
-        case SearchStartUnavailable: printf("ERR code=UNAVAILABLE\n"); break;
+        printSearchStartResponse(result, sessionId);
+        return 0;
+    }
+
+    if (!strcmp(argv[0], "searchBegin"))
+    {
+        u64 offset = 0, size = 0, alignment = 0, pauseValue = 0;
+        if ((argc < 5 || argc > 7) || !tryParseStringToInt(argv[3], &offset)
+            || !tryParseStringToInt(argv[4], &size)
+            || (argc >= 6 && !tryParseStringToInt(argv[5], &alignment))
+            || (argc == 7 && (!tryParseStringToInt(argv[6], &pauseValue) || pauseValue > 1))) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
         }
+        u64 sessionId = 0;
+        SearchStartResult result = searchBeginUnknown(argv[1], argv[2], offset, size,
+            alignment, pauseValue == 1, &sessionId);
+        printSearchStartResponse(result, sessionId);
+        return 0;
+    }
+
+    SearchOperation refineOperation = SearchOperationExactScan;
+    bool isRefine = true;
+    if (!strcmp(argv[0], "searchRefineExact")) refineOperation = SearchOperationRefineExact;
+    else if (!strcmp(argv[0], "searchRefineChanged")) refineOperation = SearchOperationRefineChanged;
+    else if (!strcmp(argv[0], "searchRefineUnchanged")) refineOperation = SearchOperationRefineUnchanged;
+    else if (!strcmp(argv[0], "searchRefineIncreased")) refineOperation = SearchOperationRefineIncreased;
+    else if (!strcmp(argv[0], "searchRefineDecreased")) refineOperation = SearchOperationRefineDecreased;
+    else isRefine = false;
+    if (isRefine)
+    {
+        const bool exact = refineOperation == SearchOperationRefineExact;
+        const int minArgs = exact ? 3 : 2;
+        const int maxArgs = exact ? 4 : 3;
+        u64 sessionId = 0, pauseValue = 0;
+        if (argc < minArgs || argc > maxArgs || !tryParseStringToInt(argv[1], &sessionId)
+            || (argc == maxArgs && (!tryParseStringToInt(argv[maxArgs - 1], &pauseValue)
+                || pauseValue > 1))) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        const char* value = exact ? argv[2] : NULL;
+        SearchStartResult result = searchRefine(sessionId, refineOperation, value,
+            pauseValue == 1);
+        printSearchStartResponse(result, sessionId);
         return 0;
     }
 
@@ -306,12 +345,15 @@ int argmain(int argc, char** argv)
             printf("ERR code=SESSION_NOT_FOUND\n");
             return 0;
         }
-        printf("OK session=%lu state=%s start=%016lX end=%016lX scanned=%lu total=%lu matches=%lu stored=%lu truncated=%d readErrors=%lu error=0x%X type=%s region=%s base=%016lX regionOffset=%016lX alignment=%lu backend=%s\n",
+        printf("OK session=%lu state=%s start=%016lX end=%016lX scanned=%lu total=%lu matches=%lu stored=%lu truncated=%d readErrors=%lu error=0x%X type=%s region=%s base=%016lX regionOffset=%016lX alignment=%lu backend=%s kind=%s generation=%lu candidates=%lu operation=%s diskBytes=%lu pause=%d committed=%d resumable=%d failure=%s\n",
             status.sessionId, searchStateName(status.state), status.start, status.end,
             status.scanned, status.end - status.start, status.totalMatches,
             status.storedMatches, status.truncated, status.readErrors, status.error,
             searchTypeName(status.type), searchRegionName(status.region), status.regionBase,
-            status.regionOffset, status.alignment, processMemoryBackendName(status.backend));
+            status.regionOffset, status.alignment, processMemoryBackendName(status.backend),
+            searchKindName(status.kind), status.generation, status.candidates,
+            searchOperationName(status.operation), status.diskBytes, status.pause,
+            status.committed, status.resumable, searchFailureName(status.failure));
         return 0;
     }
 
@@ -328,8 +370,13 @@ int argmain(int argc, char** argv)
         u64 addresses[SEARCH_MAX_PAGE_RESULTS];
         u64 copied = 0;
         u64 totalStored = 0;
-        if (!searchCopyResults(sessionId, offset, count, addresses, &copied, &totalStored)) {
-            printf("ERR code=SESSION_NOT_FOUND\n");
+        SearchResultsResult result = searchCopyResults(sessionId, offset, count, addresses,
+            &copied, &totalStored);
+        if (result != SearchResultsOk) {
+            if (result == SearchResultsNotFound) printf("ERR code=SESSION_NOT_FOUND\n");
+            else if (result == SearchResultsBusy) printf("ERR code=BUSY\n");
+            else if (result == SearchResultsUnavailable) printf("ERR code=RESULTS_UNAVAILABLE\n");
+            else printf("ERR code=CORRUPT_SESSION\n");
             return 0;
         }
         printf("OK session=%lu offset=%lu count=%lu stored=%lu addresses=", sessionId, offset, copied, totalStored);
@@ -1212,7 +1259,7 @@ int main()
 
     initFreezes();
     processMemoryInitialize();
-    searchInitialize();
+    searchInitialize(searchSdMounted);
 
     // freeze thread
     mutexInit(&freezeMutex);
@@ -1355,6 +1402,11 @@ while (1)
     if (*(FreezeThreadState*)arg == Exit)
         break;
 
+    if (searchMemoryAccessBlocked()) {
+        svcSleepThread(1e+8L);
+        continue;
+    }
+
     if (*(FreezeThreadState*)arg == Idle) // no freeze
     {
         mutexLock(&freezeMutex);
@@ -1371,6 +1423,15 @@ while (1)
     }
 
     mutexLock(&freezeMutex);
+    // The search can be queued after the lock-free check above.  Recheck while
+    // holding freezeMutex: search commands are dispatched under this same lock,
+    // so a running C-level scan can no longer race us into waiting for the
+    // process-memory backend while blocking the TCP command loop.
+    if (searchMemoryAccessBlocked()) {
+        mutexUnlock(&freezeMutex);
+        svcSleepThread(1e+8L);
+        continue;
+    }
     ProcessMemorySession memorySession;
     Result memoryRc = processMemoryOpen(&memorySession, false);
     if (R_FAILED(memoryRc)) {

@@ -12,6 +12,7 @@ class FakeState:
         self.status_calls = 0
         self.cancelled = False
         self.search_active = False
+        self.last_command: list[str] = []
         self.addresses = [0x80000010, 0x80000120, 0x80000230]
 
 
@@ -22,11 +23,17 @@ class FakeHandler(socketserver.StreamRequestHandler):
             command = raw.decode("ascii").strip().split()
             if not command:
                 continue
+            state.last_command = command
             if command[0] == "searchCapabilities":
-                response = "OK version=2 modes=bytes,u8,u16,u32,u64 regions=absolute,heap,main alignment=powerOfTwo,max256 endian=little maxPattern=256 chunk=0x40000 maxResults=65536 maxPage=256"
+                response = "OK version=3 modes=bytes,u8,u16,u32,u64 regions=absolute,heap,main alignment=powerOfTwo,max256 endian=little maxPattern=256 chunk=0x40000 maxResults=65536 maxPage=256 refine=exact,changed,unchanged,increased,decreased persistent=runtime storage=sd cRegions=absolute,heap,main,alias,addressSpace"
             elif command[0] in {"searchStart", "searchStartRegion"}:
                 state.search_active = True
                 response = "OK session=7 state=queued"
+            elif command[0] == "searchBegin":
+                state.search_active = True
+                response = "OK session=9223372036854775809 state=queued"
+            elif command[0].startswith("searchRefine"):
+                response = f"OK session={command[1]} state=queued"
             elif command[0] == "memoryBackend":
                 if len(command) == 2 and state.search_active:
                     response = "ERR code=BUSY"
@@ -126,6 +133,35 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(client.probe_backend().process_id, 0x1234)
             with self.assertRaises(ValueError):
                 client.set_backend_policy("invalid")
+
+    def test_unknown_search_commands_and_status_fields(self) -> None:
+        with self.client() as client:
+            session = client.begin_unknown("u32", "addressSpace", 0x20, 0x1000,
+                                           alignment=4, pause=True)
+            self.assertEqual(session, 0x8000000000000001)
+            self.assertEqual(self.server.state.last_command[-2:], ["4", "1"])
+            client.refine(session, "changed", pause=False)
+            self.assertEqual(self.server.state.last_command[0], "searchRefineChanged")
+            client.refine(session, "exact", "0x1234", pause=True)
+            self.assertEqual(self.server.state.last_command[-1], "1")
+            with self.assertRaises(ValueError):
+                client.begin_unknown("f32", "heap", 0, 16)
+            with self.assertRaises(ValueError):
+                client.refine(session, "changed", 1)
+
+        from client.sysbot_search import SearchStatus
+        status = SearchStatus.from_response(parse_response(
+            "OK session=9223372036854775809 state=done start=0000000000001000 "
+            "end=0000000000002000 scanned=4096 total=4096 matches=1024 stored=1024 "
+            "truncated=0 readErrors=0 error=0x0 type=u32 region=heap base=1000 "
+            "regionOffset=0 alignment=4 backend=dmnt kind=unknown generation=2 "
+            "candidates=1024 operation=unchanged diskBytes=5000 pause=1 committed=1 "
+            "resumable=1 failure=NONE"
+        ))
+        self.assertEqual(status.kind, "unknown")
+        self.assertEqual(status.generation, 2)
+        self.assertTrue(status.committed)
+        self.assertTrue(status.resumable)
 
     def test_backend_policy_change_reports_busy_during_search(self) -> None:
         with self.client() as client:
