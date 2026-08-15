@@ -48,3 +48,24 @@ python3 client/sysbot_search.py --host switch start-region \
 `absolute` treats the offset argument as the absolute start address. Integer types accept
 decimal or `0x`-prefixed unsigned values. Defaults are natural alignment for integer types and
 one-byte alignment for byte patterns.
+
+Unknown-value searches are also available from Python:
+
+```python
+with SysBotSearchClient("switch") as client:
+    session = client.begin_unknown("u32", "heap", 0, 0x100000, pause=False)
+    client.wait(session)
+
+    # Change the value in the game, then keep only changed candidates.
+    client.refine(session, "changed")
+    status = client.wait(session)
+    print(status.generation, status.candidates, status.disk_bytes)
+
+    for address in client.iter_results(session):
+        print(f"{address:016X}")
+    client.close_session(session)
+```
+
+Refine modes are `exact`, `changed`, `unchanged`, `increased`, and `decreased`. Exact mode
+requires a value. The client always sends alignment and pause explicitly so the wire command is
+unambiguous.

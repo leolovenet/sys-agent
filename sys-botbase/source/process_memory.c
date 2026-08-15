@@ -38,6 +38,14 @@ static Result fillDirectMetadata(ProcessMemorySession* session)
     rc = svcGetInfo(&metadata->aliasSize, InfoType_AliasRegionSize, session->directHandle, 0);
     if (R_FAILED(rc))
         return rc;
+    rc = svcGetInfo(&metadata->addressSpaceBase, InfoType_AslrRegionAddress,
+        session->directHandle, 0);
+    if (R_FAILED(rc))
+        return rc;
+    rc = svcGetInfo(&metadata->addressSpaceSize, InfoType_AslrRegionSize,
+        session->directHandle, 0);
+    if (R_FAILED(rc))
+        return rc;
 
     LoaderModuleInfo modules[2];
     s32 count = 0;

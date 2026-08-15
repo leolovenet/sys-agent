@@ -17,4 +17,8 @@ test:
 	/tmp/sys-botbase-search-value-test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-botbase/source tests/process_memory_select_test.c sys-botbase/source/process_memory_select.c -o /tmp/sys-botbase-process-memory-select-test
 	/tmp/sys-botbase-process-memory-select-test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-botbase/source tests/search_compare_test.c sys-botbase/source/search_compare.c -o /tmp/sys-botbase-search-compare-test
+	/tmp/sys-botbase-search-compare-test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-botbase/source tests/search_store_test.c sys-botbase/source/search_store.c -o /tmp/sys-botbase-search-store-test
+	/tmp/sys-botbase-search-store-test
 	python3 -m unittest -v tests/test_sysbot_search_client.py

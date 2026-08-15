@@ -19,13 +19,17 @@ process-memory backend that can coexist with Atmosphère cheats.
   to an operation and released afterward; this fork never force-closes a dmnt-owned handle.
 - Asynchronous exact and typed `u8`/`u16`/`u32`/`u64` memory search supports absolute, main,
   and heap-relative ranges, alignment, progress, cancellation, sessions, and paged results.
+- SD-backed unknown-value sessions support exact, changed, unchanged, increased, and decreased
+  multi-pass refinement without keeping millions of candidates in the sysmodule heap.
 - Search sessions pin their process ID and backend, preventing a running scan from silently
   switching to a different process or debug owner.
 - The original controller, screen-capture, and memory commands remain available. New commands
   are additive so existing clients can continue to ignore capabilities they do not use.
 
 See [commands.md](commands.md), [the memory-backend design](docs/process-memory-backend.md),
-and [the search design](docs/search-a-level-design.md) for protocol and implementation details.
+[the exact-search design](docs/search-a-level-design.md), and
+[the unknown-search design](docs/search-c-level-design.md) for protocol and implementation
+details.
 
 A Nintendo Switch (CFW) sysmodule that allows users to remotely control their Switch over a
 TCP socket and read or write game memory. It can be used for bots, automation, and controlled
@@ -101,6 +105,10 @@ docker run --rm \
 
 The build produces `sys-botbase/sys-botbase.nsp` and refreshes the ignored installation tree
 at `sys-botbase/430000000000000B`. The NSP is copied there as `exefs.nsp`.
+
+Unknown-search snapshots are runtime-only temporary data under `/switch/sys-botbase/search` on
+the SD card. They are removed when the session closes or the sysmodule starts again. Do not
+store personal files in that directory.
 
 ![](joycon-glow.gif)
 
