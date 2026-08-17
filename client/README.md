@@ -10,6 +10,7 @@ non-FTP sys-agent command behind grouped subcommands; FTP is intentionally not b
 backend   Inspect or configure the process-memory backend
 system    Query or control system state
 audio     Query or control system audio
+game      Launch, close, or inspect the running game
 memory    Read or write process memory
 freeze    Manage value freezing
 input     Send controller, touch, or keyboard input
@@ -50,6 +51,31 @@ python3 client/sysagent.py --host switch system action reboot-emummc
 `system query network-profile` returns the Wi-Fi passphrase over an unauthenticated,
 unencrypted TCP connection. Use it only on a trusted isolated network. The client never
 automatically retries reboot, shutdown, sleep, wireless changes, or application termination.
+
+## Game
+
+```bash
+python3 client/sysagent.py --host switch game status
+python3 client/sysagent.py --host switch game launch-headless 0x01006F8002326000
+python3 client/sysagent.py --host switch game terminate
+python3 client/sysagent.py --host switch game name
+python3 client/sysagent.py --host switch game version
+python3 client/sysagent.py --host switch game icon --output icon.bin
+```
+
+Game subcommands are `status`, `launch-headless`, `terminate`, `name`, `author`, `rating`,
+`version`, and `icon`. `status` reports the running application identity, version, memory
+bases, Build ID, and name; `icon` writes a binary icon file with `--output` (default
+`game-icon-<unix time>.bin`). `launch-headless` starts the game process without showing it on
+screen (foreground launch requires the home-menu/applet flow, which a sysmodule cannot drive);
+`terminate` is the system-level final termination (the same forced path the HOME-menu close
+flow falls back to after its graceful-close timeout), because the graceful `RequestExit` API is
+only reachable by system applets. `launch-headless` and `terminate` take effect immediately
+with no confirmation. Numeric arguments (including Title IDs) accept `0x`-prefixed hex, bare
+hex, or decimal.
+
+`game launch-headless` automatically tries SD card, built-in user storage, game card, then the
+generic `None` storage, and reports which one succeeded in the `storage=` response field.
 
 ## Audio
 
@@ -136,16 +162,13 @@ python3 client/sysagent.py --host switch utility heap-base
 python3 client/sysagent.py --host switch utility main-nso-base
 python3 client/sysagent.py --host switch utility title-id
 python3 client/sysagent.py --host switch utility is-program-running 0x01006F8002326000
-python3 client/sysagent.py --host switch utility game name
-python3 client/sysagent.py --host switch utility game icon --output icon.bin
 python3 client/sysagent.py --host switch utility charge
 python3 client/sysagent.py --host switch config set freezeRate 10
 ```
 
 Utility subcommands are `version`, `title-id`, `title-version`, `system-language`, `build-id`,
-`heap-base`, `main-nso-base`, `is-program-running`, `game`, `charge`, and `fd-count`. `game`
-accepts `icon`, `version`, `rating`, `author`, or `name`; the icon is written with `--output`
-(default `game-icon-<unix time>.bin`). `config set` validates the known parameters
+`heap-base`, `main-nso-base`, `is-program-running`, `charge`, and `fd-count`. `config set`
+validates the known parameters
 (`mainLoopSleepTime`, `buttonClickSleepTime`, `echoCommands`, `printDebugResultCodes`,
 `keySleepTime`, `fingerDiameter`, `pollRate`, `freezeRate`, `controllerType`).
 

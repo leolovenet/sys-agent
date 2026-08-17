@@ -44,12 +44,21 @@ def parse_response(line: str) -> dict[str, str]:
 
 def require_ok(response: dict[str, str]) -> dict[str, str]:
     if response.get("ok") != "OK":
-        raise SysAgentProtocolError(f"sys-agent error: {response.get('code', 'UNKNOWN')}")
+        details = ", ".join(
+            f"{key}={response[key]}" for key in ("stage", "result") if key in response
+        )
+        suffix = f" ({details})" if details else ""
+        raise SysAgentProtocolError(
+            f"sys-agent error: {response.get('code', 'UNKNOWN')}{suffix}"
+        )
     return response
 
 
 def parse_int(value: str) -> int:
-    return int(value, 0)
+    try:
+        return int(value, 0)
+    except ValueError:
+        return int(value, 16)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -483,6 +492,11 @@ class SysAgentClient:
         if field not in {"icon", "version", "rating", "author", "name"}:
             raise ValueError("field must be icon, version, rating, author, or name")
         return self._bare_command(f"game {field}")
+
+    def game_launch_headless(self, title_id: int) -> dict[str, str]:
+        if not 0 < title_id <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("title_id must be a positive 64-bit Title ID")
+        return require_ok(self.command(f"gameLaunchHeadless 0x{title_id:016X}"))
 
     def get_version(self) -> str:
         return self._bare_command("getVersion")
@@ -918,15 +932,30 @@ def _cmd_key_multi(client: SysAgentClient, args: argparse.Namespace) -> None:
     client.key_multi(args.keys)
 
 
-def _cmd_game(client: SysAgentClient, args: argparse.Namespace) -> None:
-    if args.field == "icon":
-        data = bytes.fromhex(client.game("icon"))
-        output = args.output or f"game-icon-{int(time.time())}.bin"
-        with open(output, "wb") as image:
-            image.write(data)
-        print(output)
-    else:
-        print(client.game(args.field))
+def _cmd_game_meta(field: str) -> Callable[[SysAgentClient, argparse.Namespace], None]:
+    def handler(client: SysAgentClient, args: argparse.Namespace) -> None:
+        print(client.game(field))
+    return handler
+
+
+def _cmd_game_icon(client: SysAgentClient, args: argparse.Namespace) -> None:
+    data = bytes.fromhex(client.game("icon"))
+    output = args.output or f"game-icon-{int(time.time())}.bin"
+    with open(output, "wb") as image:
+        image.write(data)
+    print(output)
+
+
+def _cmd_game_status(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.system_query("application"))
+
+
+def _cmd_game_launch_headless(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.game_launch_headless(args.title_id))
+
+
+def _cmd_game_terminate(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.system_action("terminate-application"))
 
 
 def _cmd_is_program_running(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -1054,6 +1083,25 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      choices=("enabled", "disabled"), default=None),)),
     )),
 
+    CommandGroup("game", "Launch, close, or inspect the running game", (
+        Command("status", "Show the running game identity and memory layout",
+                _cmd_game_status),
+        Command("launch-headless", "Start a game process without showing it on screen "
+                                   "(headless; foreground launch is not possible from a "
+                                   "sysmodule)", _cmd_game_launch_headless,
+                (Arg("title_id", "Title ID (hex or decimal)", type=parse_int),)),
+        Command("terminate", "Force-close the foreground game (system-level final "
+                             "termination)", _cmd_game_terminate),
+        Command("name", "Show the running game name", _cmd_game_meta("name")),
+        Command("author", "Show the running game author", _cmd_game_meta("author")),
+        Command("rating", "Show the running game age rating", _cmd_game_meta("rating")),
+        Command("version", "Show the running game version", _cmd_game_meta("version")),
+        Command("icon", "Dump the running game icon as a binary file", _cmd_game_icon,
+                (Arg("output", "write the icon to this path "
+                               "(default: game-icon-<unix time>.bin)",
+                     flags=("--output",)),)),
+    )),
+
     CommandGroup("memory", "Read or write process memory", (
         Command("peek", "Read bytes relative to the heap", _cmd_peek,
                 (Arg("offset", "heap-relative address", type=parse_int),
@@ -1176,12 +1224,6 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
         Command("is-program-running", "Check whether a program is running",
                 _cmd_is_program_running,
                 (Arg("program_id", "program ID", type=parse_int),)),
-        Command("game", "Show application metadata or dump its icon", _cmd_game,
-                (Arg("field", "icon, version, rating, author, or name",
-                     choices=("icon", "version", "rating", "author", "name")),
-                 Arg("output", "write the icon to this path "
-                               "(default: game-icon-<unix time>.bin)",
-                     flags=("--output",)))),
         Command("charge", "Show the battery charge percentage", _print_result("charge")),
         Command("fd-count", "Show the open client socket count", _print_result("fd_count")),
     )),

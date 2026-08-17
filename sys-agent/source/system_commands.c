@@ -562,6 +562,77 @@ static void applicationTerminate(void)
     printf("OK action=terminated titleId=%016lX\n", titleId);
 }
 
+static bool parseTitleId(const char* text, u64* titleId)
+{
+    if (text == NULL || titleId == NULL)
+        return false;
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))
+        text += 2;
+    size_t length = strlen(text);
+    if (length == 0 || length > 16)
+        return false;
+    u64 value = 0;
+    for (size_t i = 0; i < length; i++) {
+        const char c = text[i];
+        unsigned digit;
+        if (c >= '0' && c <= '9')
+            digit = (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f')
+            digit = (unsigned)(c - 'a') + 10;
+        else if (c >= 'A' && c <= 'F')
+            digit = (unsigned)(c - 'A') + 10;
+        else
+            return false;
+        value = (value << 4) | digit;
+    }
+    if (value == 0)
+        return false;
+    *titleId = value;
+    return true;
+}
+
+static void gameLaunchHeadlessCommand(u64 titleId)
+{
+    Result rc = pmshellInitialize();
+    if (R_FAILED(rc)) {
+        printServiceError("pm:shell", rc);
+        return;
+    }
+    /* pmshellLaunchProgram needs the real install storage: with
+     * NcmStorageId_None the loader/fsp cannot resolve the title's NCA and
+     * pm:shell fails with an lr path-not-found result (e.g. 0xA5800A08).
+     * Nintendo always passes the storage the title is installed on, so try
+     * the common storages in order and use the first one pm accepts. */
+    static const NcmStorageId launchStorageOrder[] = {
+        NcmStorageId_SdCard, NcmStorageId_BuiltInUser,
+        NcmStorageId_GameCard, NcmStorageId_None,
+    };
+    static const char* storageNames[] = {
+        "SdCard", "BuiltInUser", "GameCard", "None",
+    };
+    const char* usedStorageName = "None";
+    Result firstRc = 0;
+    u64 pid = 0;
+    for (size_t i = 0; i < sizeof(launchStorageOrder) / sizeof(launchStorageOrder[0]); i++) {
+        NcmProgramLocation location = { .program_id = titleId, .storageID = launchStorageOrder[i] };
+        rc = pmshellLaunchProgram(0, &location, &pid);
+        if (R_SUCCEEDED(rc)) {
+            usedStorageName = storageNames[i];
+            break;
+        }
+        if (firstRc == 0)
+            firstRc = rc;
+    }
+    pmshellExit();
+    if (R_FAILED(rc)) {
+        printCommandError("launchProgram", firstRc);
+        return;
+    }
+    printf("OK action=launched pid=%016lX titleId=%016lX storage=%s\n",
+           pid, titleId, usedStorageName);
+    fflush(stdout);
+}
+
 bool systemCommandsDispatch(int argc, char** argv)
 {
     if (argc <= 0) return false;
@@ -576,9 +647,19 @@ bool systemCommandsDispatch(int argc, char** argv)
         || !strcmp(command, "systemSleep") || !strcmp(command, "networkSet")
         || !strcmp(command, "lockScreenStatus") || !strcmp(command, "lockScreenSet")
         || !strcmp(command, "applicationTerminate")
-        || !strcmp(command, "audioVolume") || !strcmp(command, "audioMute");
+        || !strcmp(command, "audioVolume") || !strcmp(command, "audioMute")
+        || !strcmp(command, "gameLaunchHeadless");
     if (!known) return false;
 
+    if (!strcmp(command, "gameLaunchHeadless")) {
+        u64 titleId = 0;
+        if (argc != 2 || !parseTitleId(argv[1], &titleId)) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        gameLaunchHeadlessCommand(titleId);
+        return true;
+    }
     if (!strcmp(command, "processList")) {
         u64 offset = 0, count = 0;
         if (argc != 3 || !tryParseStringToInt(argv[1], &offset)
@@ -640,7 +721,7 @@ bool systemCommandsDispatch(int argc, char** argv)
     }
 
     if (!strcmp(command, "systemCapabilities"))
-        printf("OK version=1 queries=systemInfo,systemTime,powerStatus,storageStatus,networkStatus,networkProfile,accountStatus,applicationStatus,processList,lockScreenStatus actions=systemReboot,systemRebootEmuMMC,systemShutdown,systemSleep,networkSet,lockScreenSet,applicationTerminate processPageMax=%d audio=volume,mute sensitiveData=serial,account,wifiPassphrase authentication=none sleep=experimental rebootEmuMMCMariko=validated rebootEmuMMCErista=experimental\n", PROCESS_PAGE_MAX);
+        printf("OK version=1 queries=systemInfo,systemTime,powerStatus,storageStatus,networkStatus,networkProfile,accountStatus,applicationStatus,processList,lockScreenStatus actions=systemReboot,systemRebootEmuMMC,systemShutdown,systemSleep,networkSet,lockScreenSet,applicationTerminate game=launchHeadless processPageMax=%d audio=volume,mute sensitiveData=serial,account,wifiPassphrase authentication=none sleep=experimental rebootEmuMMCMariko=validated rebootEmuMMCErista=experimental\n", PROCESS_PAGE_MAX);
     else if (!strcmp(command, "systemInfo")) systemInfo();
     else if (!strcmp(command, "systemTime")) systemTimeCommand();
     else if (!strcmp(command, "powerStatus")) powerStatus();

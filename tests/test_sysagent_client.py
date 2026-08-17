@@ -138,6 +138,9 @@ class FakeHandler(socketserver.StreamRequestHandler):
                     response = "Nintendo"
                 else:
                     response = "Animal Crossing"
+            elif command[0] == "gameLaunchHeadless":
+                response = "OK action=launched pid=0000000000001234 " \
+                           f"titleId={command[1][2:].upper()} storage=SdCard"
             elif command[0] == "getVersion":
                 response = "2.6"
             elif command[0] == "charge":
@@ -432,10 +435,50 @@ class ClientTests(unittest.TestCase):
             output = os.path.join(directory, "icon.bin")
             code = main(["--host", "127.0.0.1",
                          "--port", str(self.server.server_address[1]),
-                         "--timeout", "1", "utility", "game", "icon", "--output", output])
+                         "--timeout", "1", "game", "icon", "--output", output])
             self.assertEqual(code, 0)
             with open(output, "rb") as image:
                 self.assertEqual(image.read(), b"\xFF\xD8" + b"ICON")
+
+    def test_game_group_commands(self) -> None:
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stdout
+        from client.sysagent import main
+
+        with self.client() as client:
+            launched = client.game_launch_headless(0x01006F8002326000)
+            self.assertEqual(launched["action"], "launched")
+            self.assertEqual(launched["titleId"], "01006F8002326000")
+            self.assertEqual(self.server.state.last_command,
+                             ["gameLaunchHeadless", "0x01006F8002326000"])
+            self.assertEqual(client.system_query("application")["command"],
+                             "applicationStatus")
+            self.assertEqual(client.system_action("terminate-application")["action"],
+                             "applicationTerminate")
+            with self.assertRaises(ValueError):
+                client.game_launch_headless(0)
+
+        base = ["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                "--timeout", "1"]
+        for path in (["game", "status"], ["game", "terminate"], ["game", "name"],
+                     ["game", "author"], ["game", "rating"], ["game", "version"],
+                     ["game", "launch-headless", "0x01006F8002326000"]):
+            with io.StringIO() as output:
+                with redirect_stdout(output):
+                    self.assertEqual(main([*base, *path]), 0)
+                self.assertNotEqual(output.getvalue(), "")
+        self.assertEqual(main([*base, "game", "launch-headless", "01006F8002326000"]), 0)
+        self.assertEqual(self.server.state.last_command,
+                         ["gameLaunchHeadless", "0x01006F8002326000"])
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "icon.bin")
+            self.assertEqual(main([*base, "game", "icon", "--output", output]), 0)
+            with open(output, "rb") as image:
+                self.assertEqual(image.read(), b"\xFF\xD8" + b"ICON")
+        with self.assertRaises(SystemExit):
+            main([*base, "game", "launch-headless", "not-a-title-id"])
 
     def test_configure_and_raw(self) -> None:
         from client.sysagent import main
@@ -499,7 +542,10 @@ class ClientTests(unittest.TestCase):
         response = parse_response("ERR code=COMMAND_FAILED stage=getLastOpenedUser result=0x2F01")
         self.assertEqual(response["code"], "COMMAND_FAILED")
         self.assertEqual(response["result"], "0x2F01")
-        with self.assertRaisesRegex(SysAgentProtocolError, "COMMAND_FAILED"):
+        with self.assertRaisesRegex(
+            SysAgentProtocolError,
+            r"sys-agent error: COMMAND_FAILED \(stage=getLastOpenedUser, result=0x2F01\)",
+        ):
             require_ok(response)
 
     def test_page_size_validation(self) -> None:

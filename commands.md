@@ -30,7 +30,8 @@ The system-management protocol is additive and uses single-line `OK key=value` o
 |networkSet|Enables or disables wireless communication|`enabled` or `disabled`|`networkSet disabled`|
 |lockScreenStatus|Reports Horizon's persistent sleep-mode lock-screen flag|none|`lockScreenStatus`|
 |lockScreenSet|Enables or disables Horizon's persistent sleep-mode lock-screen flag|`enabled` or `disabled`|`lockScreenSet disabled`|
-|applicationTerminate|Terminates only the current foreground application|none|`applicationTerminate`|
+|applicationTerminate|Terminates only the current foreground application (system-level final termination; the forced fallback after the HOME-menu graceful-close timeout)|none|`applicationTerminate`|
+|gameLaunchHeadless|Headless-launches a game by Title ID: starts the process without bringing it to the screen (16 hex digits, non-zero)|titleId|`gameLaunchHeadless 01006F8002326000`|
 
 Arbitrary strings are returned as uppercase hexadecimal bytes with an adjacent `*Len` field.
 Grouped queries return `NA` for unavailable optional fields and append native Result values in
@@ -72,6 +73,29 @@ undo; record the previous value before changing it if you need to restore state.
 session is initialized and released per command, so the sysmodule keeps no permanent `aud:ctl`
 session. Research notes comparing `aud:ctl` with process-level `aud:a` volume are in
 `docs/research/audio-control.md`.
+
+## Game control
+
+`gameLaunchHeadless` starts an installed title's process and is additive; `applicationStatus` and
+`applicationTerminate` are unchanged and shared with the system-management group. The
+`systemCapabilities` response advertises `game=launchHeadless`.
+
+`gameLaunchHeadless` returns `OK action=launched pid=<PID> titleId=<TITLEID> storage=<STORAGE>`, where
+`<STORAGE>` is the install storage pm accepted (`SdCard`, `BuiltInUser`, `GameCard` or `None`).
+The service tries the common storages in order (SD card, built-in user, game card, then `None`)
+because launching with `NcmStorageId_None` alone makes the loader/fsp unable to resolve the
+installed title's path and fails with an lr path-not-found result. Invalid Title IDs return
+`ERR code=INVALID_ARGUMENTS`; launch failures return `ERR code=COMMAND_FAILED` or
+`ERR code=SERVICE_UNAVAILABLE`. Headless launch only starts the process: it does not switch the
+screen to the game (foreground presentation requires the home-menu/applet flow, which is not
+reachable from a sysmodule). Starting it takes effect immediately with no confirmation and will
+fail if another application is already running. The Title ID may be bare hex or carry an
+optional `0x`/`0X` prefix.
+
+There is no generic graceful-close API for sysmodules: the HOME-menu close flow uses
+`IApplicationAccessor.RequestExit`, which is only reachable by system applets (qlaunch), so
+`applicationTerminate` (`pmshellTerminateProgram`) is the supported final-termination path.
+See `docs/research/game-lifecycle.md` for the full research notes.
 
 ## SD card FTP server
 
