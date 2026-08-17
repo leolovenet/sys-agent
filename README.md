@@ -138,6 +138,29 @@ release and fully restart the console. To roll back, restore the directory backe
 installation and restart again. Do not mix `exefs.nsp` from one release with packaging files
 from another release.
 
+### Deploy from source
+
+`deploy_sysagent.py` **updates** an existing sys-agent installation on a running Switch. It
+builds the current tree with the pinned Docker image, then installs the new build over the
+built-in FTP server and reboots into emuMMC — without removing the SD card. It requires that
+sys-agent is already installed and running on the Switch, because it relies on the built-in
+FTP server (port `6001`) and the reboot command (port `6000`). For a first-time installation
+on a console without sys-agent, use the manual steps in [Installation](#installation)
+instead.
+
+```bash
+python3 deploy_sysagent.py
+python3 deploy_sysagent.py --no-build --dry-run   # preview only, no Switch access
+```
+
+The update uploads the new `exefs.nsp` as `exefs.nsp.new`, verifies the byte count, renames
+it atomically over the running file, requests `systemRebootEmuMMC` to reboot directly into
+the virtual system (pass `--normal-reboot` for a plain reboot), and waits until the console
+answers a command round-trip before checking that the new build advertises
+`audio=volume,mute`. `--verify-only` performs just that wait-and-check on a console that is
+already rebooting. The script intentionally does not back up the Switch-side sys-agent; to
+roll back, re-deploy an older build or edit the SD card manually.
+
 ### Build with Docker
 
 This branch is built with the pinned official devkitPro image:
