@@ -9,6 +9,7 @@ non-FTP sys-agent command behind grouped subcommands; FTP is intentionally not b
 ```
 backend   Inspect or configure the process-memory backend
 system    Query or control system state
+audio     Query or control system audio
 memory    Read or write process memory
 freeze    Manage value freezing
 input     Send controller, touch, or keyboard input
@@ -49,6 +50,21 @@ python3 client/sysagent.py --host switch system action reboot-emummc
 `system query network-profile` returns the Wi-Fi passphrase over an unauthenticated,
 unencrypted TCP connection. Use it only on a trusted isolated network. The client never
 automatically retries reboot, shutdown, sleep, wireless changes, or application termination.
+
+## Audio
+
+```bash
+python3 client/sysagent.py --host switch audio volume
+python3 client/sysagent.py --host switch audio volume 30
+python3 client/sysagent.py --host switch audio mute
+python3 client/sysagent.py --host switch audio mute enabled
+```
+
+Volume is reported and set as an integer `0..100`; the server maps it to the audctl
+`0.0..1.0` float range and the master-volume API requires firmware 4.0.0+. Mute applies to the
+current (or default) audio output target. Volume and mute changes are immediate system-wide
+side effects with no confirmation or undo; query first if you need to restore the previous
+state.
 
 ## Screen
 

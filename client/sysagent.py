@@ -299,6 +299,18 @@ class SysAgentClient:
         state = "enabled" if enabled else "disabled"
         return require_ok(self.command(f"lockScreenSet {state}"))
 
+    def audio_volume(self, volume: int | None = None) -> dict[str, str]:
+        if volume is not None and not (0 <= volume <= 100):
+            raise ValueError("volume must be in 0..100")
+        command = "audioVolume" if volume is None else f"audioVolume {volume}"
+        return require_ok(self.command(command))
+
+    def audio_mute(self, state: str | None = None) -> dict[str, str]:
+        if state is not None and state not in {"enabled", "disabled"}:
+            raise ValueError("state must be enabled or disabled")
+        command = "audioMute" if state is None else f"audioMute {state}"
+        return require_ok(self.command(command))
+
     # ---- Legacy memory read -------------------------------------------------
 
     def peek(self, offset: int, size: int) -> str:
@@ -768,6 +780,14 @@ def _cmd_lock_screen(client: SysAgentClient, args: argparse.Namespace) -> None:
     print_fields(response)
 
 
+def _cmd_audio_volume(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.audio_volume(args.volume))
+
+
+def _cmd_audio_mute(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.audio_mute(args.state))
+
+
 def _cmd_screenshot(client: SysAgentClient, args: argparse.Namespace) -> None:
     data = client.screenshot()
     output = args.output or f"screenshot-{int(time.time())}.jpg"
@@ -1021,6 +1041,17 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
         Command("lock-screen", "Show or change the lock-screen flag", _cmd_lock_screen,
                 (Arg("state", "status, enabled, or disabled",
                      choices=("status", "enabled", "disabled")),)),
+    )),
+
+    CommandGroup("audio", "Query or control system audio", (
+        Command("volume", "Show or set the system master volume (0-100)",
+                _cmd_audio_volume,
+                (Arg("volume", "0-100 to set; omit to query", nargs="?", type=parse_int,
+                     default=None),)),
+        Command("mute", "Show or set the current output target mute state",
+                _cmd_audio_mute,
+                (Arg("state", "enabled or disabled; omit to query", nargs="?",
+                     choices=("enabled", "disabled"), default=None),)),
     )),
 
     CommandGroup("memory", "Read or write process memory", (

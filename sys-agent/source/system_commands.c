@@ -459,6 +459,88 @@ static void lockScreenSet(bool enabled)
     printf("OK lockScreen=%d\n", enabled);
 }
 
+static const char* audioTargetName(AudioTarget target)
+{
+    switch (target) {
+        case AudioTarget_Speaker: return "speaker";
+        case AudioTarget_Headphone: return "headphone";
+        case AudioTarget_Tv: return "tv";
+        case AudioTarget_UsbOutputDevice: return "usb";
+        case AudioTarget_Bluetooth: return "bluetooth";
+        default: return "invalid";
+    }
+}
+
+static bool audioResolveTarget(AudioTarget* target)
+{
+    Result rc = audctlGetActiveOutputTarget(target);
+    if (R_SUCCEEDED(rc) && *target != AudioTarget_Invalid)
+        return true;
+    rc = audctlGetDefaultTarget(target);
+    return R_SUCCEEDED(rc) && *target != AudioTarget_Invalid;
+}
+
+static void audioVolumeCommand(bool set, u64 value)
+{
+    Result rc = audctlInitialize();
+    if (R_FAILED(rc)) {
+        printServiceError("aud:ctl", rc);
+        return;
+    }
+    if (set) {
+        rc = audctlSetSystemOutputMasterVolume((float)value / 100.0f);
+        if (R_FAILED(rc)) {
+            audctlExit();
+            printCommandError("setMasterVolume", rc);
+            return;
+        }
+    }
+    float volume = 0.0f;
+    rc = audctlGetSystemOutputMasterVolume(&volume);
+    audctlExit();
+    if (R_FAILED(rc)) {
+        printCommandError("getMasterVolume", rc);
+        return;
+    }
+    u64 rounded = (u64)(volume * 100.0f + 0.5f);
+    if (rounded > 100)
+        rounded = 100;
+    printf("OK volume=%lu\n", rounded);
+    fflush(stdout);
+}
+
+static void audioMuteCommand(const char* state)
+{
+    Result rc = audctlInitialize();
+    if (R_FAILED(rc)) {
+        printServiceError("aud:ctl", rc);
+        return;
+    }
+    AudioTarget target = AudioTarget_Invalid;
+    if (!audioResolveTarget(&target)) {
+        audctlExit();
+        printf("ERR code=NO_AUDIO_TARGET\n");
+        return;
+    }
+    if (state) {
+        rc = audctlSetTargetMute(target, !strcmp(state, "enabled"));
+        if (R_FAILED(rc)) {
+            audctlExit();
+            printCommandError("setTargetMute", rc);
+            return;
+        }
+    }
+    bool mute = false;
+    rc = audctlIsTargetMute(&mute, target);
+    audctlExit();
+    if (R_FAILED(rc)) {
+        printCommandError("isTargetMute", rc);
+        return;
+    }
+    printf("OK mute=%d target=%s\n", mute ? 1 : 0, audioTargetName(target));
+    fflush(stdout);
+}
+
 static void applicationTerminate(void)
 {
     u64 pid, titleId;
@@ -493,7 +575,8 @@ bool systemCommandsDispatch(int argc, char** argv)
         || !strcmp(command, "systemShutdown")
         || !strcmp(command, "systemSleep") || !strcmp(command, "networkSet")
         || !strcmp(command, "lockScreenStatus") || !strcmp(command, "lockScreenSet")
-        || !strcmp(command, "applicationTerminate");
+        || !strcmp(command, "applicationTerminate")
+        || !strcmp(command, "audioVolume") || !strcmp(command, "audioMute");
     if (!known) return false;
 
     if (!strcmp(command, "processList")) {
@@ -522,13 +605,42 @@ bool systemCommandsDispatch(int argc, char** argv)
         lockScreenSet(!strcmp(argv[1], "enabled"));
         return true;
     }
+    if (!strcmp(command, "audioVolume")) {
+        u64 volume = 0;
+        bool set = false;
+        if (argc == 2) {
+            if (!tryParseStringToInt(argv[1], &volume) || volume > 100) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return true;
+            }
+            set = true;
+        }
+        else if (argc != 1) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        audioVolumeCommand(set, volume);
+        return true;
+    }
+    if (!strcmp(command, "audioMute")) {
+        if (argc == 2 && strcmp(argv[1], "enabled") && strcmp(argv[1], "disabled")) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        if (argc > 2) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        audioMuteCommand(argc == 2 ? argv[1] : NULL);
+        return true;
+    }
     if (argc != 1) {
         printf("ERR code=INVALID_ARGUMENTS\n");
         return true;
     }
 
     if (!strcmp(command, "systemCapabilities"))
-        printf("OK version=1 queries=systemInfo,systemTime,powerStatus,storageStatus,networkStatus,networkProfile,accountStatus,applicationStatus,processList,lockScreenStatus actions=systemReboot,systemRebootEmuMMC,systemShutdown,systemSleep,networkSet,lockScreenSet,applicationTerminate processPageMax=%d sensitiveData=serial,account,wifiPassphrase authentication=none sleep=experimental rebootEmuMMCMariko=validated rebootEmuMMCErista=experimental\n", PROCESS_PAGE_MAX);
+        printf("OK version=1 queries=systemInfo,systemTime,powerStatus,storageStatus,networkStatus,networkProfile,accountStatus,applicationStatus,processList,lockScreenStatus actions=systemReboot,systemRebootEmuMMC,systemShutdown,systemSleep,networkSet,lockScreenSet,applicationTerminate processPageMax=%d audio=volume,mute sensitiveData=serial,account,wifiPassphrase authentication=none sleep=experimental rebootEmuMMCMariko=validated rebootEmuMMCErista=experimental\n", PROCESS_PAGE_MAX);
     else if (!strcmp(command, "systemInfo")) systemInfo();
     else if (!strcmp(command, "systemTime")) systemTimeCommand();
     else if (!strcmp(command, "powerStatus")) powerStatus();

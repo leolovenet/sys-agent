@@ -49,6 +49,30 @@ rewrites `hekate_ipl.ini` and never falls back to a guessed entry.
 The Mariko path passed real-device acceptance on the current `model=3` console and booted the
 `Atm-Emu` entry directly. The Erista payload-copy branch remains experimental.
 
+## Audio control
+
+The audio commands use the `aud:ctl` service through libnx `audctl` and are additive: existing
+commands and responses are unchanged. The system master volume is reported and set as an
+integer `0..100`; the server maps it to the audctl `0.0..1.0` float range. Mute is tracked per
+audio output target; the server targets the active output and falls back to the default target.
+
+|Command|Description|Parameters|Usage|
+|--|--|--|--|
+|audioVolume|Reports or sets the system master volume|optional `0..100`|`audioVolume`<br>`audioVolume 30`|
+|audioMute|Reports or sets mute for the current (or default) output target|optional `enabled` or `disabled`|`audioMute`<br>`audioMute enabled`|
+
+Responses follow the `OK key=value` envelope: `OK volume=65`, `OK mute=0 target=Tv`, or
+`OK mute=1 target=headphone`. The master-volume API requires firmware 4.0.0+; older firmware
+returns a native Result as `ERR code=COMMAND_FAILED stage=getMasterVolume|setMasterVolume
+result=0x...`. When no active or default output target exists, mute commands return
+`ERR code=NO_AUDIO_TARGET`.
+
+Volume and mute changes take effect immediately, system-wide, and without any confirmation or
+undo; record the previous value before changing it if you need to restore state. The audctl
+session is initialized and released per command, so the sysmodule keeps no permanent `aud:ctl`
+session. Research notes comparing `aud:ctl` with process-level `aud:a` volume are in
+`docs/research/audio-control.md`.
+
 ## SD card FTP server
 
 This custom build runs a low-priority FTP server independently of the original command socket.

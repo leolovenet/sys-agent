@@ -67,6 +67,12 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 response = "OK lockScreen=0"
             elif command[0] == "lockScreenSet":
                 response = f"OK lockScreen={1 if command[1] == 'enabled' else 0}"
+            elif command[0] == "audioVolume":
+                volume = command[1] if len(command) == 2 else "65"
+                response = f"OK volume={volume}"
+            elif command[0] == "audioMute":
+                mute = 1 if len(command) == 2 and command[1] == "enabled" else 0
+                response = f"OK mute={mute} target=Tv"
             elif command[0] == "searchStatus":
                 state.status_calls += 1
                 status = "running" if state.status_calls == 1 else "done"
@@ -234,6 +240,38 @@ class ClientTests(unittest.TestCase):
                 client.process_list(0, 65)
             with self.assertRaises(ValueError):
                 client.system_action("payload")
+
+    def test_audio_commands(self) -> None:
+        with self.client() as client:
+            self.assertEqual(client.audio_volume()["volume"], "65")
+            self.assertEqual(self.server.state.last_command, ["audioVolume"])
+            self.assertEqual(client.audio_volume(0)["volume"], "0")
+            self.assertEqual(client.audio_volume(100)["volume"], "100")
+            self.assertEqual(client.audio_volume(30)["volume"], "30")
+            self.assertEqual(self.server.state.last_command, ["audioVolume", "30"])
+            self.assertEqual(client.audio_mute()["mute"], "0")
+            self.assertEqual(client.audio_mute()["target"], "Tv")
+            self.assertEqual(client.audio_mute("disabled")["mute"], "0")
+            self.assertEqual(client.audio_mute("enabled")["mute"], "1")
+            self.assertEqual(self.server.state.last_command, ["audioMute", "enabled"])
+            with self.assertRaises(ValueError):
+                client.audio_volume(-1)
+            with self.assertRaises(ValueError):
+                client.audio_volume(101)
+            with self.assertRaises(ValueError):
+                client.audio_mute("maybe")
+
+    def test_audio_cli(self) -> None:
+        from client.sysagent import main
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "audio", "volume"])
+        self.assertEqual(code, 0)
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "audio", "volume", "30"])
+        self.assertEqual(code, 0)
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "audio", "mute", "enabled"])
+        self.assertEqual(code, 0)
 
     def test_unknown_search_commands_and_status_fields(self) -> None:
         with self.client() as client:
