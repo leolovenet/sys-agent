@@ -23,13 +23,17 @@ process-memory backend that can coexist with Atmosphère cheats.
   multi-pass refinement without keeping millions of candidates in the sysmodule heap.
 - Search sessions pin their process ID and backend, preventing a running scan from silently
   switching to a different process or debug owner.
+- An isolated, low-priority FTP worker exposes the SD card at `ftp://switch:6001` while a game
+  remains open. It supports normal file and directory CRUD and can be controlled over the
+  existing sys-botbase TCP connection.
 - The original controller, screen-capture, and memory commands remain available. New commands
   are additive so existing clients can continue to ignore capabilities they do not use.
 
 See [commands.md](commands.md), [the memory-backend design](docs/process-memory-backend.md),
 [the exact-search design](docs/search-a-level-design.md), and
 [the unknown-search design](docs/search-c-level-design.md) for protocol and implementation
-details.
+details. FTP architecture, validation results, known filename limitations, and remaining
+hardware acceptance checks are recorded in [the FTP server notes](docs/ftp-server.md).
 
 A Nintendo Switch (CFW) sysmodule that allows users to remotely control their Switch over a
 TCP socket and read or write game memory. It can be used for bots, automation, and controlled
@@ -53,6 +57,42 @@ memory research.
 
 ### Screen Capture:
 - Capture current screen and return as JPG
+
+### SD card FTP
+
+The custom build starts an anonymous FTP server on port `6001` by default. Its root is the SD
+card root; it does not expose BIS, save data, gamecard, or other system mounts.
+
+The FTP core runs as one event-driven worker thread and accepts up to four simultaneous client
+sessions. Connections and transfers are polled and advanced in turns; they do not receive one
+thread each and multiple large transfers do not run in true CPU-parallel fashion. Concurrent
+transfers also share Wi-Fi and SD-card bandwidth.
+
+```bash
+curl ftp://switch:6001/
+printf 'ftpStatus\r\n' | nc -w 3 switch 6000
+printf 'ftpStop\r\n' | nc -w 3 switch 6000
+printf 'ftpStart\r\n' | nc -w 3 switch 6000
+```
+
+Anonymous mode permits uploads, renames, and deletion across the complete SD card. This is
+intended for a trusted development network. For account access, copy
+[`config/ftp.ini.template`](config/ftp.ini.template) to
+`/config/sys-botbase/ftp.ini` on the SD card, set `anonymous=0`, provide both credentials, and
+run `ftpReload`. Invalid credentials or ports leave FTP in an error state without stopping
+the controller or memory service.
+
+ASCII filenames, including spaces, are the supported stable baseline. On the tested Horizon
+SD filesystem, Chinese and Japanese names return native FS `0x202`, while some other non-ASCII
+names can be opened but are not returned reliably by directory enumeration. The server does
+not silently rewrite names; use an ASCII temporary or final filename when transferring such
+files.
+
+Do not run old sys-ftpd on port `6001`. Sphaira normally uses port `5000`, so both can coexist,
+although two writers changing the same file is unsafe. For Atmosphere deployment, upload to a
+temporary filename and rename it only after the transfer completes. During an active C-level
+search, FTP modifications below `/switch/sys-botbase/search` are rejected to protect the
+transactional snapshot.
 
 ## Disclaimer:
 This project was created for the purpose of development for bot automation. The creators and maintainers of this project are not liable for any damages caused or bans received. Use at your own risk.
@@ -102,6 +142,9 @@ docker run --rm \
   devkitpro/devkita64:20260219 \
   bash -lc 'source /opt/devkitpro/switchvars.sh && make clean && make && make test'
 ```
+
+Clone with `--recurse-submodules`, or run `git submodule update --init --recursive` before the
+first build. The build uses the checked-out pinned FTP source and does not download dependencies.
 
 The build produces `sys-botbase/sys-botbase.nsp` and refreshes the ignored installation tree
 at `sys-botbase/430000000000000B`. The NSP is copied there as `exefs.nsp`.

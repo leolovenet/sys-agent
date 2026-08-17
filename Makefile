@@ -9,6 +9,10 @@ clean:
 	@$(MAKE) clean -C sys-botbase/
 
 test:
+	$(HOSTCC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Isys-botbase/source tests/ftp_config_test.c sys-botbase/source/ftp_config.c -o /tmp/sys-botbase-ftp-config-test
+	/tmp/sys-botbase-ftp-config-test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-botbase/source tests/ftp_path_test.c sys-botbase/source/ftp_path.c -o /tmp/sys-botbase-ftp-path-test
+	/tmp/sys-botbase-ftp-path-test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-botbase/source tests/search_match_test.c sys-botbase/source/search_match.c -o /tmp/sys-botbase-search-match-test
 	/tmp/sys-botbase-search-match-test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-botbase/source tests/search_range_test.c sys-botbase/source/search_range.c -o /tmp/sys-botbase-search-range-test

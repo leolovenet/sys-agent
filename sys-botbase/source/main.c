@@ -14,6 +14,7 @@
 #include "freeze.h"
 #include "search.h"
 #include "process_memory.h"
+#include "ftp_server.h"
 #include <poll.h>
 #include <switch/runtime/devices/fs_dev.h>
 
@@ -193,6 +194,52 @@ int argmain(int argc, char** argv)
 {
     if (argc == 0)
         return 0;
+
+    if (!strcmp(argv[0], "ftpStatus"))
+    {
+        if (argc != 1) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        FtpServerStatus status;
+        ftpServerGetStatus(&status);
+        printf("OK state=%s enabled=%d port=%u anonymous=%d transfers=%u bytesSent=%lu bytesReceived=%lu config=%s lastError=%d lastFsResult=0x%X\n",
+            ftpServerStateName(status.state), status.config.enabled, status.config.port,
+            status.config.anonymous, status.activeTransfers, status.bytesSent,
+            status.bytesReceived, ftpConfigResultName(status.configResult), status.lastError,
+            status.lastFsResult);
+        return 0;
+    }
+
+    if (!strcmp(argv[0], "ftpStart") || !strcmp(argv[0], "ftpStop")
+        || !strcmp(argv[0], "ftpRestart") || !strcmp(argv[0], "ftpReload"))
+    {
+        if (argc != 1) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        bool accepted;
+        if (!strcmp(argv[0], "ftpStart"))
+            accepted = ftpServerStart();
+        else if (!strcmp(argv[0], "ftpStop"))
+            accepted = ftpServerStop();
+        else
+            accepted = ftpServerRestart(!strcmp(argv[0], "ftpReload"));
+        if (!accepted) {
+            FtpServerStatus status;
+            ftpServerGetStatus(&status);
+            if (status.configResult != FtpConfigOk)
+                printf("ERR code=FTP_CONFIG_ERROR detail=%s\n",
+                    ftpConfigResultName(status.configResult));
+            else
+                printf("ERR code=FTP_UNAVAILABLE\n");
+            return 0;
+        }
+        FtpServerStatus status;
+        ftpServerGetStatus(&status);
+        printf("OK state=%s\n", ftpServerStateName(status.state));
+        return 0;
+    }
 
     if (!strcmp(argv[0], "memoryBackend"))
     {
@@ -1260,6 +1307,7 @@ int main()
     initFreezes();
     processMemoryInitialize();
     searchInitialize(searchSdMounted);
+    ftpServerInitialize(searchSdMounted);
 
     // freeze thread
     mutexInit(&freezeMutex);
@@ -1374,6 +1422,7 @@ int main()
 
     clearFreezes();
     freeFreezes();
+    ftpServerShutdown();
     searchShutdown();
     processMemoryExit();
 
