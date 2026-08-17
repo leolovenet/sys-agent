@@ -1,5 +1,5 @@
-#ifndef SYSBOT_FTP_SERVER_H
-#define SYSBOT_FTP_SERVER_H
+#ifndef SYSAGENT_FTP_SERVER_H
+#define SYSAGENT_FTP_SERVER_H
 
 #include "ftp_config.h"
 

@@ -1,11 +1,11 @@
-#ifndef SYSBOT_FTP_CONFIG_H
-#define SYSBOT_FTP_CONFIG_H
+#ifndef SYSAGENT_FTP_CONFIG_H
+#define SYSAGENT_FTP_CONFIG_H
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#define FTP_CONFIG_PATH "sdmc:/config/sys-botbase/ftp.ini"
+#define FTP_CONFIG_PATH "sdmc:/config/sys-agent/ftp.ini"
 #define FTP_DEFAULT_PORT 6001
 #define FTP_DEFAULT_TIMEOUT 30
 #define FTP_CREDENTIAL_SIZE 128

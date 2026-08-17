@@ -6,7 +6,7 @@ cannot scan concurrently.
 
 ## Storage model
 
-The dedicated directory is `sdmc:/switch/sys-botbase/search` (`/switch/sys-botbase/search` as
+The dedicated directory is `sdmc:/switch/sys-agent/search` (`/switch/sys-agent/search` as
 seen on the SD card). Startup and explicit session close remove only files inside that
 directory. A session records PID, Title ID, Build ID, backend, type, region, resolved range,
 alignment, and generation.
@@ -36,7 +36,7 @@ The default live scan opens the pinned backend around individual queries and rea
 memory commands can interleave. With `pause=1`, one backend session pauses the process and is
 held for the complete operation; the resume path runs for success, cancellation, and error.
 A pause failure aborts rather than degrading to a live scan.
-The sys-botbase freeze worker skips its write cycle while any C-level search is queued or
+The sys-agent freeze worker skips its write cycle while any C-level search is queued or
 running. This prevents it from holding `freezeMutex` while waiting for the repeatedly acquired
 backend, preserves controller-command responsiveness, and prevents frozen writes from changing
 values during an unknown snapshot. Freeze cycles resume after the operation becomes terminal.

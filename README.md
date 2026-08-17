@@ -1,12 +1,12 @@
-# sys-botbase — leolovenet custom build
+# sys-agent — leolovenet custom build
 
-This fork is an independently maintained sys-botbase build based on upstream v2.5. It keeps
+This fork is an independently maintained sys-agent build based on upstream v2.5. It keeps
 the original TCP protocol compatible while adding Switch-side memory search and a unified
 process-memory backend that can coexist with Atmosphère cheats.
 
 > **Custom-build warning:** this is not an official upstream release. It can read and write
 > game-process memory and runs as an Atmosphère sysmodule. Back up the existing
-> `atmosphere/contents/430000000000000B` directory before installing, and use it only on a
+> `atmosphere/contents/43000000000000A6` directory before installing, and use it only on a
 > console where you understand the risks.
 
 ## Changes in this fork
@@ -25,7 +25,7 @@ process-memory backend that can coexist with Atmosphère cheats.
   switching to a different process or debug owner.
 - An isolated, low-priority FTP worker exposes the SD card at `ftp://switch:6001` while a game
   remains open. It supports normal file and directory CRUD and can be controlled over the
-  existing sys-botbase TCP connection.
+  existing sys-agent TCP connection.
 - Grouped system-management commands report system, power, storage, network, account,
   application, and process state. Additive actions cover normal reboot/shutdown, wireless and
   lock-screen settings, foreground-application termination, and one-shot Hekate emuMMC reboot.
@@ -86,7 +86,7 @@ printf 'ftpStart\r\n' | nc -w 3 switch 6000
 Anonymous mode permits uploads, renames, and deletion across the complete SD card. This is
 intended for a trusted development network. For account access, copy
 [`config/ftp.ini.template`](config/ftp.ini.template) to
-`/config/sys-botbase/ftp.ini` on the SD card, set `anonymous=0`, provide both credentials, and
+`/config/sys-agent/ftp.ini` on the SD card, set `anonymous=0`, provide both credentials, and
 run `ftpReload`. Invalid credentials or ports leave FTP in an error state without stopping
 the controller or memory service.
 
@@ -99,7 +99,7 @@ files.
 Do not run old sys-ftpd on port `6001`. Sphaira normally uses port `5000`, so both can coexist,
 although two writers changing the same file is unsafe. For Atmosphere deployment, upload to a
 temporary filename and rename it only after the transfer completes. During an active C-level
-search, FTP modifications below `/switch/sys-botbase/search` are rejected to protect the
+search, FTP modifications below `/switch/sys-agent/search` are rejected to protect the
 transactional snapshot.
 
 ## Disclaimer:
@@ -108,14 +108,14 @@ This project was created for the purpose of development for bot automation. The 
 ## Installation
 
 1. Download the ZIP from this fork's
-   [latest release](https://github.com/leolovenet/sys-botbase/releases/latest).
+   [latest release](https://github.com/leolovenet/sys-agent/releases/latest).
 2. Power off the Switch and back up the existing directory:
-   `atmosphere/contents/430000000000000B`.
+   `atmosphere/contents/43000000000000A6`.
 3. Extract the ZIP into the **root of the SD card**. The final files must be:
 
    ```text
-   atmosphere/contents/430000000000000B/exefs.nsp
-   atmosphere/contents/430000000000000B/flags/boot2.flag
+   atmosphere/contents/43000000000000A6/exefs.nsp
+   atmosphere/contents/43000000000000A6/flags/boot2.flag
    ```
 
 4. Safely eject the SD card and fully restart the Switch. Restarting only the game is not
@@ -128,12 +128,12 @@ This project was created for the purpose of development for bot automation. The 
    printf 'searchCapabilities\r\n' | nc -w 3 switch 6000
    ```
 
-When installed correctly, sys-botbase will make the docked Joy-Con HOME button glow during
+When installed correctly, sys-agent will make the docked Joy-Con HOME button glow during
 Switch startup. If this does not happen, check the directory layout and `boot2.flag`.
 
 ### Upgrade and rollback
 
-To upgrade, replace the complete `430000000000000B` directory with the one from the new
+To upgrade, replace the complete `43000000000000A6` directory with the one from the new
 release and fully restart the console. To roll back, restore the directory backed up before
 installation and restart again. Do not mix `exefs.nsp` from one release with packaging files
 from another release.
@@ -154,10 +154,10 @@ docker run --rm \
 Clone with `--recurse-submodules`, or run `git submodule update --init --recursive` before the
 first build. The build uses the checked-out pinned FTP source and does not download dependencies.
 
-The build produces `sys-botbase/sys-botbase.nsp` and refreshes the ignored installation tree
-at `sys-botbase/430000000000000B`. The NSP is copied there as `exefs.nsp`.
+The build produces `sys-agent/sys-agent.nsp` and refreshes the ignored installation tree
+at `sys-agent/43000000000000A6`. The NSP is copied there as `exefs.nsp`.
 
-Unknown-search snapshots are runtime-only temporary data under `/switch/sys-botbase/search` on
+Unknown-search snapshots are runtime-only temporary data under `/switch/sys-agent/search` on
 the SD card. They are removed when the session closes or the sysmodule starts again. Do not
 store personal files in that directory.
 

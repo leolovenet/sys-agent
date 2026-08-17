@@ -15,12 +15,12 @@ int main(void)
     assert(!ftpPathResolve("/a/../b", output, sizeof(output)));
     assert(ftpPathResolve("/a/./b", output, sizeof(output)));
 
-    assert(ftpPathIsSearchStorage("/switch/sys-botbase/search"));
-    assert(ftpPathIsSearchStorage("/switch/sys-botbase/search/session.dat"));
-    assert(!ftpPathIsSearchStorage("/switch/sys-botbase/search-old"));
-    assert(!ftpPathIsSearchStorage("/switch/sys-botbase"));
-    assert(!ftpPathCanMutate("/switch/sys-botbase/search/session.dat", true));
-    assert(ftpPathCanMutate("/switch/sys-botbase/search/session.dat", false));
+    assert(ftpPathIsSearchStorage("/switch/sys-agent/search"));
+    assert(ftpPathIsSearchStorage("/switch/sys-agent/search/session.dat"));
+    assert(!ftpPathIsSearchStorage("/switch/sys-agent/search-old"));
+    assert(!ftpPathIsSearchStorage("/switch/sys-agent"));
+    assert(!ftpPathCanMutate("/switch/sys-agent/search/session.dat", true));
+    assert(ftpPathCanMutate("/switch/sys-agent/search/session.dat", false));
     assert(ftpPathCanMutate("/atmosphere/contents/test", true));
 
     puts("ftp_path_test: ok");

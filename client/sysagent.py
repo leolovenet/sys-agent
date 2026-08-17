@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Client for the additive sys-botbase asynchronous exact-search protocol."""
+"""Client for the additive sys-agent asynchronous exact-search protocol."""
 
 from __future__ import annotations
 
@@ -13,29 +13,36 @@ from collections.abc import Iterator
 
 TERMINAL_STATES = {"done", "cancelled", "error"}
 
+# Ordinary command responses are small, but the screenCapture (legacy
+# "pixelPeek") command returns the captured JPEG as a single hex line. The
+# sys-agent capture buffer is 0x7D000 bytes, so the worst-case hex line is
+# 1,048,576 characters plus the newline, which sits exactly at the old 1 MiB
+# cap. 4 MiB gives comfortable headroom for that response.
+RESPONSE_LIMIT = 4 * 1024 * 1024
 
-class SysBotProtocolError(RuntimeError):
+
+class SysAgentProtocolError(RuntimeError):
     pass
 
 
 def parse_response(line: str) -> dict[str, str]:
     parts = line.strip().split()
     if not parts or parts[0] not in {"OK", "ERR"}:
-        raise SysBotProtocolError(f"invalid response: {line!r}")
+        raise SysAgentProtocolError(f"invalid response: {line!r}")
     response = {"result": parts[0]}
     for part in parts[1:]:
         if "=" not in part:
-            raise SysBotProtocolError(f"invalid response field: {part!r}")
+            raise SysAgentProtocolError(f"invalid response field: {part!r}")
         key, value = part.split("=", 1)
         if not key or key in response:
-            raise SysBotProtocolError(f"invalid response key: {key!r}")
+            raise SysAgentProtocolError(f"invalid response key: {key!r}")
         response[key] = value
     return response
 
 
 def require_ok(response: dict[str, str]) -> dict[str, str]:
     if response.get("result") != "OK":
-        raise SysBotProtocolError(f"sys-botbase error: {response.get('code', 'UNKNOWN')}")
+        raise SysAgentProtocolError(f"sys-agent error: {response.get('code', 'UNKNOWN')}")
     return response
 
 
@@ -129,7 +136,7 @@ class BackendStatus:
         )
 
 
-class SysBotSearchClient:
+class SysAgentClient:
     def __init__(self, host: str = "switch", port: int = 6000, timeout: float = 10.0):
         self.host = host
         self.port = port
@@ -137,7 +144,7 @@ class SysBotSearchClient:
         self._socket: socket.socket | None = None
         self._buffer = bytearray()
 
-    def __enter__(self) -> "SysBotSearchClient":
+    def __enter__(self) -> "SysAgentClient":
         self.connect()
         return self
 
@@ -162,22 +169,42 @@ class SysBotSearchClient:
         self.connect()
         assert self._socket is not None
         self._socket.sendall(command.encode("ascii") + b"\r\n")
-        return parse_response(self._readline())
+        return parse_response(self._readline().decode("ascii"))
 
-    def _readline(self) -> str:
+    def _readline(self, max_bytes: int = RESPONSE_LIMIT) -> bytes:
         assert self._socket is not None
         while True:
             newline = self._buffer.find(b"\n")
             if newline >= 0:
                 line = bytes(self._buffer[:newline])
                 del self._buffer[: newline + 1]
-                return line.rstrip(b"\r").decode("ascii")
+                return line.rstrip(b"\r")
             data = self._socket.recv(4096)
             if not data:
-                raise SysBotProtocolError("connection closed before a complete response")
+                raise SysAgentProtocolError("connection closed before a complete response")
             self._buffer.extend(data)
-            if len(self._buffer) > 1024 * 1024:
-                raise SysBotProtocolError("response exceeds 1 MiB safety limit")
+            if len(self._buffer) > max_bytes:
+                raise SysAgentProtocolError(f"response exceeds {max_bytes} byte safety limit")
+
+    def screenshot(self) -> bytes:
+        """Capture the current screen and return the JPEG bytes.
+
+        The sys-agent `screenCapture` command (legacy name `pixelPeek`)
+        returns the JPEG as one bare uppercase-hex line without an OK/ERR
+        envelope. An empty line means the capture failed.
+        """
+        self.connect()
+        assert self._socket is not None
+        self._socket.sendall(b"screenCapture\r\n")
+        line = self._readline()
+        if line.startswith(b"OK ") or line.startswith(b"ERR "):
+            raise SysAgentProtocolError(line.decode("ascii", "replace"))
+        if not line:
+            raise SysAgentProtocolError("screen capture returned an empty response")
+        try:
+            return bytes.fromhex(line.decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise SysAgentProtocolError(f"invalid screen capture response: {error}") from error
 
     def capabilities(self) -> dict[str, str]:
         return require_ok(self.command("searchCapabilities"))
@@ -333,7 +360,7 @@ class SysBotSearchClient:
         addresses = [] if not addresses_text else [int(value, 16) for value in addresses_text.split(",")]
         expected = parse_int(response["count"])
         if len(addresses) != expected:
-            raise SysBotProtocolError(f"response count says {expected}, received {len(addresses)} addresses")
+            raise SysAgentProtocolError(f"response count says {expected}, received {len(addresses)} addresses")
         return addresses, parse_int(response["stored"])
 
     def iter_results(self, session: int, page_size: int = 256) -> Iterator[int]:
@@ -401,6 +428,10 @@ def build_parser() -> argparse.ArgumentParser:
     lock_screen = subparsers.add_parser("lock-screen")
     lock_screen.add_argument("state", choices=("status", "enabled", "disabled"))
 
+    screenshot = subparsers.add_parser("screenshot")
+    screenshot.add_argument("--output",
+        help="write the JPEG to this path (default: screenshot-<unix time>.jpg)")
+
     start = subparsers.add_parser("start")
     start.add_argument("start", type=lambda value: int(value, 0))
     start.add_argument("end", type=lambda value: int(value, 0))
@@ -435,7 +466,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        with SysBotSearchClient(args.host, args.port, args.timeout) as client:
+        with SysAgentClient(args.host, args.port, args.timeout) as client:
             if args.action == "capabilities":
                 print_fields(client.capabilities())
             elif args.action == "backend":
@@ -458,6 +489,12 @@ def main(argv: list[str] | None = None) -> int:
                 response = client.lock_screen_status() if args.state == "status" \
                     else client.set_lock_screen(args.state == "enabled")
                 print_fields(response)
+            elif args.action == "screenshot":
+                data = client.screenshot()
+                output = args.output or f"screenshot-{int(time.time())}.jpg"
+                with open(output, "wb") as image:
+                    image.write(data)
+                print(output)
             elif args.action == "start":
                 print(client.start(args.start, args.end, args.pattern))
             elif args.action == "start-region":
@@ -491,7 +528,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"0x{address:016X}")
                 return 0 if status.state == "done" else 1
         return 0
-    except (OSError, ValueError, SysBotProtocolError) as error:
+    except (OSError, ValueError, SysAgentProtocolError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 

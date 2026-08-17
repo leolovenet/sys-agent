@@ -14,7 +14,7 @@ static void setBit(uint8_t* mask, unsigned bit)
 int main(void)
 {
     char path[128];
-    snprintf(path, sizeof(path), "/tmp/sys-botbase-store-%ld.dat", (long)getpid());
+    snprintf(path, sizeof(path), "/tmp/sys-agent-store-%ld.dat", (long)getpid());
     remove(path);
     SearchStoreMetadata metadata = {
         .processId = 7,
@@ -85,7 +85,7 @@ int main(void)
     searchStoreReaderClose(&reader);
 
     char directory[128], child[160], sibling[160];
-    snprintf(directory, sizeof(directory), "/tmp/sys-botbase-store-dir-%ld", (long)getpid());
+    snprintf(directory, sizeof(directory), "/tmp/sys-agent-store-dir-%ld", (long)getpid());
     snprintf(child, sizeof(child), "%s/session.tmp", directory);
     snprintf(sibling, sizeof(sibling), "%s-sibling", directory);
     assert(searchStorePrepareDirectory(directory));
@@ -100,9 +100,9 @@ int main(void)
     rmdir(directory);
 
     char current[128], temporaryPath[128], backup[128];
-    snprintf(current, sizeof(current), "/tmp/sys-botbase-current-%ld", (long)getpid());
-    snprintf(temporaryPath, sizeof(temporaryPath), "/tmp/sys-botbase-temp-%ld", (long)getpid());
-    snprintf(backup, sizeof(backup), "/tmp/sys-botbase-backup-%ld", (long)getpid());
+    snprintf(current, sizeof(current), "/tmp/sys-agent-current-%ld", (long)getpid());
+    snprintf(temporaryPath, sizeof(temporaryPath), "/tmp/sys-agent-temp-%ld", (long)getpid());
+    snprintf(backup, sizeof(backup), "/tmp/sys-agent-backup-%ld", (long)getpid());
     FILE* currentFile = fopen(current, "wb");
     assert(currentFile != NULL && fputs("old", currentFile) >= 0 && fclose(currentFile) == 0);
     assert(!searchStoreCommit(temporaryPath, current, backup, true));

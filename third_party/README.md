@@ -5,5 +5,5 @@
 by Sphaira. Its source files identify the project as MIT licensed with SPDX headers, including
 `src/ftpsrv.h` and `src/ftpsrv_vfs.h`.
 
-sys-botbase supplies its own SD-only VFS and lifecycle integration. It does not use Sphaira's
+sys-agent supplies its own SD-only VFS and lifecycle integration. It does not use Sphaira's
 UI, installer, BIS/save/gamecard mounts, or Sphaira-specific callbacks.

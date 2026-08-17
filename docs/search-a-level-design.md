@@ -1,7 +1,7 @@
 # A-level exact-search design and deployment gate
 
 This document records the implementation boundary that was verified before any real-device
-deployment. The feature is additive and keeps all original sys-botbase commands unchanged.
+deployment. The feature is additive and keeps all original sys-agent commands unchanged.
 
 ## Scope
 
@@ -79,7 +79,7 @@ Build and test with the fixed toolchain:
 ```bash
 docker run --rm \
   --platform linux/amd64 \
-  -v "/Users/leo/Documents/switch 金手指/src/sys-botbase:/work" \
+  -v "/Users/leo/Documents/switch 金手指/src/sys-agent:/work" \
   -w /work \
   devkitpro/devkita64:20260219 \
   bash -lc 'source /opt/devkitpro/switchvars.sh && make clean && make && make test'
@@ -90,7 +90,7 @@ docker run --rm \
 Compilation and simulated tests do not validate Horizon SVC behavior, scheduling latency, ACNH
 mapping changes, or interaction with Atmosphere's debug manager. Before deployment:
 
-1. Back up the exact currently installed official sys-botbase directory and hashes.
+1. Back up the exact currently installed official sys-agent directory and hashes.
 2. Prepare a tested SD-card rollback path before replacing `exefs.nsp`.
 3. With the unified backend build, keep ACNH cheats enabled and require
    `memoryBackendProbe` to report `active=dmnt`. Disable the title contents directory only when

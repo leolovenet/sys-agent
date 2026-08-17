@@ -1,21 +1,21 @@
-# sys-botbase exact-search client
+# sys-agent exact-search client
 
 This dependency-free Python client speaks the additive asynchronous search protocol. It does
-not deploy sys-botbase or write target-process memory.
+not deploy sys-agent or write target-process memory.
 
 It also exposes the grouped system-management protocol:
 
 ```bash
-python3 client/sysbot_search.py --host switch system-capabilities
-python3 client/sysbot_search.py --host switch system-query info
-python3 client/sysbot_search.py --host switch system-query power
-python3 client/sysbot_search.py --host switch system-query network
-python3 client/sysbot_search.py --host switch process-list --offset 0 --count 64
-python3 client/sysbot_search.py --host switch wireless enabled
-python3 client/sysbot_search.py --host switch lock-screen status
-python3 client/sysbot_search.py --host switch lock-screen disabled
-python3 client/sysbot_search.py --host switch system-action reboot
-python3 client/sysbot_search.py --host switch system-action reboot-emummc
+python3 client/sysagent.py --host switch system-capabilities
+python3 client/sysagent.py --host switch system-query info
+python3 client/sysagent.py --host switch system-query power
+python3 client/sysagent.py --host switch system-query network
+python3 client/sysagent.py --host switch process-list --offset 0 --count 64
+python3 client/sysagent.py --host switch wireless enabled
+python3 client/sysagent.py --host switch lock-screen status
+python3 client/sysagent.py --host switch lock-screen disabled
+python3 client/sysagent.py --host switch system-action reboot
+python3 client/sysagent.py --host switch system-action reboot-emummc
 ```
 
 `network-profile` returns the Wi-Fi passphrase over an unauthenticated, unencrypted TCP
@@ -23,18 +23,29 @@ connection. Use it only on a trusted isolated network. The client never automati
 reboot, shutdown, sleep, wireless changes, or application termination; connection closure
 before a complete response is an expected possible outcome for these operations.
 
+Capture the current screen as a JPEG:
+
+```bash
+python3 client/sysagent.py --host switch screenshot --output screen.jpg
+```
+
+Without `--output`, the client writes `screenshot-<unix timestamp>.jpg` in the current
+directory and prints the path. The Switch side exposes this as `screenCapture` (legacy name
+`pixelPeek`); the JPEG arrives as a single hex line, which is why the client response buffer
+allows up to 4 MiB.
+
 Check capabilities:
 
 ```bash
-python3 client/sysbot_search.py --host switch capabilities
+python3 client/sysagent.py --host switch capabilities
 ```
 
 Inspect or select the shared process-memory backend and probe it:
 
 ```bash
-python3 client/sysbot_search.py --host switch backend
-python3 client/sysbot_search.py --host switch backend auto
-python3 client/sysbot_search.py --host switch backend-probe
+python3 client/sysagent.py --host switch backend
+python3 client/sysagent.py --host switch backend auto
+python3 client/sysagent.py --host switch backend-probe
 ```
 
 `auto` prefers Atmosphere `dmnt:cht`; `dmnt` requires it; `direct` preserves the original
@@ -44,7 +55,7 @@ Run an exact search over an exclusive absolute range, poll until completion, and
 stored matching addresses:
 
 ```bash
-python3 client/sysbot_search.py --host switch search \
+python3 client/sysagent.py --host switch search \
   0x80000000 0x80010000 DEADBEEF
 ```
 
@@ -54,14 +65,14 @@ individually. Pressing Control-C during `search` sends `searchCancel` before exi
 Start a typed little-endian search over the first 16 MiB of the heap, aligned to four bytes:
 
 ```bash
-python3 client/sysbot_search.py --host switch start-region \
+python3 client/sysagent.py --host switch start-region \
   u32 heap 0 0x1000000 0x12345678 --alignment 4
 ```
 
 Search raw bytes in a main-relative range:
 
 ```bash
-python3 client/sysbot_search.py --host switch start-region \
+python3 client/sysagent.py --host switch start-region \
   bytes main 0 0x100000 DEADBEEF
 ```
 
@@ -72,7 +83,7 @@ one-byte alignment for byte patterns.
 Unknown-value searches are also available from Python:
 
 ```python
-with SysBotSearchClient("switch") as client:
+with SysAgentClient("switch") as client:
     session = client.begin_unknown("u32", "heap", 0, 0x100000, pause=False)
     client.wait(session)
 

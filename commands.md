@@ -65,19 +65,19 @@ large transfers are interleaved and share network and SD-card throughput.
 |ftpStart|Asynchronously starts the server using the loaded configuration|none|`ftpStart`|
 |ftpStop|Asynchronously closes the listener, clients, transfers, and open FTP files|none|`ftpStop`|
 |ftpRestart|Restarts the server without rereading the configuration file|none|`ftpRestart`|
-|ftpReload|Stops the server, rereads `/config/sys-botbase/ftp.ini`, and applies `enabled`|none|`ftpReload`|
+|ftpReload|Stops the server, rereads `/config/sys-agent/ftp.ini`, and applies `enabled`|none|`ftpReload`|
 
 The configuration defaults to `enabled=1`, `port=6001`, `anonymous=1`, and `timeout=30` when
 the file is absent. If anonymous access is disabled, both `username` and `password` are
-required. Commands are additive and never emit unsolicited FTP events on a sys-botbase client.
+required. Commands are additive and never emit unsolicited FTP events on a sys-agent client.
 
 FTP grants complete SD read/write/create/rename/delete access. During a queued or running
-C-level search, mutations within `/switch/sys-botbase/search` return an FTP error; reads and
+C-level search, mutations within `/switch/sys-agent/search` return an FTP error; reads and
 all unrelated paths remain available.
 
 The tested stable filename set is ASCII, including spaces. Horizon's SD filesystem returned
 native Result `0x202` for Chinese and Japanese filenames and enumerated other non-ASCII names
-inconsistently. sys-botbase reports the latest native error as `lastFsResult` and does not
+inconsistently. sys-agent reports the latest native error as `lastFsResult` and does not
 silently rename a requested path.
 
 ## Process memory backend
@@ -95,11 +95,11 @@ of attempting a conflicting second `svcDebugActiveProcess`.
 
 Policies are runtime-only and reset to `auto` when the sysmodule restarts. `dmnt` never falls
 back to direct; `direct` never contacts dmnt. Policy changes are rejected with `BUSY` while a
-search is queued or running. sys-botbase never force-closes dmnt's cheat process.
+search is queued or running. sys-agent never force-closes dmnt's cheat process.
 
-Turning off individual cheat entries does not disable `dmnt:cht`. In auto mode sys-botbase may
+Turning off individual cheat entries does not disable `dmnt:cht`. In auto mode sys-agent may
 still ask dmnt to attach, and Atmosphere retains ownership of that shared debug handle. In
-direct mode, sys-botbase owns the handle only for the current command, freeze cycle, mapping
+direct mode, sys-agent owns the handle only for the current command, freeze cycle, mapping
 query, or search read and closes it immediately afterward.
 
 ## Asynchronous exact memory search
@@ -126,7 +126,7 @@ after that limit, and reports `truncated=1`. A result page is limited to 256 add
 
 Search commands return one newline-terminated `OK ...` or `ERR code=...` response. Progress is
 polled with `searchStatus`; the worker never writes unsolicited data to a client socket.
-The dependency-free macOS client and examples are in `client/sysbot_search.py` and
+The dependency-free macOS client and examples are in `client/sysagent.py` and
 `client/README.md`. Deployment constraints and the concurrency/memory audit are recorded in
 `docs/search-a-level-design.md`.
 
@@ -163,14 +163,14 @@ temporary generation and preserves the last committed generation for retry.
 The session pins PID, Title ID, Build ID, and memory backend until `searchClose`. Backend policy
 changes return `BUSY` during that lifetime. Status appends `kind`, `generation`, `candidates`,
 `operation`, `diskBytes`, `pause`, `committed`, `resumable`, and `failure`. Temporary files live
-only in `/switch/sys-botbase/search`; startup and `searchClose` clean that dedicated directory.
+only in `/switch/sys-agent/search`; startup and `searchClose` clean that dedicated directory.
 
-Before writing a generation, sys-botbase checks that the SD has room for the estimated output
+Before writing a generation, sys-agent checks that the SD has room for the estimated output
 plus a 64 MiB reserve. C-level search can return `SD_UNAVAILABLE`, `INSUFFICIENT_STORAGE`,
 `CORRUPT_SESSION`, `PROCESS_CHANGED`, `PAUSE_FAILED`, or `IO_ERROR`. A requested pause never
 silently falls back to a live scan, and every successfully paused operation attempts to resume
 the game on completion, cancellation, or error.
-The sys-botbase freeze worker temporarily skips writes during every active C-level operation;
+The sys-agent freeze worker temporarily skips writes during every active C-level operation;
 it resumes automatically when that operation completes, is cancelled, or fails.
 
 C-level scans process memory in 256 KiB blocks and yield the sysmodule's only permitted CPU
@@ -254,14 +254,14 @@ See https://switchbrew.github.io/libnx/hid_8h.html HidKeyboardKey and HidKeyboar
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
 |key|Types several keys on the keyboard in sequence|1. HidKeyboardKey1<br>...<br>n. HidKeyboardKeyN|key 11 8 15 15 18|
-|keyMod|Types several keys on the keyboard in sequence with modifier keys<br>Do not bitshift the modifiers yourself, sys-botbase will do the shifting| 1. HidKeyboardKey1<br>2.HidKeyboardModifier1<br>...<br>n-1. HidKeyboardKeyN<br>n. HidKeyboardModifierN|keyMod 4 1|
+|keyMod|Types several keys on the keyboard in sequence with modifier keys<br>Do not bitshift the modifiers yourself, sys-agent will do the shifting| 1. HidKeyboardKey1<br>2.HidKeyboardModifier1<br>...<br>n-1. HidKeyboardKeyN<br>n. HidKeyboardModifierN|keyMod 4 1|
 |keyMulti|Presses several keys at the same time|1. HidKeyboardKey1<br>...<br>n. HidKeyboardKeyN|keyMulti 224 226 23|
 
 
 ## Screen Control
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
-|pixelPeek|Returns .jpg file of the current screen|none|pixelPeek|
+|screenCapture|Returns a JPEG of the current screen; `pixelPeek` is kept as a legacy alias|none|screenCapture|
 |screenOff|Turns the screen off|none|screenOff|
 |screenOn|Turns the screen on|none|screenOn|
 
@@ -277,11 +277,11 @@ See https://switchbrew.github.io/libnx/hid_8h.html HidKeyboardKey and HidKeyboar
 |getMainNsoBase|Returns Memory address of the NSOMain|none|getMainNsoBase|
 |isProgramRunning|Checks if program with given id is running|1. programID to check| isProgramRunning 0x420000000007e51a|
 |game|Returns Metadata about the running game|1. one of the following<br>**icon** IconData<br>**version** Game Version<br>**rating** age rating<br>**author** Author of the game<br>**name** Name of the game|game rating|
-|getVersion|Returns version of sys-botbased used|none|getVersion|
+|getVersion|Returns the sys-agent version|none|getVersion|
 |charge|Returns charge status of the battery|none|charge|
 
 ## Configure
-The configure command allows setting of some timing values in sys-botbase:
+The configure command allows setting of some timing values in sys-agent:
 |Configure parameter|Description|Parameters|Usage|
 |--|--|--|--|
 |mainLoopSleepTime|Time the main thread sleeps after every single command<br>default 50ms|1. New time in ms to sleep after every command|configure mainLoopSleepTime 10|

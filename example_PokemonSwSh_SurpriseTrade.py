@@ -14,7 +14,7 @@ def sendCommand(s, content):
     s.sendall(content.encode())
 
 
-# sys-botbase port is compiled for 6000
+# sys-agent port is compiled for 6000
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.connect(("192.168.178.25", 6000))
 

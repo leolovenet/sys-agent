@@ -4,7 +4,7 @@ import socketserver
 import threading
 import unittest
 
-from client.sysbot_search import SysBotProtocolError, SysBotSearchClient, parse_response
+from client.sysagent import SysAgentProtocolError, SysAgentClient, parse_response
 
 
 class FakeState:
@@ -86,6 +86,10 @@ class FakeHandler(socketserver.StreamRequestHandler):
             elif command[0] == "searchClose":
                 state.search_active = False
                 response = "OK session=7 state=closed"
+            elif command[0] == "screenCapture":
+                # Return a JPEG-like payload whose hex line exceeds the old
+                # 1 MiB client cap, proving the raised response limit works.
+                response = (b"\xFF\xD8" + b"\x00" * 600000 + b"\xFF\xD9").hex().upper()
             else:
                 response = "ERR code=UNKNOWN_COMMAND"
             # Split the response to verify that the client handles TCP fragmentation.
@@ -116,8 +120,8 @@ class ClientTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join()
 
-    def client(self) -> SysBotSearchClient:
-        return SysBotSearchClient("127.0.0.1", self.server.server_address[1], timeout=1)
+    def client(self) -> SysAgentClient:
+        return SysAgentClient("127.0.0.1", self.server.server_address[1], timeout=1)
 
     def test_complete_search_and_pagination(self) -> None:
         with self.client() as client:
@@ -182,7 +186,7 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 client.refine(session, "changed", 1)
 
-        from client.sysbot_search import SearchStatus
+        from client.sysagent import SearchStatus
         status = SearchStatus.from_response(parse_response(
             "OK session=9223372036854775809 state=done start=0000000000001000 "
             "end=0000000000002000 scanned=4096 total=4096 matches=1024 stored=1024 "
@@ -199,7 +203,7 @@ class ClientTests(unittest.TestCase):
     def test_backend_policy_change_reports_busy_during_search(self) -> None:
         with self.client() as client:
             client.start(0x80000000, 0x80001000, b"\x00")
-            with self.assertRaisesRegex(SysBotProtocolError, "BUSY"):
+            with self.assertRaisesRegex(SysAgentProtocolError, "BUSY"):
                 client.set_backend_policy("direct")
 
     def test_cancel(self) -> None:
@@ -207,10 +211,32 @@ class ClientTests(unittest.TestCase):
             client.cancel(7)
         self.assertTrue(self.server.state.cancelled)
 
+    def test_screenshot_large_response(self) -> None:
+        expected = b"\xFF\xD8" + b"\x00" * 600000 + b"\xFF\xD9"
+        with self.client() as client:
+            data = client.screenshot()
+            self.assertEqual(data, expected)
+            self.assertEqual(self.server.state.last_command, ["screenCapture"])
+
+    def test_screenshot_cli_writes_file(self) -> None:
+        import os
+        import tempfile
+        from client.sysagent import main
+
+        expected = b"\xFF\xD8" + b"\x00" * 600000 + b"\xFF\xD9"
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "screen.jpg")
+            code = main(["--host", "127.0.0.1",
+                         "--port", str(self.server.server_address[1]),
+                         "--timeout", "1", "screenshot", "--output", output])
+            self.assertEqual(code, 0)
+            with open(output, "rb") as image:
+                self.assertEqual(image.read(), expected)
+
     def test_rejects_malformed_response(self) -> None:
-        with self.assertRaises(SysBotProtocolError):
+        with self.assertRaises(SysAgentProtocolError):
             parse_response("not-a-response")
-        with self.assertRaises(SysBotProtocolError):
+        with self.assertRaises(SysAgentProtocolError):
             parse_response("OK duplicate=1 duplicate=2")
 
     def test_page_size_validation(self) -> None:
@@ -224,7 +250,7 @@ class ClientTests(unittest.TestCase):
             "scanned=4096 total=4096 matches=70000 stored=65536 truncated=1 "
             "readErrors=0 error=0x0"
         )
-        from client.sysbot_search import SearchStatus
+        from client.sysagent import SearchStatus
 
         status = SearchStatus.from_response(response)
         self.assertTrue(status.truncated)

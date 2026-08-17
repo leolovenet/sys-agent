@@ -19,7 +19,7 @@
 #include <poll.h>
 #include <switch/runtime/devices/fs_dev.h>
 
-#define TITLE_ID 0x430000000000000B
+#define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
 #define VERSION_S "2.5"
@@ -873,7 +873,7 @@ int argmain(int argc, char** argv)
         printf("%d\n", isRunning);
     }
 
-    if (!strcmp(argv[0], "pixelPeek")) {
+    if (!strcmp(argv[0], "screenCapture") || !strcmp(argv[0], "pixelPeek")) {
         //errors with 0x668CE, unless debugunit flag is patched
         u64 bSize = 0x7D000;
         char* buf = malloc(bSize);

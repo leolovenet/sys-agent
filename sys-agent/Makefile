@@ -7,14 +7,14 @@ endif
 TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
-TARGET		:=	sys-botbase
+TARGET		:=	sys-agent
 BUILD		:=	build
 SOURCES		:=	source
 FTP_SOURCE_DIR := $(TOPDIR)/../third_party/ftpsrv/src
 DATA		:=	data
 INCLUDES	:=	include
 EXEFS_SRC	:=	exefs_src
-ATMOSPHERE_TITLE_ID := 430000000000000B
+ATMOSPHERE_TITLE_ID := 43000000000000A6
 SD_LAYOUT_DIR := $(CURDIR)/$(ATMOSPHERE_TITLE_ID)
 
 ARCH	:=	-march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE

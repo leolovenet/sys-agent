@@ -22,7 +22,7 @@ int main(int argc, char** argv)
         printf("result=%s index=%u\n", hekateConfigResultName(actual), actualIndex);
         return actual == HekateConfigOk ? 0 : 1;
     }
-    char path[] = "/tmp/sys-botbase-hekate-XXXXXX";
+    char path[] = "/tmp/sys-agent-hekate-XXXXXX";
     int fd = mkstemp(path);
     assert(fd >= 0);
     close(fd);

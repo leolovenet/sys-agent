@@ -11,7 +11,7 @@
 
 #define UNKNOWN_CHUNK_SIZE 0x40000
 #define UNKNOWN_CHUNK_YIELD_NS 20000000L
-#define UNKNOWN_STORAGE_DIR "sdmc:/switch/sys-botbase/search"
+#define UNKNOWN_STORAGE_DIR "sdmc:/switch/sys-agent/search"
 #define UNKNOWN_STORAGE_ROOT "sdmc:/"
 #define UNKNOWN_STORAGE_FILE UNKNOWN_STORAGE_DIR "/session.dat"
 #define UNKNOWN_STORAGE_TEMP UNKNOWN_STORAGE_DIR "/session.tmp"

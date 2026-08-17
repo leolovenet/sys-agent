@@ -1,5 +1,5 @@
-#ifndef SYSBOT_FTP_VFS_SD_H
-#define SYSBOT_FTP_VFS_SD_H
+#ifndef SYSAGENT_FTP_VFS_SD_H
+#define SYSAGENT_FTP_VFS_SD_H
 
 #include <stdbool.h>
 #include <switch.h>

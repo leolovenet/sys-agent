@@ -2,8 +2,8 @@
 
 ## Purpose
 
-Atmosphere dmnt and the original sys-botbase implementation cannot independently attach debug
-handles to the same application. The unified backend makes sys-botbase a `dmnt:cht` IPC client
+Atmosphere dmnt and the original sys-agent implementation cannot independently attach debug
+handles to the same application. The unified backend makes sys-agent a `dmnt:cht` IPC client
 when dmnt is available, so cheats, EdiZon-style access, legacy TCP memory commands, freezes,
 and asynchronous searches share Atmosphere's existing debug handle and locking.
 
@@ -28,7 +28,7 @@ holds one session for metadata and all writes in a cycle. Search captures backen
 at start, then opens that exact backend for one mapping query or 256 KiB read at a time, keeping
 the existing cancellation and command-interleaving behavior.
 
-The dmnt service is initialized lazily; its absence does not prevent sys-botbase from starting.
+The dmnt service is initialized lazily; its absence does not prevent sys-agent from starting.
 Policy is volatile and resets to auto after reboot. Search sessions reject policy changes while
 queued or running.
 
@@ -36,10 +36,10 @@ queued or running.
 
 Disabling individual Atmosphere cheat entries does not mean that `dmnt:cht` is unavailable or
 that dmnt has detached from the game. Under the default auto policy, if the dmnt service is
-available but has not attached, sys-botbase calls `ForceOpenCheatProcess`; dmnt then owns the
+available but has not attached, sys-agent calls `ForceOpenCheatProcess`; dmnt then owns the
 single shared debug handle even when no cheat entry is enabled.
 
-sys-botbase never releases that dmnt-owned handle with `ForceCloseCheatProcess`. It closes only
+sys-agent never releases that dmnt-owned handle with `ForceCloseCheatProcess`. It closes only
 its own IPC service session during sysmodule shutdown. Atmosphere remains responsible for the
 debug handle until it closes the cheat process, the game exits, or the console restarts. This
 preserves other dmnt clients and allows cheats or EdiZon to be enabled later without another
@@ -50,7 +50,7 @@ The direct backend has different ownership. It calls `svcDebugActiveProcess` for
 peek/poke/pointer batch holds one direct handle for the command; the freeze worker holds one per
 freeze cycle; search opens and closes one for each mapping query or 256 KiB read. Failed opens
 that obtained a handle also close it during cleanup. Thus direct handles do not remain owned by
-sys-botbase after an operation finishes.
+sys-agent after an operation finishes.
 
 ## IPC surface
 
