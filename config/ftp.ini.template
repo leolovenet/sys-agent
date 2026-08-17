@@ -1,0 +1,12 @@
+[ftp]
+# The FTP server starts automatically when enabled is 1.
+enabled=1
+port=6001
+
+# Anonymous access has full read/write/delete access to the SD card.
+anonymous=1
+username=
+password=
+
+# Close an inactive FTP session after this many seconds. Zero disables the timeout.
+timeout=30

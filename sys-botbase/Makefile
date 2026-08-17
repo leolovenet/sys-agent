@@ -10,6 +10,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET		:=	sys-botbase
 BUILD		:=	build
 SOURCES		:=	source
+FTP_SOURCE_DIR := $(TOPDIR)/../third_party/ftpsrv/src
 DATA		:=	data
 INCLUDES	:=	include
 EXEFS_SRC	:=	exefs_src
@@ -22,6 +23,15 @@ CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
 			$(ARCH) $(DEFINES)
 
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__
+CFLAGS  +=  -DFTP_PATHNAME_SIZE=769 -DFTP_MAX_SESSIONS=4 -DFTP_FILE_BUFFER_SIZE=65536 \
+			-DFTP_VFS_HEADER='"ftp_vfs_sd.h"' \
+			-DFTP_SOCKET_HEADER='"platform/nx/socket_nx.h"' \
+			-DHAVE_LSTAT=0 -DHAVE_READLINK=0 -DHAVE_GETPWUID=0 -DHAVE_GETGRGID=0 \
+			-DHAVE_STRNCASECMP=1 -DHAVE_LOCALTIME_R=1 -DHAVE_GMTIME_R=1 -DHAVE_POLL=1 \
+			-DHAVE_IPTOS_THROUGHPUT=0 -DHAVE_TCP_NODELAY=1 -DHAVE_SO_KEEPALIVE=1 \
+			-DHAVE_SO_REUSEADDR=1 \
+			-DFTPSRV_VERSION_MAJOR=1 -DFTPSRV_VERSION_MINOR=2 -DFTPSRV_VERSION_PATCH=2 \
+			-DFTPSRV_VERSION_STR='"1.2.2"' -DFTPSRV_VERSION_HASH='"1.2.2-7c82402"'
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 
@@ -38,11 +48,13 @@ export OUTPUT	:=	$(CURDIR)/$(TARGET)
 export TOPDIR	:=	$(CURDIR)
 
 export VPATH	:=	$(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
-			$(foreach dir,$(DATA),$(CURDIR)/$(dir))
+			$(foreach dir,$(DATA),$(CURDIR)/$(dir)) \
+			$(FTP_SOURCE_DIR)
 
 export DEPSDIR	:=	$(CURDIR)/$(BUILD)
 
 CFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+CFILES		+=	ftpsrv.c
 CPPFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
 SFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
 BINFILES	:=	$(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
@@ -60,6 +72,8 @@ export HFILES_BIN	:=	$(addsuffix .h,$(subst .,_,$(BINFILES)))
 
 export INCLUDE	:=	$(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
 			$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
+			-I$(TOPDIR)/source \
+			-I$(FTP_SOURCE_DIR) \
 			-I$(CURDIR)/$(BUILD)
 
 export LIBPATHS	:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib)

@@ -1,5 +1,36 @@
 # Available Commands
 
+## SD card FTP server
+
+This custom build runs a low-priority FTP server independently of the original command socket.
+It listens on port `6001` by default and maps FTP `/` directly to the SD card root. BIS, save
+data, gamecard, and other system mounts are not exposed.
+
+One event-driven FTP worker supports up to four simultaneous client sessions. It polls their
+commands and transfers cooperatively instead of creating one thread per client, so concurrent
+large transfers are interleaved and share network and SD-card throughput.
+
+|Command|Description|Parameters|Usage|
+|--|--|--|--|
+|ftpStatus|Reports lifecycle state, effective configuration, active file transfers, byte counters, lifecycle error, and the latest native FS Result|none|`ftpStatus`|
+|ftpStart|Asynchronously starts the server using the loaded configuration|none|`ftpStart`|
+|ftpStop|Asynchronously closes the listener, clients, transfers, and open FTP files|none|`ftpStop`|
+|ftpRestart|Restarts the server without rereading the configuration file|none|`ftpRestart`|
+|ftpReload|Stops the server, rereads `/config/sys-botbase/ftp.ini`, and applies `enabled`|none|`ftpReload`|
+
+The configuration defaults to `enabled=1`, `port=6001`, `anonymous=1`, and `timeout=30` when
+the file is absent. If anonymous access is disabled, both `username` and `password` are
+required. Commands are additive and never emit unsolicited FTP events on a sys-botbase client.
+
+FTP grants complete SD read/write/create/rename/delete access. During a queued or running
+C-level search, mutations within `/switch/sys-botbase/search` return an FTP error; reads and
+all unrelated paths remain available.
+
+The tested stable filename set is ASCII, including spaces. Horizon's SD filesystem returned
+native Result `0x202` for Chinese and Japanese filenames and enumerated other non-ASCII names
+inconsistently. sys-botbase reports the latest native error as `lastFsResult` and does not
+silently rename a requested path.
+
 ## Process memory backend
 
 All memory commands, pointer traversal, freezes, and asynchronous searches use one shared
@@ -214,5 +245,3 @@ The configure command allows setting of some timing values in sys-botbase:
 |freezeRate|How often frozen values shall be rewritten to RAM<br>default 3ms|1. new freezerate in ms|configure freezeRate 10|
 |controllerType|controllerType to use for controller input commands<br>default 3|See HidDeviceType on https://switchbrew.github.io/libnx/hid_8h.html|configure controllerType 12|
  
-
-
