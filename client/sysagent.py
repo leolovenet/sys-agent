@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Client for the additive sys-agent asynchronous exact-search protocol."""
+"""Dependency-free client for the sys-agent Switch automation protocol."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import dataclasses
 import socket
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 
 TERMINAL_STATES = {"done", "cancelled", "error"}
@@ -29,7 +29,9 @@ def parse_response(line: str) -> dict[str, str]:
     parts = line.strip().split()
     if not parts or parts[0] not in {"OK", "ERR"}:
         raise SysAgentProtocolError(f"invalid response: {line!r}")
-    response = {"result": parts[0]}
+    # The envelope lives under "ok" so it cannot collide with server fields
+    # such as "result=" (native Result codes) or "status=" (networkStatus).
+    response = {"ok": parts[0]}
     for part in parts[1:]:
         if "=" not in part:
             raise SysAgentProtocolError(f"invalid response field: {part!r}")
@@ -41,7 +43,7 @@ def parse_response(line: str) -> dict[str, str]:
 
 
 def require_ok(response: dict[str, str]) -> dict[str, str]:
-    if response.get("result") != "OK":
+    if response.get("ok") != "OK":
         raise SysAgentProtocolError(f"sys-agent error: {response.get('code', 'UNKNOWN')}")
     return response
 
@@ -186,6 +188,37 @@ class SysAgentClient:
             if len(self._buffer) > max_bytes:
                 raise SysAgentProtocolError(f"response exceeds {max_bytes} byte safety limit")
 
+    def _bare_command(self, command_line: str, expect_output: bool = True) -> str | None:
+        """Send a legacy command that answers with a bare line instead of OK/ERR.
+
+        Legacy commands print raw hex, plain text, or nothing. ``expect_output``
+        controls whether a response line is read; an empty response line is
+        treated as a failed command and raises.
+        """
+        if "\r" in command_line or "\n" in command_line:
+            raise ValueError("command must be a single line")
+        self.connect()
+        assert self._socket is not None
+        self._socket.sendall(command_line.encode("ascii") + b"\r\n")
+        if not expect_output:
+            return None
+        line = self._readline().decode("utf-8", errors="replace")
+        if not line:
+            raise SysAgentProtocolError(f"command returned an empty response: {command_line}")
+        return line
+
+    def raw_command(self, command_line: str) -> str | None:
+        """Send any single-line command and return the raw response (or None on timeout)."""
+        if "\r" in command_line or "\n" in command_line:
+            raise ValueError("command must be a single line")
+        self.connect()
+        assert self._socket is not None
+        self._socket.sendall(command_line.encode("ascii") + b"\r\n")
+        try:
+            return self._readline().decode("utf-8", errors="replace")
+        except socket.timeout:
+            return None
+
     def screenshot(self) -> bytes:
         """Capture the current screen and return the JPEG bytes.
 
@@ -265,6 +298,193 @@ class SysAgentClient:
     def set_lock_screen(self, enabled: bool) -> dict[str, str]:
         state = "enabled" if enabled else "disabled"
         return require_ok(self.command(f"lockScreenSet {state}"))
+
+    # ---- Legacy memory read -------------------------------------------------
+
+    def peek(self, offset: int, size: int) -> str:
+        return self._bare_command(f"peek 0x{offset:X} 0x{size:X}")
+
+    def peek_absolute(self, address: int, size: int) -> str:
+        return self._bare_command(f"peekAbsolute 0x{address:X} 0x{size:X}")
+
+    def peek_main(self, offset: int, size: int) -> str:
+        return self._bare_command(f"peekMain 0x{offset:X} 0x{size:X}")
+
+    def peek_multi(self, pairs: Sequence[tuple[int, int]]) -> str:
+        args = " ".join(f"0x{address:X} 0x{size:X}" for address, size in pairs)
+        return self._bare_command(f"peekMulti {args}")
+
+    def peek_absolute_multi(self, pairs: Sequence[tuple[int, int]]) -> str:
+        args = " ".join(f"0x{address:X} 0x{size:X}" for address, size in pairs)
+        return self._bare_command(f"peekAbsoluteMulti {args}")
+
+    def peek_main_multi(self, pairs: Sequence[tuple[int, int]]) -> str:
+        args = " ".join(f"0x{address:X} 0x{size:X}" for address, size in pairs)
+        return self._bare_command(f"peekMainMulti {args}")
+
+    def pointer(self, jumps: Sequence[int]) -> str:
+        args = " ".join(f"0x{value:X}" for value in jumps)
+        return self._bare_command(f"pointer {args}")
+
+    def pointer_all(self, jumps: Sequence[int], final: int) -> str:
+        args = " ".join(f"0x{value:X}" for value in jumps) + f" 0x{final:X}"
+        return self._bare_command(f"pointerAll {args}")
+
+    def pointer_relative(self, jumps: Sequence[int], final: int) -> str:
+        args = " ".join(f"0x{value:X}" for value in jumps) + f" 0x{final:X}"
+        return self._bare_command(f"pointerRelative {args}")
+
+    def pointer_peek(self, size: int, jumps: Sequence[int], final: int) -> str:
+        args = f"0x{size:X} " + " ".join(f"0x{value:X}" for value in jumps) + f" 0x{final:X}"
+        return self._bare_command(f"pointerPeek {args}")
+
+    def pointer_peek_multi(self, chains: Sequence[tuple[int, Sequence[int], int]]) -> str:
+        blocks = []
+        for size, jumps, final in chains:
+            args = f"0x{size:X} " + " ".join(f"0x{value:X}" for value in jumps) + f" 0x{final:X}"
+            blocks.append(args)
+        return self._bare_command("pointerPeekMulti " + " * ".join(blocks))
+
+    # ---- Legacy memory write ------------------------------------------------
+
+    def poke(self, offset: int, data: bytes) -> None:
+        self._bare_command(f"poke 0x{offset:X} {data.hex().upper()}", expect_output=False)
+
+    def poke_absolute(self, address: int, data: bytes) -> None:
+        self._bare_command(f"pokeAbsolute 0x{address:X} {data.hex().upper()}", expect_output=False)
+
+    def poke_main(self, offset: int, data: bytes) -> None:
+        self._bare_command(f"pokeMain 0x{offset:X} {data.hex().upper()}", expect_output=False)
+
+    def pointer_poke(self, data: bytes, jumps: Sequence[int], final: int) -> None:
+        args = f"{data.hex().upper()} " + " ".join(f"0x{value:X}" for value in jumps) + f" 0x{final:X}"
+        self._bare_command(f"pointerPoke {args}", expect_output=False)
+
+    # ---- Freeze --------------------------------------------------------------
+
+    def freeze(self, address: int, data: bytes) -> None:
+        self._bare_command(f"freeze 0x{address:X} {data.hex().upper()}", expect_output=False)
+
+    def unfreeze(self, address: int) -> None:
+        self._bare_command(f"unFreeze 0x{address:X}", expect_output=False)
+
+    def freeze_count(self) -> str:
+        return self._bare_command("freezeCount")
+
+    def freeze_clear(self) -> None:
+        self._bare_command("freezeClear", expect_output=False)
+
+    def freeze_pause(self) -> None:
+        self._bare_command("freezePause", expect_output=False)
+
+    def freeze_unpause(self) -> None:
+        self._bare_command("freezeUnpause", expect_output=False)
+
+    # ---- Controller input ----------------------------------------------------
+
+    def press(self, button: str) -> None:
+        self._bare_command(f"press {button}", expect_output=False)
+
+    def release(self, button: str) -> None:
+        self._bare_command(f"release {button}", expect_output=False)
+
+    def click(self, button: str) -> None:
+        self._bare_command(f"click {button}", expect_output=False)
+
+    def set_stick(self, side: str, x: int, y: int) -> None:
+        if side not in {"LEFT", "RIGHT"}:
+            raise ValueError("side must be LEFT or RIGHT")
+        if not (-0x8000 <= x <= 0x7FFF) or not (-0x8000 <= y <= 0x7FFF):
+            raise ValueError("stick coordinates must be in -0x8000..0x7FFF")
+        self._bare_command(f"setStick {side} {x} {y}", expect_output=False)
+
+    def click_seq(self, sequence: str, wait_done: bool = True) -> str | None:
+        line = self._bare_command(f"clickSeq {sequence}", expect_output=wait_done)
+        if wait_done and line != "done":
+            raise SysAgentProtocolError(f"expected 'done' from clickSeq, got {line!r}")
+        return line
+
+    def click_cancel(self) -> None:
+        self._bare_command("clickCancel", expect_output=False)
+
+    def detach_controller(self) -> None:
+        self._bare_command("detachController", expect_output=False)
+
+    def touch(self, points: Sequence[tuple[int, int]]) -> None:
+        args = " ".join(f"{x} {y}" for x, y in points)
+        self._bare_command(f"touch {args}", expect_output=False)
+
+    def touch_hold(self, x: int, y: int, milliseconds: int) -> None:
+        self._bare_command(f"touchHold {x} {y} {milliseconds}", expect_output=False)
+
+    def touch_draw(self, points: Sequence[tuple[int, int]]) -> None:
+        args = " ".join(f"{x} {y}" for x, y in points)
+        self._bare_command(f"touchDraw {args}", expect_output=False)
+
+    def touch_cancel(self) -> None:
+        self._bare_command("touchCancel", expect_output=False)
+
+    def key(self, keys: Sequence[int]) -> None:
+        args = " ".join(str(key) for key in keys)
+        self._bare_command(f"key {args}", expect_output=False)
+
+    def key_mod(self, pairs: Sequence[tuple[int, int]]) -> None:
+        args = " ".join(f"{key} {mod}" for key, mod in pairs)
+        self._bare_command(f"keyMod {args}", expect_output=False)
+
+    def key_multi(self, keys: Sequence[int]) -> None:
+        args = " ".join(str(key) for key in keys)
+        self._bare_command(f"keyMulti {args}", expect_output=False)
+
+    # ---- Screen ---------------------------------------------------------------
+
+    def screen_off(self) -> None:
+        self._bare_command("screenOff", expect_output=False)
+
+    def screen_on(self) -> None:
+        self._bare_command("screenOn", expect_output=False)
+
+    # ---- Utility --------------------------------------------------------------
+
+    def get_title_id(self) -> str:
+        return self._bare_command("getTitleID")
+
+    def get_title_version(self) -> str:
+        return self._bare_command("getTitleVersion")
+
+    def get_system_language(self) -> str:
+        return self._bare_command("getSystemLanguage")
+
+    def get_build_id(self) -> str:
+        return self._bare_command("getBuildID")
+
+    def get_heap_base(self) -> str:
+        return self._bare_command("getHeapBase")
+
+    def get_main_nso_base(self) -> str:
+        return self._bare_command("getMainNsoBase")
+
+    def is_program_running(self, program_id: int) -> str:
+        return self._bare_command(f"isProgramRunning 0x{program_id:X}")
+
+    def game(self, field: str) -> str:
+        if field not in {"icon", "version", "rating", "author", "name"}:
+            raise ValueError("field must be icon, version, rating, author, or name")
+        return self._bare_command(f"game {field}")
+
+    def get_version(self) -> str:
+        return self._bare_command("getVersion")
+
+    def charge(self) -> str:
+        return self._bare_command("charge")
+
+    def fd_count(self) -> str:
+        return self._bare_command("fdCount")
+
+    def configure(self, parameter: str, value: int) -> None:
+        if not parameter or any(char.isspace() for char in parameter):
+            raise ValueError("parameter must be a single token")
+        self._bare_command(f"configure {parameter} {value}", expect_output=False)
 
     def start(self, start: int, end: int, pattern: bytes) -> int:
         if start < 0 or end <= start:
@@ -403,131 +623,660 @@ def print_fields(response: dict[str, str]) -> None:
     print(" ".join(f"{key}={value}" for key, value in response.items()))
 
 
+def pair_values(values: Sequence[int]) -> list[tuple[int, int]]:
+    if len(values) % 2:
+        raise ValueError("expected an even number of arguments")
+    return list(zip(values[0::2], values[1::2]))
+
+
+def parse_pointer_chains(tokens: Sequence[str]) -> list[tuple[int, list[int], int]]:
+    """Split ``pointer-peek-multi`` arguments on literal ``*`` tokens."""
+    groups: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token == "*":
+            groups.append(current)
+            current = []
+        else:
+            current.append(token)
+    groups.append(current)
+    chains: list[tuple[int, list[int], int]] = []
+    for group in groups:
+        if len(group) < 3:
+            raise ValueError("each pointer chain needs size, at least one jump, and a final offset")
+        values = [int(value, 0) for value in group]
+        chains.append((values[0], values[1:-1], values[-1]))
+    return chains
+
+
+# ---------------------------------------------------------------------------
+# Declarative CLI: one Command per sys-agent command
+# ---------------------------------------------------------------------------
+
+
+_UNSET = object()
+
+
+@dataclasses.dataclass(frozen=True)
+class Arg:
+    """A single argument (positional or option) of a registered subcommand."""
+
+    name: str
+    help: str
+    nargs: str | int | None = None
+    choices: tuple[str, ...] | None = None
+    type: Callable[[str], Any] | None = None
+    default: Any = _UNSET
+    action: str | None = None
+    flags: tuple[str, ...] = ()
+    metavar: str | None = None
+
+    def add_to(self, parser: argparse.ArgumentParser) -> None:
+        kwargs: dict[str, Any] = {"help": self.help}
+        if self.nargs is not None:
+            kwargs["nargs"] = self.nargs
+        if self.choices is not None:
+            kwargs["choices"] = self.choices
+        if self.type is not None:
+            kwargs["type"] = self.type
+        if self.default is not _UNSET:
+            kwargs["default"] = self.default
+        if self.action is not None:
+            kwargs["action"] = self.action
+        if self.metavar is not None:
+            kwargs["metavar"] = self.metavar
+        if self.flags:
+            parser.add_argument(*self.flags, dest=self.name, **kwargs)
+        else:
+            parser.add_argument(self.name, **kwargs)
+
+
+@dataclasses.dataclass(frozen=True)
+class Command:
+    """A leaf subcommand mirroring one sys-agent command."""
+
+    name: str
+    help: str
+    handler: Callable[[SysAgentClient, argparse.Namespace], int | None]
+    args: tuple[Arg, ...] = ()
+    description: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class CommandGroup:
+    """A named namespace of related leaf subcommands."""
+
+    name: str
+    help: str
+    children: tuple[Command, ...]
+
+
+# ---- handlers ---------------------------------------------------------------
+
+
+def _print_result(method_name: str) -> Callable[[SysAgentClient, argparse.Namespace], None]:
+    def handler(client: SysAgentClient, args: argparse.Namespace) -> None:
+        print(getattr(client, method_name)())
+    return handler
+
+
+def _silent(method_name: str) -> Callable[[SysAgentClient, argparse.Namespace], None]:
+    def handler(client: SysAgentClient, args: argparse.Namespace) -> None:
+        getattr(client, method_name)()
+    return handler
+
+
+def _cmd_capabilities(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.capabilities())
+
+
+def _cmd_backend_status(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(dataclasses.asdict(client.backend_status()))
+
+
+def _cmd_backend_set(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(dataclasses.asdict(client.set_backend_policy(args.policy)))
+
+
+def _cmd_backend_probe(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(dataclasses.asdict(client.probe_backend()))
+
+
+def _cmd_system_capabilities(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.system_capabilities())
+
+
+def _cmd_system_query(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.system_query(args.query))
+
+
+def _cmd_process_list(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.process_list(args.offset, args.count))
+
+
+def _cmd_system_action(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.system_action(args.command))
+
+
+def _cmd_wireless(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.set_wireless(args.state == "enabled"))
+
+
+def _cmd_lock_screen(client: SysAgentClient, args: argparse.Namespace) -> None:
+    response = client.lock_screen_status() if args.state == "status" \
+        else client.set_lock_screen(args.state == "enabled")
+    print_fields(response)
+
+
+def _cmd_screenshot(client: SysAgentClient, args: argparse.Namespace) -> None:
+    data = client.screenshot()
+    output = args.output or f"screenshot-{int(time.time())}.jpg"
+    with open(output, "wb") as image:
+        image.write(data)
+    print(output)
+
+
+def _cmd_peek(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.peek(args.offset, args.size))
+
+
+def _cmd_peek_absolute(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.peek_absolute(args.address, args.size))
+
+
+def _cmd_peek_main(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.peek_main(args.offset, args.size))
+
+
+def _cmd_peek_multi(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.peek_multi(pair_values(args.pairs)))
+
+
+def _cmd_peek_absolute_multi(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.peek_absolute_multi(pair_values(args.pairs)))
+
+
+def _cmd_peek_main_multi(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.peek_main_multi(pair_values(args.pairs)))
+
+
+def _cmd_poke(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.poke(args.offset, args.data)
+
+
+def _cmd_poke_absolute(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.poke_absolute(args.address, args.data)
+
+
+def _cmd_poke_main(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.poke_main(args.offset, args.data)
+
+
+def _cmd_pointer(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.pointer(args.jumps))
+
+
+def _cmd_pointer_all(client: SysAgentClient, args: argparse.Namespace) -> None:
+    if len(args.args) < 2:
+        raise ValueError("pointer-all needs at least one jump and a final offset")
+    print(client.pointer_all(args.args[:-1], args.args[-1]))
+
+
+def _cmd_pointer_relative(client: SysAgentClient, args: argparse.Namespace) -> None:
+    if len(args.args) < 2:
+        raise ValueError("pointer-relative needs at least one jump and a final offset")
+    print(client.pointer_relative(args.args[:-1], args.args[-1]))
+
+
+def _cmd_pointer_peek(client: SysAgentClient, args: argparse.Namespace) -> None:
+    if len(args.args) < 3:
+        raise ValueError("pointer-peek needs size, at least one jump, and a final offset")
+    print(client.pointer_peek(args.args[0], args.args[1:-1], args.args[-1]))
+
+
+def _cmd_pointer_peek_multi(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.pointer_peek_multi(parse_pointer_chains(args.args)))
+
+
+def _cmd_pointer_poke(client: SysAgentClient, args: argparse.Namespace) -> None:
+    if len(args.args) < 2:
+        raise ValueError("pointer-poke needs at least one jump and a final offset")
+    client.pointer_poke(args.data, args.args[:-1], args.args[-1])
+
+
+def _cmd_freeze(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.freeze(args.address, args.data)
+
+
+def _cmd_unfreeze(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.unfreeze(args.address)
+
+
+def _cmd_press(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.press(args.button)
+
+
+def _cmd_release(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.release(args.button)
+
+
+def _cmd_click(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.click(args.button)
+
+
+def _cmd_set_stick(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.set_stick(args.side, args.x, args.y)
+
+
+def _cmd_click_seq(client: SysAgentClient, args: argparse.Namespace) -> None:
+    line = client.click_seq(args.sequence, wait_done=not args.no_wait)
+    if line is not None:
+        print(line)
+
+
+def _cmd_touch(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.touch(pair_values(args.points))
+
+
+def _cmd_touch_hold(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.touch_hold(args.x, args.y, args.milliseconds)
+
+
+def _cmd_touch_draw(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.touch_draw(pair_values(args.points))
+
+
+def _cmd_key(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.key(args.keys)
+
+
+def _cmd_key_mod(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.key_mod(pair_values(args.pairs))
+
+
+def _cmd_key_multi(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.key_multi(args.keys)
+
+
+def _cmd_game(client: SysAgentClient, args: argparse.Namespace) -> None:
+    if args.field == "icon":
+        data = bytes.fromhex(client.game("icon"))
+        output = args.output or f"game-icon-{int(time.time())}.bin"
+        with open(output, "wb") as image:
+            image.write(data)
+        print(output)
+    else:
+        print(client.game(args.field))
+
+
+def _cmd_is_program_running(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.is_program_running(args.program_id))
+
+
+def _cmd_configure(client: SysAgentClient, args: argparse.Namespace) -> None:
+    known_params = {
+        "mainLoopSleepTime", "buttonClickSleepTime", "echoCommands",
+        "printDebugResultCodes", "keySleepTime", "fingerDiameter",
+        "pollRate", "freezeRate", "controllerType",
+    }
+    if args.parameter not in known_params:
+        raise ValueError(
+            f"unsupported configure parameter: {args.parameter} "
+            f"(known: {', '.join(sorted(known_params))})")
+    client.configure(args.parameter, args.value)
+
+
+def _cmd_begin(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.begin_unknown(args.type, args.region, args.offset, args.size,
+                               alignment=args.alignment, pause=args.pause))
+
+
+def _cmd_refine(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.refine(args.session, args.mode, args.value, pause=args.pause)
+
+
+def _cmd_raw(client: SysAgentClient, args: argparse.Namespace) -> None:
+    line = client.raw_command(" ".join(args.command))
+    if line is not None:
+        print(line)
+
+
+def _cmd_start(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.start(args.start, args.end, args.pattern))
+
+
+def _cmd_start_region(client: SysAgentClient, args: argparse.Namespace) -> None:
+    value: str | bytes = parse_pattern(args.value) if args.type == "bytes" else args.value
+    print(client.start_region(args.type, args.region, args.offset, args.size,
+                              value, args.alignment))
+
+
+def _cmd_status(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(dataclasses.asdict(client.status(args.session)))
+
+
+def _cmd_cancel(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.cancel(args.session)
+
+
+def _cmd_close(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.close_session(args.session)
+
+
+def _cmd_results(client: SysAgentClient, args: argparse.Namespace) -> None:
+    addresses, stored = client.results(args.session, args.offset, args.count)
+    print(f"stored={stored}")
+    for address in addresses:
+        print(f"0x{address:016X}")
+
+
+def _cmd_search(client: SysAgentClient, args: argparse.Namespace) -> int:
+    session = client.start(args.start, args.end, args.pattern)
+    print(f"session={session}", file=sys.stderr)
+    try:
+        status = client.wait(session, args.poll_interval)
+    except KeyboardInterrupt:
+        client.cancel(session)
+        print("cancel requested", file=sys.stderr)
+        return 130
+    print(dataclasses.asdict(status), file=sys.stderr)
+    if status.state == "error":
+        return 2
+    for address in client.iter_results(session, args.page_size):
+        print(f"0x{address:016X}")
+    return 0 if status.state == "done" else 1
+
+
+# ---- command registry -------------------------------------------------------
+
+
+COMMANDS: tuple[Command | CommandGroup, ...] = (
+    CommandGroup("backend", "Inspect or configure the process-memory backend", (
+        Command("status", "Show the backend policy and state", _cmd_backend_status),
+        Command("set", "Set the backend policy", _cmd_backend_set,
+                (Arg("policy", "auto, dmnt, or direct", choices=("auto", "dmnt", "direct")),)),
+        Command("probe", "Probe the configured backend", _cmd_backend_probe),
+    )),
+
+    CommandGroup("system", "Query or control system state", (
+        Command("capabilities", "Show system-management capabilities",
+                _cmd_system_capabilities),
+        Command("query", "Query grouped system state", _cmd_system_query,
+                (Arg("query", "info, time, power, storage, network, network-profile, "
+                              "account, or application",
+                     choices=("info", "time", "power", "storage", "network",
+                              "network-profile", "account", "application")),)),
+        Command("process-list", "List running processes (PID:TitleID)", _cmd_process_list,
+                (Arg("offset", "result page offset", type=parse_int, default=0,
+                     flags=("--offset",)),
+                 Arg("count", "page size, 1..64", type=parse_int, default=64,
+                     flags=("--count",)))),
+        Command("action", "Run a system action", _cmd_system_action,
+                (Arg("command", "reboot, shutdown, sleep, reboot-emummc, or "
+                                "terminate-application",
+                     choices=("reboot", "shutdown", "sleep", "reboot-emummc",
+                              "terminate-application")),)),
+        Command("wireless", "Enable or disable wireless communication", _cmd_wireless,
+                (Arg("state", "enabled or disabled", choices=("enabled", "disabled")),)),
+        Command("lock-screen", "Show or change the lock-screen flag", _cmd_lock_screen,
+                (Arg("state", "status, enabled, or disabled",
+                     choices=("status", "enabled", "disabled")),)),
+    )),
+
+    CommandGroup("memory", "Read or write process memory", (
+        Command("peek", "Read bytes relative to the heap", _cmd_peek,
+                (Arg("offset", "heap-relative address", type=parse_int),
+                 Arg("size", "byte count", type=parse_int))),
+        Command("peek-absolute", "Read bytes from an absolute address", _cmd_peek_absolute,
+                (Arg("address", "absolute address", type=parse_int),
+                 Arg("size", "byte count", type=parse_int))),
+        Command("peek-main", "Read bytes relative to the main NSO base", _cmd_peek_main,
+                (Arg("offset", "main-relative address", type=parse_int),
+                 Arg("size", "byte count", type=parse_int))),
+        Command("peek-multi", "Read multiple heap ranges in one request", _cmd_peek_multi,
+                (Arg("pairs", "address size address size ...", nargs="+", type=parse_int),)),
+        Command("peek-absolute-multi", "Read multiple absolute ranges in one request",
+                _cmd_peek_absolute_multi,
+                (Arg("pairs", "address size address size ...", nargs="+", type=parse_int),)),
+        Command("peek-main-multi", "Read multiple main-relative ranges in one request",
+                _cmd_peek_main_multi,
+                (Arg("pairs", "address size address size ...", nargs="+", type=parse_int),)),
+        Command("poke", "Write bytes relative to the heap", _cmd_poke,
+                (Arg("offset", "heap-relative address", type=parse_int),
+                 Arg("data", "hex bytes", type=parse_pattern))),
+        Command("poke-absolute", "Write bytes at an absolute address", _cmd_poke_absolute,
+                (Arg("address", "absolute address", type=parse_int),
+                 Arg("data", "hex bytes", type=parse_pattern))),
+        Command("poke-main", "Write bytes relative to the main NSO base", _cmd_poke_main,
+                (Arg("offset", "main-relative address", type=parse_int),
+                 Arg("data", "hex bytes", type=parse_pattern))),
+        Command("pointer", "Resolve a pointer chain to an absolute address", _cmd_pointer,
+                (Arg("jumps", "main-relative first jump followed by offsets", nargs="+",
+                     type=parse_int),)),
+        Command("pointer-all", "Resolve a pointer chain plus a final offset",
+                _cmd_pointer_all,
+                (Arg("args", "jumps... final-offset", nargs="+", type=parse_int),)),
+        Command("pointer-relative", "Resolve a pointer chain relative to the heap",
+                _cmd_pointer_relative,
+                (Arg("args", "jumps... final-offset", nargs="+", type=parse_int),)),
+        Command("pointer-peek", "Read bytes through a pointer chain", _cmd_pointer_peek,
+                (Arg("args", "size jumps... final-offset", nargs="+", type=parse_int),)),
+        Command("pointer-peek-multi", "Read bytes through several pointer chains",
+                _cmd_pointer_peek_multi,
+                (Arg("args", "size jumps... final [* size jumps... final] ...", nargs="+"),),
+                "Separate chains with a literal * argument."),
+        Command("pointer-poke", "Write bytes through a pointer chain", _cmd_pointer_poke,
+                (Arg("data", "hex bytes to write", type=parse_pattern),
+                 Arg("args", "jumps... final-offset", nargs="+", type=parse_int))),
+    )),
+
+    CommandGroup("freeze", "Manage value freezing", (
+        Command("add", "Freeze a value at an absolute address", _cmd_freeze,
+                (Arg("address", "absolute address", type=parse_int),
+                 Arg("data", "hex bytes", type=parse_pattern))),
+        Command("remove", "Unfreeze an absolute address", _cmd_unfreeze,
+                (Arg("address", "absolute address", type=parse_int),)),
+        Command("count", "Show the number of frozen addresses",
+                _print_result("freeze_count")),
+        Command("clear", "Unfreeze every address", _silent("freeze_clear")),
+        Command("pause", "Pause the freeze worker", _silent("freeze_pause")),
+        Command("resume", "Resume the freeze worker", _silent("freeze_unpause")),
+    )),
+
+    CommandGroup("input", "Send controller, touch, or keyboard input", (
+        Command("press", "Press and hold a button", _cmd_press,
+                (Arg("button", "HidNpadButton name, e.g. A"),)),
+        Command("release", "Release a held button", _cmd_release,
+                (Arg("button", "HidNpadButton name, e.g. A"),)),
+        Command("click", "Press and release a button", _cmd_click,
+                (Arg("button", "HidNpadButton name, e.g. A"),)),
+        Command("set-stick", "Set a stick position", _cmd_set_stick,
+                (Arg("side", "LEFT or RIGHT", choices=("LEFT", "RIGHT")),
+                 Arg("x", "X coordinate in -0x8000..0x7FFF", type=parse_int),
+                 Arg("y", "Y coordinate in -0x8000..0x7FFF", type=parse_int))),
+        Command("click-seq", "Run a comma-separated input sequence", _cmd_click_seq,
+                (Arg("sequence", "e.g. A,W1000,B,+X,-X,%%5000,1500"),
+                 Arg("no_wait", "send without waiting for 'done'", action="store_true",
+                     default=False, flags=("--no-wait",))),
+                "Tokens: button=click, +button=press, -button=release, Wms=wait, "
+                "%LX,LY left stick, &RX,RY right stick."),
+        Command("click-cancel", "Interrupt the current click sequence",
+                _silent("click_cancel")),
+        Command("detach-controller", "Force-detach the virtual controller",
+                _silent("detach_controller")),
+        Command("touch", "Tap touchscreen points", _cmd_touch,
+                (Arg("points", "x y x y ...", nargs="+", type=parse_int),)),
+        Command("touch-hold", "Hold a touchscreen point", _cmd_touch_hold,
+                (Arg("x", "X in 0..1280", type=parse_int),
+                 Arg("y", "Y in 0..720", type=parse_int),
+                 Arg("milliseconds", "hold duration in ms", type=parse_int))),
+        Command("touch-draw", "Draw a touch path", _cmd_touch_draw,
+                (Arg("points", "x y x y ...", nargs="+", type=parse_int),)),
+        Command("touch-cancel", "Cancel the current touch operation",
+                _silent("touch_cancel")),
+        Command("key", "Type keys in sequence", _cmd_key,
+                (Arg("keys", "HidKeyboardKey values", nargs="+", type=parse_int),)),
+        Command("key-mod", "Type keys with modifiers", _cmd_key_mod,
+                (Arg("pairs", "key modifier key modifier ...", nargs="+", type=parse_int),)),
+        Command("key-multi", "Press several keys at once", _cmd_key_multi,
+                (Arg("keys", "HidKeyboardKey values", nargs="+", type=parse_int),)),
+    )),
+
+    CommandGroup("screen", "Capture or control the screen", (
+        Command("capture", "Capture the current screen as a JPEG", _cmd_screenshot,
+                (Arg("output", "write the JPEG to this path "
+                               "(default: screenshot-<unix time>.jpg)",
+                     flags=("--output",)),)),
+        Command("off", "Turn the screen off", _silent("screen_off")),
+        Command("on", "Turn the screen on", _silent("screen_on")),
+    )),
+
+    CommandGroup("utility", "Show device and application information", (
+        Command("version", "Show the sys-agent version", _print_result("get_version")),
+        Command("title-id", "Show the running title ID", _print_result("get_title_id")),
+        Command("title-version", "Show the running title version",
+                _print_result("get_title_version")),
+        Command("system-language", "Show the system language",
+                _print_result("get_system_language")),
+        Command("build-id", "Show the application Build ID", _print_result("get_build_id")),
+        Command("heap-base", "Show the heap base address", _print_result("get_heap_base")),
+        Command("main-nso-base", "Show the main NSO base address",
+                _print_result("get_main_nso_base")),
+        Command("is-program-running", "Check whether a program is running",
+                _cmd_is_program_running,
+                (Arg("program_id", "program ID", type=parse_int),)),
+        Command("game", "Show application metadata or dump its icon", _cmd_game,
+                (Arg("field", "icon, version, rating, author, or name",
+                     choices=("icon", "version", "rating", "author", "name")),
+                 Arg("output", "write the icon to this path "
+                               "(default: game-icon-<unix time>.bin)",
+                     flags=("--output",)))),
+        Command("charge", "Show the battery charge percentage", _print_result("charge")),
+        Command("fd-count", "Show the open client socket count", _print_result("fd_count")),
+    )),
+
+    CommandGroup("config", "Change sys-agent runtime settings", (
+        Command("set", "Change a timing or settings value", _cmd_configure,
+                (Arg("parameter", "mainLoopSleepTime, buttonClickSleepTime, echoCommands, "
+                                  "printDebugResultCodes, keySleepTime, fingerDiameter, "
+                                  "pollRate, freezeRate, or controllerType"),
+                 Arg("value", "new value", type=parse_int))),
+    )),
+
+    CommandGroup("search", "Exact and unknown-value memory search", (
+        Command("capabilities", "Show search protocol capabilities", _cmd_capabilities),
+        Command("start", "Start an exact byte search session", _cmd_start,
+                (Arg("start", "absolute start address", type=parse_int),
+                 Arg("end", "exclusive absolute end address", type=parse_int),
+                 Arg("pattern", "hex byte pattern", type=parse_pattern))),
+        Command("start-region", "Start a typed or region search session", _cmd_start_region,
+                (Arg("type", "bytes, u8, u16, u32, or u64",
+                     choices=("bytes", "u8", "u16", "u32", "u64")),
+                 Arg("region", "absolute, heap, or main", choices=("absolute", "heap", "main")),
+                 Arg("offset", "region-relative offset (absolute start for absolute)",
+                     type=parse_int),
+                 Arg("size", "search size in bytes", type=parse_int),
+                 Arg("value", "hex pattern or unsigned integer value"),
+                 Arg("alignment", "candidate alignment (default: natural)", type=parse_int,
+                     flags=("--alignment",)))),
+        Command("status", "Show a search session's status", _cmd_status,
+                (Arg("session", "session ID", type=parse_int),)),
+        Command("results", "Page stored search results", _cmd_results,
+                (Arg("session", "session ID", type=parse_int),
+                 Arg("offset", "zero-based result offset", type=parse_int, default=0,
+                     flags=("--offset",)),
+                 Arg("count", "page size, 1..256", type=parse_int, default=256,
+                     flags=("--count",)))),
+        Command("cancel", "Request cancellation of a search session", _cmd_cancel,
+                (Arg("session", "session ID", type=parse_int),)),
+        Command("close", "Close a finished search session", _cmd_close,
+                (Arg("session", "session ID", type=parse_int),)),
+        Command("begin", "Start an SD-backed unknown-value search session", _cmd_begin,
+                (Arg("type", "u8, u16, u32, or u64", choices=("u8", "u16", "u32", "u64")),
+                 Arg("region", "absolute, heap, main, alias, or addressSpace",
+                     choices=("absolute", "heap", "main", "alias", "addressSpace")),
+                 Arg("offset", "region-relative offset", type=parse_int),
+                 Arg("size", "scan size in bytes", type=parse_int),
+                 Arg("alignment", "candidate alignment (default: value width)", type=parse_int,
+                     flags=("--alignment",)),
+                 Arg("pause", "pause the process during the scan", action="store_true",
+                     default=False, flags=("--pause",)))),
+        Command("refine", "Refine an unknown-value search session", _cmd_refine,
+                (Arg("session", "session ID", type=parse_int),
+                 Arg("mode", "exact, changed, unchanged, increased, or decreased",
+                     choices=("exact", "changed", "unchanged", "increased", "decreased")),
+                 Arg("value", "value for exact mode", nargs="?"),
+                 Arg("pause", "pause the process during refinement", action="store_true",
+                     default=False, flags=("--pause",)))),
+        Command("run", "Run an exact search and print matching addresses", _cmd_search,
+                (Arg("start", "absolute start address", type=parse_int),
+                 Arg("end", "exclusive absolute end address", type=parse_int),
+                 Arg("pattern", "hex byte pattern", type=parse_pattern),
+                 Arg("poll_interval", "status poll interval in seconds", type=float,
+                     default=0.25, flags=("--poll-interval",)),
+                 Arg("page_size", "result page size, 1..256", type=parse_int, default=256,
+                     flags=("--page-size",)))),
+    )),
+
+    Command("raw", "Send any single-line command and print the raw response", _cmd_raw,
+            (Arg("command", "command words to join and send", nargs="+"),)),
+)
+
+COMMAND_BY_NAME: dict[str, Command] = {}
+for _item in COMMANDS:
+    if isinstance(_item, CommandGroup):
+        for _child in _item.children:
+            COMMAND_BY_NAME[f"{_item.name} {_child.name}"] = _child
+    else:
+        COMMAND_BY_NAME[_item.name] = _item
+
+GROUP_BY_NAME = {item.name: item for item in COMMANDS if isinstance(item, CommandGroup)}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="switch")
-    parser.add_argument("--port", type=int, default=6000)
-    parser.add_argument("--timeout", type=float, default=10.0)
-    subparsers = parser.add_subparsers(dest="action", required=True)
-    subparsers.add_parser("capabilities")
-    backend = subparsers.add_parser("backend")
-    backend.add_argument("policy", nargs="?", choices=("auto", "dmnt", "direct"))
-    subparsers.add_parser("backend-probe")
-    subparsers.add_parser("system-capabilities")
-    query = subparsers.add_parser("system-query")
-    query.add_argument("query", choices=("info", "time", "power", "storage", "network",
-        "network-profile", "account", "application"))
-    processes = subparsers.add_parser("process-list")
-    processes.add_argument("--offset", type=int, default=0)
-    processes.add_argument("--count", type=int, default=64)
-    system_action = subparsers.add_parser("system-action")
-    system_action.add_argument("command", choices=("reboot", "shutdown", "sleep",
-        "reboot-emummc", "terminate-application"))
-    wireless = subparsers.add_parser("wireless")
-    wireless.add_argument("state", choices=("enabled", "disabled"))
-    lock_screen = subparsers.add_parser("lock-screen")
-    lock_screen.add_argument("state", choices=("status", "enabled", "disabled"))
-
-    screenshot = subparsers.add_parser("screenshot")
-    screenshot.add_argument("--output",
-        help="write the JPEG to this path (default: screenshot-<unix time>.jpg)")
-
-    start = subparsers.add_parser("start")
-    start.add_argument("start", type=lambda value: int(value, 0))
-    start.add_argument("end", type=lambda value: int(value, 0))
-    start.add_argument("pattern", type=parse_pattern)
-
-    region_start = subparsers.add_parser("start-region")
-    region_start.add_argument("type", choices=("bytes", "u8", "u16", "u32", "u64"))
-    region_start.add_argument("region", choices=("absolute", "heap", "main"))
-    region_start.add_argument("offset", type=lambda value: int(value, 0))
-    region_start.add_argument("size", type=lambda value: int(value, 0))
-    region_start.add_argument("value")
-    region_start.add_argument("--alignment", type=int)
-
-    for action in ("status", "cancel", "close"):
-        command = subparsers.add_parser(action)
-        command.add_argument("session", type=int)
-
-    results = subparsers.add_parser("results")
-    results.add_argument("session", type=int)
-    results.add_argument("--offset", type=int, default=0)
-    results.add_argument("--count", type=int, default=256)
-
-    search = subparsers.add_parser("search")
-    search.add_argument("start", type=lambda value: int(value, 0))
-    search.add_argument("end", type=lambda value: int(value, 0))
-    search.add_argument("pattern", type=parse_pattern)
-    search.add_argument("--poll-interval", type=float, default=0.25)
-    search.add_argument("--page-size", type=int, default=256)
+    parser.add_argument("--host", default="switch", help="sys-agent host (default: switch)")
+    parser.add_argument("--port", type=int, default=6000,
+                        help="sys-agent TCP port (default: 6000)")
+    parser.add_argument("--timeout", type=float, default=10.0,
+                        help="socket timeout in seconds (default: 10.0)")
+    subparsers = parser.add_subparsers(dest="action", required=True, metavar="COMMAND",
+                                       title="commands")
+    for item in COMMANDS:
+        if isinstance(item, CommandGroup):
+            group_parser = subparsers.add_parser(item.name, help=item.help,
+                                                 description=item.help)
+            group_subparsers = group_parser.add_subparsers(
+                dest=f"{item.name}_action", required=True, metavar="COMMAND",
+                title="commands")
+            for child in item.children:
+                child_parser = group_subparsers.add_parser(
+                    child.name, help=child.help,
+                    description=child.description or child.help)
+                for argument in child.args:
+                    argument.add_to(child_parser)
+        else:
+            subparser = subparsers.add_parser(item.name, help=item.help,
+                                              description=item.description or item.help)
+            for argument in item.args:
+                argument.add_to(subparser)
     return parser
+
+
+def _resolve_command(args: argparse.Namespace) -> Command:
+    group = GROUP_BY_NAME.get(args.action)
+    if group is None:
+        return COMMAND_BY_NAME[args.action]
+    child = getattr(args, f"{group.name}_action")
+    return COMMAND_BY_NAME[f"{group.name} {child}"]
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    command = _resolve_command(args)
     try:
         with SysAgentClient(args.host, args.port, args.timeout) as client:
-            if args.action == "capabilities":
-                print_fields(client.capabilities())
-            elif args.action == "backend":
-                status = client.backend_status() if args.policy is None \
-                    else client.set_backend_policy(args.policy)
-                print(dataclasses.asdict(status))
-            elif args.action == "backend-probe":
-                print(dataclasses.asdict(client.probe_backend()))
-            elif args.action == "system-capabilities":
-                print_fields(client.system_capabilities())
-            elif args.action == "system-query":
-                print_fields(client.system_query(args.query))
-            elif args.action == "process-list":
-                print_fields(client.process_list(args.offset, args.count))
-            elif args.action == "system-action":
-                print_fields(client.system_action(args.command))
-            elif args.action == "wireless":
-                print_fields(client.set_wireless(args.state == "enabled"))
-            elif args.action == "lock-screen":
-                response = client.lock_screen_status() if args.state == "status" \
-                    else client.set_lock_screen(args.state == "enabled")
-                print_fields(response)
-            elif args.action == "screenshot":
-                data = client.screenshot()
-                output = args.output or f"screenshot-{int(time.time())}.jpg"
-                with open(output, "wb") as image:
-                    image.write(data)
-                print(output)
-            elif args.action == "start":
-                print(client.start(args.start, args.end, args.pattern))
-            elif args.action == "start-region":
-                value: str | bytes = parse_pattern(args.value) if args.type == "bytes" else args.value
-                print(client.start_region(args.type, args.region, args.offset, args.size,
-                    value, args.alignment))
-            elif args.action == "status":
-                print(dataclasses.asdict(client.status(args.session)))
-            elif args.action == "results":
-                addresses, stored = client.results(args.session, args.offset, args.count)
-                print(f"stored={stored}")
-                for address in addresses:
-                    print(f"0x{address:016X}")
-            elif args.action == "cancel":
-                client.cancel(args.session)
-            elif args.action == "close":
-                client.close_session(args.session)
-            elif args.action == "search":
-                session = client.start(args.start, args.end, args.pattern)
-                print(f"session={session}", file=sys.stderr)
-                try:
-                    status = client.wait(session, args.poll_interval)
-                except KeyboardInterrupt:
-                    client.cancel(session)
-                    print("cancel requested", file=sys.stderr)
-                    return 130
-                print(dataclasses.asdict(status), file=sys.stderr)
-                if status.state == "error":
-                    return 2
-                for address in client.iter_results(session, args.page_size):
-                    print(f"0x{address:016X}")
-                return 0 if status.state == "done" else 1
-        return 0
+            return command.handler(client, args) or 0
     except (OSError, ValueError, SysAgentProtocolError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

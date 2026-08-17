@@ -1,4 +1,4 @@
-# sys-agent — leolovenet custom build
+# sys-agent
 
 This fork is an independently maintained sys-agent build based on upstream v2.5. It keeps
 the original TCP protocol compatible while adding Switch-side memory search and a unified

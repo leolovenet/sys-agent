@@ -4,7 +4,7 @@ import socketserver
 import threading
 import unittest
 
-from client.sysagent import SysAgentProtocolError, SysAgentClient, parse_response
+from client.sysagent import SysAgentProtocolError, SysAgentClient, parse_response, require_ok
 
 
 class FakeState:
@@ -13,6 +13,7 @@ class FakeState:
         self.cancelled = False
         self.search_active = False
         self.last_command: list[str] = []
+        self.commands: list[list[str]] = []
         self.addresses = [0x80000010, 0x80000120, 0x80000230]
 
 
@@ -24,6 +25,7 @@ class FakeHandler(socketserver.StreamRequestHandler):
             if not command:
                 continue
             state.last_command = command
+            state.commands.append(command)
             if command[0] == "searchCapabilities":
                 response = "OK version=3 modes=bytes,u8,u16,u32,u64 regions=absolute,heap,main alignment=powerOfTwo,max256 endian=little maxPattern=256 chunk=0x40000 maxResults=65536 maxPage=256 refine=exact,changed,unchanged,increased,decreased persistent=runtime storage=sd cRegions=absolute,heap,main,alias,addressSpace"
             elif command[0] in {"searchStart", "searchStartRegion"}:
@@ -90,8 +92,70 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 # Return a JPEG-like payload whose hex line exceeds the old
                 # 1 MiB client cap, proving the raised response limit works.
                 response = (b"\xFF\xD8" + b"\x00" * 600000 + b"\xFF\xD9").hex().upper()
+            elif command[0] in {"peek", "peekAbsolute", "peekMain"}:
+                if command[0] == "peek" and command[2] == "0x0":
+                    response = ""
+                else:
+                    response = "DEADBEEF00"
+            elif command[0] in {"peekMulti", "peekAbsoluteMulti", "peekMainMulti"}:
+                response = "DEADBEEF00C0FFEE"
+            elif command[0] in {"poke", "pokeAbsolute", "pokeMain", "pointerPoke"}:
+                response = None
+            elif command[0] == "pointer":
+                response = "0000000080001000"
+            elif command[0] in {"pointerAll", "pointerRelative"}:
+                response = "0000000080002000"
+            elif command[0] == "pointerPeek":
+                response = "AABBCCDD"
+            elif command[0] == "pointerPeekMulti":
+                response = "AABBCCDDEEFF"
+            elif command[0] in {"freeze", "unFreeze", "freezeClear", "freezePause",
+                                "freezeUnpause"}:
+                response = None
+            elif command[0] == "freezeCount":
+                response = "03"
+            elif command[0] in {"press", "release", "click", "setStick", "clickCancel",
+                                 "detachController", "touch", "touchHold", "touchDraw",
+                                 "touchCancel", "key", "keyMod", "keyMulti",
+                                 "screenOff", "screenOn", "configure"}:
+                response = None
+            elif command[0] == "clickSeq":
+                response = "done"
+            elif command[0] == "game":
+                if command[1] == "icon":
+                    response = (b"\xFF\xD8" + b"ICON").hex().upper()
+                elif command[1] == "version":
+                    response = "1.6.0"
+                elif command[1] == "rating":
+                    response = "7"
+                elif command[1] == "author":
+                    response = "Nintendo"
+                else:
+                    response = "Animal Crossing"
+            elif command[0] == "getVersion":
+                response = "2.6"
+            elif command[0] == "charge":
+                response = "85"
+            elif command[0] == "fdCount":
+                response = "3"
+            elif command[0] == "getTitleID":
+                response = "01006F8002326000"
+            elif command[0] == "getTitleVersion":
+                response = "0000000000100000"
+            elif command[0] == "getSystemLanguage":
+                response = "1"
+            elif command[0] == "getBuildID":
+                response = "0123456789ABCDEF"
+            elif command[0] == "getHeapBase":
+                response = "00000005ECA00000"
+            elif command[0] == "getMainNsoBase":
+                response = "00000005370606000"
+            elif command[0] == "isProgramRunning":
+                response = "1"
             else:
                 response = "ERR code=UNKNOWN_COMMAND"
+            if response is None:
+                continue
             # Split the response to verify that the client handles TCP fragmentation.
             payload = (response + "\n").encode("ascii")
             midpoint = len(payload) // 2
@@ -228,16 +292,177 @@ class ClientTests(unittest.TestCase):
             output = os.path.join(directory, "screen.jpg")
             code = main(["--host", "127.0.0.1",
                          "--port", str(self.server.server_address[1]),
-                         "--timeout", "1", "screenshot", "--output", output])
+                         "--timeout", "1", "screen", "capture", "--output", output])
             self.assertEqual(code, 0)
             with open(output, "rb") as image:
                 self.assertEqual(image.read(), expected)
+
+    def test_legacy_memory_read_and_write(self) -> None:
+        with self.client() as client:
+            self.assertEqual(client.peek(0x100, 4), "DEADBEEF00")
+            self.assertEqual(client.peek_absolute(0x80000000, 4), "DEADBEEF00")
+            self.assertEqual(client.peek_main(0x20, 4), "DEADBEEF00")
+            self.assertEqual(client.peek_multi([(0x100, 4), (0x200, 2)]), "DEADBEEF00C0FFEE")
+            self.assertEqual(client.peek_absolute_multi([(0x100, 4)]), "DEADBEEF00C0FFEE")
+            self.assertEqual(client.peek_main_multi([(0x100, 4)]), "DEADBEEF00C0FFEE")
+            self.assertEqual(client.pointer([0x10, 0x20]), "0000000080001000")
+            self.assertEqual(client.pointer_all([0x10], 0x20), "0000000080002000")
+            self.assertEqual(client.pointer_relative([0x10], 0x20), "0000000080002000")
+            self.assertEqual(client.pointer_peek(4, [0x10], 0x20), "AABBCCDD")
+            self.assertEqual(
+                client.pointer_peek_multi([(4, [0x10], 0x20), (2, [0x30], 0x40)]),
+                "AABBCCDDEEFF")
+            self.assertEqual(
+                self.server.state.last_command,
+                ["pointerPeekMulti", "0x4", "0x10", "0x20", "*", "0x2", "0x30", "0x40"])
+            client.poke(0x100, b"\xDE\xAD")
+            client.poke_absolute(0x80000000, b"\xBE\xEF")
+            client.poke_main(0x20, b"\x01\x02")
+            client.pointer_poke(b"\xAA", [0x10], 0x20)
+            self.assertEqual(client.freeze_count(), "03")
+            self.assertEqual(self.server.state.commands[-2][0], "pointerPoke")
+
+    def test_empty_bare_response_raises(self) -> None:
+        with self.client() as client:
+            with self.assertRaises(SysAgentProtocolError):
+                client.peek(0x100, 0)
+
+    def test_freeze_commands(self) -> None:
+        with self.client() as client:
+            client.freeze(0x45097552, b"\x00\x64")
+            client.unfreeze(0x45097552)
+            client.freeze_clear()
+            client.freeze_pause()
+            client.freeze_unpause()
+            self.assertEqual(client.freeze_count(), "03")
+            self.assertEqual(self.server.state.last_command, ["freezeCount"])
+
+    def test_input_and_screen_commands(self) -> None:
+        with self.client() as client:
+            client.press("A")
+            client.release("A")
+            client.click("A")
+            client.set_stick("LEFT", 0x7FFF, 0)
+            client.click_cancel()
+            client.detach_controller()
+            client.touch([(100, 200), (300, 400)])
+            client.touch_hold(100, 200, 500)
+            client.touch_draw([(100, 200), (300, 400)])
+            client.touch_cancel()
+            client.key([11, 8])
+            client.key_mod([(4, 1), (5, 2)])
+            client.key_multi([224, 226])
+            client.screen_off()
+            client.screen_on()
+            self.assertEqual(client.freeze_count(), "03")
+            self.assertEqual(self.server.state.commands[-2][0], "screenOn")
+            with self.assertRaises(ValueError):
+                client.set_stick("UP", 0, 0)
+            with self.assertRaises(ValueError):
+                client.set_stick("LEFT", 0x8000, 0)
+
+    def test_click_seq_done(self) -> None:
+        with self.client() as client:
+            line = client.click_seq("A,W100,B")
+            self.assertEqual(line, "done")
+            self.assertEqual(self.server.state.last_command, ["clickSeq", "A,W100,B"])
+
+    def test_utility_commands(self) -> None:
+        with self.client() as client:
+            self.assertEqual(client.get_version(), "2.6")
+            self.assertEqual(client.get_title_id(), "01006F8002326000")
+            self.assertEqual(client.get_title_version(), "0000000000100000")
+            self.assertEqual(client.get_system_language(), "1")
+            self.assertEqual(client.get_build_id(), "0123456789ABCDEF")
+            self.assertEqual(client.get_heap_base(), "00000005ECA00000")
+            self.assertEqual(client.get_main_nso_base(), "00000005370606000")
+            self.assertEqual(client.is_program_running(0x01006F8002326000), "1")
+            self.assertEqual(client.charge(), "85")
+            self.assertEqual(client.fd_count(), "3")
+            self.assertEqual(client.game("name"), "Animal Crossing")
+            self.assertEqual(client.game("author"), "Nintendo")
+            self.assertEqual(client.game("rating"), "7")
+            self.assertEqual(client.game("version"), "1.6.0")
+            self.assertEqual(client.game("icon"), (b"\xFF\xD8" + b"ICON").hex().upper())
+
+    def test_game_icon_cli_writes_file(self) -> None:
+        import os
+        import tempfile
+        from client.sysagent import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "icon.bin")
+            code = main(["--host", "127.0.0.1",
+                         "--port", str(self.server.server_address[1]),
+                         "--timeout", "1", "utility", "game", "icon", "--output", output])
+            self.assertEqual(code, 0)
+            with open(output, "rb") as image:
+                self.assertEqual(image.read(), b"\xFF\xD8" + b"ICON")
+
+    def test_configure_and_raw(self) -> None:
+        from client.sysagent import main
+        with self.client() as client:
+            client.configure("freezeRate", 10)
+            self.assertEqual(client.raw_command("getVersion"), "2.6")
+            self.assertEqual(self.server.state.commands[-2], ["configure", "freezeRate", "10"])
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "config", "set", "notAParam", "1"])
+        self.assertEqual(code, 2)
+
+    def test_begin_and_refine_cli(self) -> None:
+        from client.sysagent import main
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "search", "begin", "u32", "heap", "0x0", "0x1000",
+                     "--alignment", "4", "--pause"])
+        self.assertEqual(code, 0)
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "search", "refine", "9223372036854775809", "changed"])
+        self.assertEqual(code, 0)
+
+    def test_legacy_cli_and_raw(self) -> None:
+        from client.sysagent import main
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "utility", "heap-base"])
+        self.assertEqual(code, 0)
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "memory", "poke", "0x100", "DEADBEEF"])
+        self.assertEqual(code, 0)
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "input", "click-seq", "A,W10", "--no-wait"])
+        self.assertEqual(code, 0)
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "raw", "getVersion"])
+        self.assertEqual(code, 0)
+
+    def test_every_subcommand_has_help(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import COMMANDS, CommandGroup, build_parser
+        paths = []
+        for item in COMMANDS:
+            if isinstance(item, CommandGroup):
+                for child in item.children:
+                    paths.append([item.name, child.name])
+            else:
+                paths.append([item.name])
+        for path in paths:
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    build_parser().parse_args([*path, "--help"])
+            self.assertEqual(raised.exception.code, 0, " ".join(path))
 
     def test_rejects_malformed_response(self) -> None:
         with self.assertRaises(SysAgentProtocolError):
             parse_response("not-a-response")
         with self.assertRaises(SysAgentProtocolError):
             parse_response("OK duplicate=1 duplicate=2")
+
+    def test_error_response_with_result_field(self) -> None:
+        response = parse_response("ERR code=COMMAND_FAILED stage=getLastOpenedUser result=0x2F01")
+        self.assertEqual(response["code"], "COMMAND_FAILED")
+        self.assertEqual(response["result"], "0x2F01")
+        with self.assertRaisesRegex(SysAgentProtocolError, "COMMAND_FAILED"):
+            require_ok(response)
 
     def test_page_size_validation(self) -> None:
         with self.client() as client:
