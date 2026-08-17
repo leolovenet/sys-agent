@@ -1,5 +1,54 @@
 # Available Commands
 
+## System management
+
+The system-management protocol is additive and uses single-line `OK key=value` or
+`ERR code=...` responses. It does not change any legacy command response.
+
+> **Security warning:** port 6000 has no authentication or encryption. `networkProfile`
+> deliberately exposes the current Wi-Fi passphrase, and `systemInfo` and `accountStatus`
+> expose device and account identifiers. Any host able to connect to port 6000 can read this
+> data and invoke the state-changing commands below. Use only on a trusted isolated network
+> and restrict port 6000 with the surrounding network firewall.
+
+|Command|Description|Parameters|Usage|
+|--|--|--|--|
+|systemCapabilities|Lists protocol version, query groups, actions, limits, and sensitive-data policy|none|`systemCapabilities`|
+|systemInfo|Reports firmware, hardware model, region, language, device nickname, and serial number|none|`systemInfo`|
+|systemTime|Reports Unix time, timezone, and uptime|none|`systemTime`|
+|powerStatus|Reports battery, charger, voltage, health, temperature, and current-limit fields|none|`powerStatus`|
+|storageStatus|Reports SD mount state and total/free/used bytes|none|`storageStatus`|
+|networkStatus|Reports link state, signal strength, and current IPv4 configuration|none|`networkStatus`|
+|networkProfile|Reports the current profile, SSID, **Wi-Fi passphrase**, IPv4/DNS settings, and MTU|none|`networkProfile`|
+|accountStatus|Reports the last-opened account UID and nickname|none|`accountStatus`|
+|applicationStatus|Reports the current application identity, version, memory bases, Build ID, and name|none|`applicationStatus`|
+|processList|Returns a PID/Title-ID page; count is 1 through 64|offset, count|`processList 0 64`|
+|systemReboot|Requests a normal Atmosphere/Horizon reboot|none|`systemReboot`|
+|systemRebootEmuMMC|One-shot reboot directly to the Hekate entry with `id=Atm-Emu`; does not change global autoboot|none|`systemRebootEmuMMC`|
+|systemShutdown|Requests an orderly shutdown|none|`systemShutdown`|
+|systemSleep|Invokes the experimental system-sleep SVC|none|`systemSleep`|
+|networkSet|Enables or disables wireless communication|`enabled` or `disabled`|`networkSet disabled`|
+|lockScreenStatus|Reports Horizon's persistent sleep-mode lock-screen flag|none|`lockScreenStatus`|
+|lockScreenSet|Enables or disables Horizon's persistent sleep-mode lock-screen flag|`enabled` or `disabled`|`lockScreenSet disabled`|
+|applicationTerminate|Terminates only the current foreground application|none|`applicationTerminate`|
+
+Arbitrary strings are returned as uppercase hexadecimal bytes with an adjacent `*Len` field.
+Grouped queries return `NA` for unavailable optional fields and append native Result values in
+`errors`. Power actions, sleep, wireless disable, and application termination can interrupt
+searches, FTP transfers, open files, and the command connection. A successful response may not
+reach the client before the requested state change takes effect. Clients must never retry these
+non-idempotent commands automatically. `systemSleep` remains experimental until real-device
+acceptance succeeds and is advertised as such by `systemCapabilities`.
+
+`systemRebootEmuMMC` reads `sdmc:/bootloader/hekate_ipl.ini` on every invocation and requires
+exactly one main-file boot entry with `id=Atm-Emu`. It refuses to reboot if the ID is missing,
+duplicated, or outside Hekate's RTC index range. On Erista it validates and patches
+`bootloader/update.bin` in memory with Hekate's one-shot Boot-from-ID fields; on Mariko it
+writes the corresponding one-shot RTC autoboot reason before requesting reboot. It never
+rewrites `hekate_ipl.ini` and never falls back to a guessed entry.
+The Mariko path passed real-device acceptance on the current `model=3` console and booted the
+`Atm-Emu` entry directly. The Erista payload-copy branch remains experimental.
+
 ## SD card FTP server
 
 This custom build runs a low-priority FTP server independently of the original command socket.

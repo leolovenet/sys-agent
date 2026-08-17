@@ -9,3 +9,4 @@ build
 __pycache__/
 *.pyc
 sys-botbase/430000000000000B/
+docs/research

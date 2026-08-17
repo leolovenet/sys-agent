@@ -15,6 +15,7 @@
 #include "search.h"
 #include "process_memory.h"
 #include "ftp_server.h"
+#include "system_commands.h"
 #include <poll.h>
 #include <switch/runtime/devices/fs_dev.h>
 
@@ -193,6 +194,9 @@ static void printSearchStartResponse(SearchStartResult result, u64 sessionId)
 int argmain(int argc, char** argv)
 {
     if (argc == 0)
+        return 0;
+
+    if (systemCommandsDispatch(argc, argv))
         return 0;
 
     if (!strcmp(argv[0], "ftpStatus"))

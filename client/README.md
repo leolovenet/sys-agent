@@ -3,6 +3,26 @@
 This dependency-free Python client speaks the additive asynchronous search protocol. It does
 not deploy sys-botbase or write target-process memory.
 
+It also exposes the grouped system-management protocol:
+
+```bash
+python3 client/sysbot_search.py --host switch system-capabilities
+python3 client/sysbot_search.py --host switch system-query info
+python3 client/sysbot_search.py --host switch system-query power
+python3 client/sysbot_search.py --host switch system-query network
+python3 client/sysbot_search.py --host switch process-list --offset 0 --count 64
+python3 client/sysbot_search.py --host switch wireless enabled
+python3 client/sysbot_search.py --host switch lock-screen status
+python3 client/sysbot_search.py --host switch lock-screen disabled
+python3 client/sysbot_search.py --host switch system-action reboot
+python3 client/sysbot_search.py --host switch system-action reboot-emummc
+```
+
+`network-profile` returns the Wi-Fi passphrase over an unauthenticated, unencrypted TCP
+connection. Use it only on a trusted isolated network. The client never automatically retries
+reboot, shutdown, sleep, wireless changes, or application termination; connection closure
+before a complete response is an expected possible outcome for these operations.
+
 Check capabilities:
 
 ```bash

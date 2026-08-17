@@ -48,6 +48,23 @@ class FakeHandler(socketserver.StreamRequestHandler):
                     "OK policy=auto active=dmnt dmntAvailable=1 dmntAttached=1 "
                     "pid=0000000000001234 titleId=01006F8002326000 lastError=0x0"
                 )
+            elif command[0] == "systemCapabilities":
+                response = "OK version=1 processPageMax=64 sensitiveData=serial,account,wifiPassphrase"
+            elif command[0] in {"systemInfo", "systemTime", "powerStatus", "storageStatus",
+                               "networkStatus", "networkProfile", "accountStatus",
+                               "applicationStatus"}:
+                response = f"OK command={command[0]} sample=1 errors=field:0x0"
+            elif command[0] == "processList":
+                response = f"OK total=3 offset={command[1]} count=1 processes=1:2"
+            elif command[0] in {"systemReboot", "systemRebootEmuMMC", "systemShutdown", "systemSleep",
+                               "applicationTerminate"}:
+                response = f"OK action={command[0]}"
+            elif command[0] == "networkSet":
+                response = f"OK wireless={1 if command[1] == 'enabled' else 0}"
+            elif command[0] == "lockScreenStatus":
+                response = "OK lockScreen=0"
+            elif command[0] == "lockScreenSet":
+                response = f"OK lockScreen={1 if command[1] == 'enabled' else 0}"
             elif command[0] == "searchStatus":
                 state.status_calls += 1
                 status = "running" if state.status_calls == 1 else "done"
@@ -133,6 +150,22 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(client.probe_backend().process_id, 0x1234)
             with self.assertRaises(ValueError):
                 client.set_backend_policy("invalid")
+
+    def test_system_queries_and_actions(self) -> None:
+        with self.client() as client:
+            self.assertEqual(client.system_capabilities()["processPageMax"], "64")
+            self.assertEqual(client.system_query("network-profile")["sample"], "1")
+            self.assertEqual(client.process_list(1, 2)["offset"], "1")
+            self.assertEqual(client.set_wireless(False)["wireless"], "0")
+            self.assertEqual(client.lock_screen_status()["lockScreen"], "0")
+            self.assertEqual(client.set_lock_screen(True)["lockScreen"], "1")
+            self.assertEqual(client.system_action("reboot")["action"], "systemReboot")
+            self.assertEqual(self.server.state.last_command, ["systemReboot"])
+            self.assertEqual(client.system_action("reboot-emummc")["action"], "systemRebootEmuMMC")
+            with self.assertRaises(ValueError):
+                client.process_list(0, 65)
+            with self.assertRaises(ValueError):
+                client.system_action("payload")
 
     def test_unknown_search_commands_and_status_fields(self) -> None:
         with self.client() as client:

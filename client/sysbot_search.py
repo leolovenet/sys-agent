@@ -193,6 +193,52 @@ class SysBotSearchClient:
     def probe_backend(self) -> BackendStatus:
         return BackendStatus.from_response(self.command("memoryBackendProbe"))
 
+    def system_capabilities(self) -> dict[str, str]:
+        return require_ok(self.command("systemCapabilities"))
+
+    def system_query(self, name: str) -> dict[str, str]:
+        queries = {
+            "info": "systemInfo",
+            "time": "systemTime",
+            "power": "powerStatus",
+            "storage": "storageStatus",
+            "network": "networkStatus",
+            "network-profile": "networkProfile",
+            "account": "accountStatus",
+            "application": "applicationStatus",
+        }
+        if name not in queries:
+            raise ValueError("unsupported system query")
+        return require_ok(self.command(queries[name]))
+
+    def process_list(self, offset: int = 0, count: int = 64) -> dict[str, str]:
+        if offset < 0 or count < 1 or count > 64:
+            raise ValueError("offset must be non-negative and count must be in 1..64")
+        return require_ok(self.command(f"processList {offset} {count}"))
+
+    def system_action(self, action: str) -> dict[str, str]:
+        commands = {
+            "reboot": "systemReboot",
+            "reboot-emummc": "systemRebootEmuMMC",
+            "shutdown": "systemShutdown",
+            "sleep": "systemSleep",
+            "terminate-application": "applicationTerminate",
+        }
+        if action not in commands:
+            raise ValueError("unsupported system action")
+        return require_ok(self.command(commands[action]))
+
+    def set_wireless(self, enabled: bool) -> dict[str, str]:
+        state = "enabled" if enabled else "disabled"
+        return require_ok(self.command(f"networkSet {state}"))
+
+    def lock_screen_status(self) -> dict[str, str]:
+        return require_ok(self.command("lockScreenStatus"))
+
+    def set_lock_screen(self, enabled: bool) -> dict[str, str]:
+        state = "enabled" if enabled else "disabled"
+        return require_ok(self.command(f"lockScreenSet {state}"))
+
     def start(self, start: int, end: int, pattern: bytes) -> int:
         if start < 0 or end <= start:
             raise ValueError("end must be greater than start")
@@ -340,6 +386,20 @@ def build_parser() -> argparse.ArgumentParser:
     backend = subparsers.add_parser("backend")
     backend.add_argument("policy", nargs="?", choices=("auto", "dmnt", "direct"))
     subparsers.add_parser("backend-probe")
+    subparsers.add_parser("system-capabilities")
+    query = subparsers.add_parser("system-query")
+    query.add_argument("query", choices=("info", "time", "power", "storage", "network",
+        "network-profile", "account", "application"))
+    processes = subparsers.add_parser("process-list")
+    processes.add_argument("--offset", type=int, default=0)
+    processes.add_argument("--count", type=int, default=64)
+    system_action = subparsers.add_parser("system-action")
+    system_action.add_argument("command", choices=("reboot", "shutdown", "sleep",
+        "reboot-emummc", "terminate-application"))
+    wireless = subparsers.add_parser("wireless")
+    wireless.add_argument("state", choices=("enabled", "disabled"))
+    lock_screen = subparsers.add_parser("lock-screen")
+    lock_screen.add_argument("state", choices=("status", "enabled", "disabled"))
 
     start = subparsers.add_parser("start")
     start.add_argument("start", type=lambda value: int(value, 0))
@@ -384,6 +444,20 @@ def main(argv: list[str] | None = None) -> int:
                 print(dataclasses.asdict(status))
             elif args.action == "backend-probe":
                 print(dataclasses.asdict(client.probe_backend()))
+            elif args.action == "system-capabilities":
+                print_fields(client.system_capabilities())
+            elif args.action == "system-query":
+                print_fields(client.system_query(args.query))
+            elif args.action == "process-list":
+                print_fields(client.process_list(args.offset, args.count))
+            elif args.action == "system-action":
+                print_fields(client.system_action(args.command))
+            elif args.action == "wireless":
+                print_fields(client.set_wireless(args.state == "enabled"))
+            elif args.action == "lock-screen":
+                response = client.lock_screen_status() if args.state == "status" \
+                    else client.set_lock_screen(args.state == "enabled")
+                print_fields(response)
             elif args.action == "start":
                 print(client.start(args.start, args.end, args.pattern))
             elif args.action == "start-region":

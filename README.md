@@ -26,6 +26,9 @@ process-memory backend that can coexist with Atmosphère cheats.
 - An isolated, low-priority FTP worker exposes the SD card at `ftp://switch:6001` while a game
   remains open. It supports normal file and directory CRUD and can be controlled over the
   existing sys-botbase TCP connection.
+- Grouped system-management commands report system, power, storage, network, account,
+  application, and process state. Additive actions cover normal reboot/shutdown, wireless and
+  lock-screen settings, foreground-application termination, and one-shot Hekate emuMMC reboot.
 - The original controller, screen-capture, and memory commands remain available. New commands
   are additive so existing clients can continue to ignore capabilities they do not use.
 
@@ -38,6 +41,11 @@ hardware acceptance checks are recorded in [the FTP server notes](docs/ftp-serve
 A Nintendo Switch (CFW) sysmodule that allows users to remotely control their Switch over a
 TCP socket and read or write game memory. It can be used for bots, automation, and controlled
 memory research.
+
+**Security warning:** the command socket on port 6000 is unauthenticated. The explicitly
+enabled `networkProfile` command returns the current Wi-Fi passphrase, while other commands
+return serial and account identifiers or change system state. Expose this port only on a
+trusted isolated network and restrict it with the surrounding network firewall.
 
 ## Features:
 ### Remote Control:
