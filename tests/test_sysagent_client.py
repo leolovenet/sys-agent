@@ -532,6 +532,31 @@ class ClientTests(unittest.TestCase):
                     build_parser().parse_args([*path, "--help"])
             self.assertEqual(raised.exception.code, 0, " ".join(path))
 
+    def test_missing_command_prints_full_help(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import build_parser
+
+        def stderr_of(argv: list[str]) -> tuple[str, int]:
+            with contextlib.redirect_stderr(io.StringIO()) as error:
+                with self.assertRaises(SystemExit) as raised:
+                    build_parser().parse_args(argv)
+            return error.getvalue(), raised.exception.code  # type: ignore[union-attr]
+
+        top, code = stderr_of([])
+        self.assertEqual(code, 2)
+        self.assertIn("error: the following arguments are required: COMMAND", top)
+        self.assertIn("usage:", top)
+        self.assertIn("commands:", top)
+        self.assertIn("Launch, close, or inspect the running game", top)
+
+        game, code = stderr_of(["game"])
+        self.assertEqual(code, 2)
+        self.assertIn("game: error: the following arguments are required: COMMAND", game)
+        self.assertIn("usage:", game)
+        self.assertIn("game [-h] COMMAND", game)
+        self.assertIn("launch-headless", game)
+
     def test_rejects_malformed_response(self) -> None:
         with self.assertRaises(SysAgentProtocolError):
             parse_response("not-a-response")

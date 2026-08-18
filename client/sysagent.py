@@ -1091,7 +1091,9 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                                    "sysmodule)", _cmd_game_launch_headless,
                 (Arg("title_id", "Title ID (hex or decimal)", type=parse_int),)),
         Command("terminate", "Force-close the foreground game (system-level final "
-                             "termination)", _cmd_game_terminate),
+                             "termination; hard kill: the Switch shows the software-error "
+                             "dialog, then returns to the game-selection screen)",
+                _cmd_game_terminate),
         Command("name", "Show the running game name", _cmd_game_meta("name")),
         Command("author", "Show the running game author", _cmd_game_meta("author")),
         Command("rating", "Show the running game age rating", _cmd_game_meta("rating")),
@@ -1306,15 +1308,32 @@ for _item in COMMANDS:
 GROUP_BY_NAME = {item.name: item for item in COMMANDS if isinstance(item, CommandGroup)}
 
 
+class _HelpfulParser(argparse.ArgumentParser):
+    """argparse parser whose missing-argument errors also print the full help.
+
+    The default error path only prints the one-line usage summary when a
+    required subcommand is omitted (``sysagent.py`` or ``sysagent.py game``),
+    which hides the command list the caller actually needs. On that specific
+    failure, print the complete ``-h`` text to stderr before exiting.
+    """
+
+    def error(self, message: str) -> None:
+        if message.startswith("the following arguments are required:"):
+            print(f"{self.prog}: error: {message}\n", file=sys.stderr)
+            self.print_help(sys.stderr)
+            self.exit(2)
+        super().error(message)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = _HelpfulParser(description=__doc__)
     parser.add_argument("--host", default="switch", help="sys-agent host (default: switch)")
     parser.add_argument("--port", type=int, default=6000,
                         help="sys-agent TCP port (default: 6000)")
     parser.add_argument("--timeout", type=float, default=10.0,
                         help="socket timeout in seconds (default: 10.0)")
     subparsers = parser.add_subparsers(dest="action", required=True, metavar="COMMAND",
-                                       title="commands")
+                                       title="commands", parser_class=_HelpfulParser)
     for item in COMMANDS:
         if isinstance(item, CommandGroup):
             group_parser = subparsers.add_parser(item.name, help=item.help,

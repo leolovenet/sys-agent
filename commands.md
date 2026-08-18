@@ -30,7 +30,7 @@ The system-management protocol is additive and uses single-line `OK key=value` o
 |networkSet|Enables or disables wireless communication|`enabled` or `disabled`|`networkSet disabled`|
 |lockScreenStatus|Reports Horizon's persistent sleep-mode lock-screen flag|none|`lockScreenStatus`|
 |lockScreenSet|Enables or disables Horizon's persistent sleep-mode lock-screen flag|`enabled` or `disabled`|`lockScreenSet disabled`|
-|applicationTerminate|Terminates only the current foreground application (system-level final termination; the forced fallback after the HOME-menu graceful-close timeout)|none|`applicationTerminate`|
+|applicationTerminate|Terminates only the current foreground application (system-level final termination; the forced fallback after the HOME-menu graceful-close timeout; a hard kill that makes the Switch show the standard software-error dialog and return to the game-selection screen)|none|`applicationTerminate`|
 |gameLaunchHeadless|Headless-launches a game by Title ID: starts the process without bringing it to the screen (16 hex digits, non-zero)|titleId|`gameLaunchHeadless 01006F8002326000`|
 
 Arbitrary strings are returned as uppercase hexadecimal bytes with an adjacent `*Len` field.
@@ -95,6 +95,10 @@ optional `0x`/`0X` prefix.
 There is no generic graceful-close API for sysmodules: the HOME-menu close flow uses
 `IApplicationAccessor.RequestExit`, which is only reachable by system applets (qlaunch), so
 `applicationTerminate` (`pmshellTerminateProgram`) is the supported final-termination path.
+This is a hard kill, not a graceful close: the Switch screen shows the standard software-error
+dialog ("The software was closed because an error occurred"; Simplified Chinese:
+"由于发生错误, 软件已关闭") with an OK button, and acknowledging it returns to the
+game-selection screen.
 See `docs/research/game-lifecycle.md` for the full research notes.
 
 ## SD card FTP server
