@@ -932,13 +932,23 @@ def _cmd_key_multi(client: SysAgentClient, args: argparse.Namespace) -> None:
     client.key_multi(args.keys)
 
 
+def _require_game_running(client: SysAgentClient, command: str) -> None:
+    status = client.system_query("application")
+    running = status.get("running", "NA")
+    if running != "1":
+        raise SysAgentProtocolError(
+            f"{command} requires a running game (applicationStatus running={running})")
+
+
 def _cmd_game_meta(field: str) -> Callable[[SysAgentClient, argparse.Namespace], None]:
     def handler(client: SysAgentClient, args: argparse.Namespace) -> None:
+        _require_game_running(client, f"game {field}")
         print(client.game(field))
     return handler
 
 
 def _cmd_game_icon(client: SysAgentClient, args: argparse.Namespace) -> None:
+    _require_game_running(client, "game icon")
     data = bytes.fromhex(client.game("icon"))
     output = args.output or f"game-icon-{int(time.time())}.bin"
     with open(output, "wb") as image:
@@ -947,6 +957,7 @@ def _cmd_game_icon(client: SysAgentClient, args: argparse.Namespace) -> None:
 
 
 def _cmd_game_status(client: SysAgentClient, args: argparse.Namespace) -> None:
+    _require_game_running(client, "game status")
     print_fields(client.system_query("application"))
 
 
@@ -1086,13 +1097,14 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
     CommandGroup("game", "Launch, close, or inspect the running game", (
         Command("status", "Show the running game identity and memory layout",
                 _cmd_game_status),
-        Command("launch-headless", "Start a game process without showing it on screen "
-                                   "(headless; foreground launch is not possible from a "
-                                   "sysmodule)", _cmd_game_launch_headless,
+        Command("launch-headless", "Experimental: start a game process without showing it "
+                                   "on screen (headless; foreground launch is not possible "
+                                   "from a sysmodule)", _cmd_game_launch_headless,
                 (Arg("title_id", "Title ID (hex or decimal)", type=parse_int),)),
-        Command("terminate", "Force-close the foreground game (system-level final "
-                             "termination; hard kill: the Switch shows the software-error "
-                             "dialog, then returns to the game-selection screen)",
+        Command("terminate", "Experimental: force-close the foreground game (system-level "
+                             "final termination; hard kill: the Switch shows the "
+                             "software-error dialog, then returns to the game-selection "
+                             "screen)",
                 _cmd_game_terminate),
         Command("name", "Show the running game name", _cmd_game_meta("name")),
         Command("author", "Show the running game author", _cmd_game_meta("author")),

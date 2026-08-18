@@ -15,6 +15,7 @@ class FakeState:
         self.last_command: list[str] = []
         self.commands: list[list[str]] = []
         self.addresses = [0x80000010, 0x80000120, 0x80000230]
+        self.application_running = True
 
 
 class FakeHandler(socketserver.StreamRequestHandler):
@@ -53,9 +54,12 @@ class FakeHandler(socketserver.StreamRequestHandler):
             elif command[0] == "systemCapabilities":
                 response = "OK version=1 processPageMax=64 sensitiveData=serial,account,wifiPassphrase"
             elif command[0] in {"systemInfo", "systemTime", "powerStatus", "storageStatus",
-                               "networkStatus", "networkProfile", "accountStatus",
-                               "applicationStatus"}:
+                               "networkStatus", "networkProfile", "accountStatus"}:
                 response = f"OK command={command[0]} sample=1 errors=field:0x0"
+            elif command[0] == "applicationStatus":
+                response = (f"OK command=applicationStatus "
+                            f"running={1 if state.application_running else 0} "
+                            "sample=1 errors=field:0x0")
             elif command[0] == "processList":
                 response = f"OK total=3 offset={command[1]} count=1 processes=1:2"
             elif command[0] in {"systemReboot", "systemRebootEmuMMC", "systemShutdown", "systemSleep",
@@ -441,6 +445,7 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(image.read(), b"\xFF\xD8" + b"ICON")
 
     def test_game_group_commands(self) -> None:
+        import contextlib
         import io
         import os
         import tempfile
@@ -469,6 +474,16 @@ class ClientTests(unittest.TestCase):
                 with redirect_stdout(output):
                     self.assertEqual(main([*base, *path]), 0)
                 self.assertNotEqual(output.getvalue(), "")
+        self.server.state.application_running = False
+        for path in (["game", "status"], ["game", "name"], ["game", "icon"]):
+            with io.StringIO() as output:
+                with contextlib.redirect_stderr(io.StringIO()) as error:
+                    with redirect_stdout(output):
+                        self.assertEqual(main([*base, *path]), 2)
+                self.assertEqual(output.getvalue(), "")
+                self.assertIn("requires a running game", error.getvalue())
+            self.assertEqual(self.server.state.last_command, ["applicationStatus"])
+        self.server.state.application_running = True
         self.assertEqual(main([*base, "game", "launch-headless", "01006F8002326000"]), 0)
         self.assertEqual(self.server.state.last_command,
                          ["gameLaunchHeadless", "0x01006F8002326000"])
