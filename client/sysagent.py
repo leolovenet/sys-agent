@@ -45,7 +45,8 @@ def parse_response(line: str) -> dict[str, str]:
 def require_ok(response: dict[str, str]) -> dict[str, str]:
     if response.get("ok") != "OK":
         details = ", ".join(
-            f"{key}={response[key]}" for key in ("stage", "result") if key in response
+            f"{key}={response[key]}"
+            for key in ("stage", "result", "attempts") if key in response
         )
         suffix = f" ({details})" if details else ""
         raise SysAgentProtocolError(

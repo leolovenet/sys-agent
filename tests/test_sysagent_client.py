@@ -12,6 +12,7 @@ class FakeState:
         self.status_calls = 0
         self.cancelled = False
         self.search_active = False
+        self.launch_fails = False
         self.last_command: list[str] = []
         self.commands: list[list[str]] = []
         self.addresses = [0x80000010, 0x80000120, 0x80000230]
@@ -143,8 +144,13 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 else:
                     response = "Animal Crossing"
             elif command[0] == "gameLaunchHeadless":
-                response = "OK action=launched pid=0000000000001234 " \
-                           f"titleId={command[1][2:].upper()} storage=SdCard"
+                if state.launch_fails:
+                    response = ("ERR code=COMMAND_FAILED stage=launchProgram result=0xDFC7D802 "
+                                "attempts=SdCard:0xDFC7D802,BuiltInUser:0xA5800A08,"
+                                "GameCard:0x80000A08,None:0x80000A08")
+                else:
+                    response = "OK action=launched pid=0000000000001234 " \
+                               f"titleId={command[1][2:].upper()} storage=SdCard"
             elif command[0] == "getVersion":
                 response = "2.6"
             elif command[0] == "charge":
@@ -494,6 +500,17 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(image.read(), b"\xFF\xD8" + b"ICON")
         with self.assertRaises(SystemExit):
             main([*base, "game", "launch-headless", "not-a-title-id"])
+
+    def test_game_launch_headless_failure_lists_attempts(self) -> None:
+        self.server.state.launch_fails = True
+        with self.client() as client:
+            with self.assertRaises(SysAgentProtocolError) as ctx:
+                client.game_launch_headless(0x01006F8002326000)
+        message = str(ctx.exception)
+        self.assertIn("stage=launchProgram", message)
+        self.assertIn("result=0xDFC7D802", message)
+        self.assertIn("attempts=SdCard:0xDFC7D802", message)
+        self.assertIn("BuiltInUser:0xA5800A08", message)
 
     def test_configure_and_raw(self) -> None:
         from client.sysagent import main

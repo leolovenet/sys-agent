@@ -86,11 +86,14 @@ The service tries the common storages in order (SD card, built-in user, game car
 because launching with `NcmStorageId_None` alone makes the loader/fsp unable to resolve the
 installed title's path and fails with an lr path-not-found result. Invalid Title IDs return
 `ERR code=INVALID_ARGUMENTS`; launch failures return `ERR code=COMMAND_FAILED` or
-`ERR code=SERVICE_UNAVAILABLE`. Headless launch only starts the process: it does not switch the
-screen to the game (foreground presentation requires the home-menu/applet flow, which is not
-reachable from a sysmodule). Starting it takes effect immediately with no confirmation and will
-fail if another application is already running. The Title ID may be bare hex or carry an
-optional `0x`/`0X` prefix.
+`ERR code=SERVICE_UNAVAILABLE`. A `COMMAND_FAILED` launch error reports the first failing
+storage as `result=` and every storage attempt in `attempts=` as
+`<storage>:0x<result>,...`, so a mixed failure (for example SD card resolving an NCA while the
+built-in user storage does not) is visible without another device round trip. Headless launch
+only starts the process: it does not switch the screen to the game (foreground presentation
+requires the home-menu/applet flow, which is not reachable from a sysmodule). Starting it takes
+effect immediately with no confirmation and will fail if another application is already
+running. The Title ID may be bare hex or carry an optional `0x`/`0X` prefix.
 
 There is no generic graceful-close API for sysmodules: the HOME-menu close flow uses
 `IApplicationAccessor.RequestExit`, which is only reachable by system applets (qlaunch), so

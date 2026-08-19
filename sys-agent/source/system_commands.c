@@ -603,19 +603,22 @@ static void gameLaunchHeadlessCommand(u64 titleId)
      * pm:shell fails with an lr path-not-found result (e.g. 0xA5800A08).
      * Nintendo always passes the storage the title is installed on, so try
      * the common storages in order and use the first one pm accepts. */
-    static const NcmStorageId launchStorageOrder[] = {
+    enum { LaunchStorageCount = 4 };
+    static const NcmStorageId launchStorageOrder[LaunchStorageCount] = {
         NcmStorageId_SdCard, NcmStorageId_BuiltInUser,
         NcmStorageId_GameCard, NcmStorageId_None,
     };
-    static const char* storageNames[] = {
+    static const char* storageNames[LaunchStorageCount] = {
         "SdCard", "BuiltInUser", "GameCard", "None",
     };
     const char* usedStorageName = "None";
     Result firstRc = 0;
+    Result attemptRcs[LaunchStorageCount] = {0};
     u64 pid = 0;
-    for (size_t i = 0; i < sizeof(launchStorageOrder) / sizeof(launchStorageOrder[0]); i++) {
+    for (size_t i = 0; i < LaunchStorageCount; i++) {
         NcmProgramLocation location = { .program_id = titleId, .storageID = launchStorageOrder[i] };
         rc = pmshellLaunchProgram(0, &location, &pid);
+        attemptRcs[i] = rc;
         if (R_SUCCEEDED(rc)) {
             usedStorageName = storageNames[i];
             break;
@@ -625,7 +628,12 @@ static void gameLaunchHeadlessCommand(u64 titleId)
     }
     pmshellExit();
     if (R_FAILED(rc)) {
-        printCommandError("launchProgram", firstRc);
+        printf("ERR code=COMMAND_FAILED stage=launchProgram result=0x%X attempts=", firstRc);
+        for (size_t i = 0; i < LaunchStorageCount; i++) {
+            if (i > 0) printf(",");
+            printf("%s:0x%X", storageNames[i], attemptRcs[i]);
+        }
+        printf("\n");
         return;
     }
     printf("OK action=launched pid=%016lX titleId=%016lX storage=%s\n",
