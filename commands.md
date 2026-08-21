@@ -31,7 +31,7 @@ The system-management protocol is additive and uses single-line `OK key=value` o
 |lockScreenStatus|Reports Horizon's persistent sleep-mode lock-screen flag|none|`lockScreenStatus`|
 |lockScreenSet|Enables or disables Horizon's persistent sleep-mode lock-screen flag|`enabled` or `disabled`|`lockScreenSet disabled`|
 |applicationTerminate|Experimental: terminates only the current foreground application (system-level final termination; the forced fallback after the HOME-menu graceful-close timeout; a hard kill that makes the Switch show the standard software-error dialog and return to the game-selection screen)|none|`applicationTerminate`|
-|gameLaunchHeadless|Experimental: headless-launches a game by Title ID: starts the process without bringing it to the screen (16 hex digits, non-zero)|titleId|`gameLaunchHeadless 01006F8002326000`|
+|gameLaunchHeadless|Experimental: headless-launches a game by Title ID: starts the process without bringing it to the screen (16 hex digits, non-zero; optional storage name forces that storage)|titleId [storage]|`gameLaunchHeadless 01006F8002326000`|
 
 Arbitrary strings are returned as uppercase hexadecimal bytes with an adjacent `*Len` field.
 Grouped queries return `NA` for unavailable optional fields and append native Result values in
@@ -80,11 +80,16 @@ session. Research notes comparing `aud:ctl` with process-level `aud:a` volume ar
 `applicationTerminate` are unchanged and shared with the system-management group. The
 `systemCapabilities` response advertises `game=launchHeadless`.
 
-`gameLaunchHeadless` returns `OK action=launched pid=<PID> titleId=<TITLEID> storage=<STORAGE>`, where
-`<STORAGE>` is the install storage pm accepted (`SdCard`, `BuiltInUser`, `GameCard` or `None`).
-The service tries the common storages in order (SD card, built-in user, game card, then `None`)
-because launching with `NcmStorageId_None` alone makes the loader/fsp unable to resolve the
-installed title's path and fails with an lr path-not-found result. Invalid Title IDs return
+`gameLaunchHeadless` returns `OK action=launched pid=<PID> titleId=<TITLEID> storage=<STORAGE>`
+(and, in auto mode, `updateStorage=<STORAGE|none>`), where `<STORAGE>` is the storage pm
+accepted (`SdCard`, `BuiltInUser`, `GameCard` or `None`). On firmware 20.0.0+ fsp resolves the
+launched program's code NCA for the requested storage, so launching with the base title's
+storage alone loads the base build instead of the installed update. Auto mode therefore
+queries each storage's ncm content meta database for the title's Patch (`titleId | 0x800`)
+and tries the storage holding the newest Patch first, falling back through the common storages
+(SD card, built-in user, game card, then `None`). An optional third argument forces one
+storage (`gameLaunchHeadless <titleId> <SdCard|BuiltInUser|GameCard|None>`); the name is
+case-sensitive and must match exactly. Invalid Title IDs and unknown storage names return
 `ERR code=INVALID_ARGUMENTS`; launch failures return `ERR code=COMMAND_FAILED` or
 `ERR code=SERVICE_UNAVAILABLE`. A `COMMAND_FAILED` launch error reports the first failing
 storage as `result=` and every storage attempt in `attempts=` as
@@ -105,6 +110,33 @@ dialog ("The software was closed because an error occurred"; Simplified Chinese:
 "由于发生错误, 软件已关闭") with an OK button, and acknowledging it returns to the
 game-selection screen.
 See `docs/research/game-lifecycle.md` for the full research notes.
+
+### Investigation-only game diagnostics
+
+These commands are experimental diagnostics for the external-key / headless-launch
+investigation; they are not part of the stable protocol and may change without notice. They
+are hidden from `systemCapabilities` and require raw access
+(`python3 client/sysagent.py raw "<command>"`).
+
+|Command|Description|Parameters|Usage|
+|--|--|--|--|
+|gameExternalKeyProbe|Resolves the update storage/program/rights id, reads es 14/16 ticket size/data, and verifies fsp-srv 607/617 callability with a dummy registration|titleId|`gameExternalKeyProbe 01006F8002326000`|
+|gameTicketRead|Reads the update title's common ticket from es (size + full hex)|titleId|`gameTicketRead 01006F8002326000`|
+|gameTicketListAll|Lists es common/personalized ticket rights ids and ncm Patch meta versions|titleId|`gameTicketListAll 01006F8002326000`|
+|gameExternalKeyScan|Pattern-scans a target process's memory (fs/es by name, or a program id) for a rights id and prints surrounding bytes; used to recover the access key fsp-srv registers while a game is running|rightsIdHex, target|`gameExternalKeyScan 01006F8002326800000000000000000B fs`|
+|gameExternalKeyRegister|Registers an external key with fsp-srv 607 for a rights id|rightsIdHex, keyHex|`gameExternalKeyRegister 01006F8002326800000000000000000B <16-byte key>`|
+|gameExternalKeyUnregister|Removes an external key with fsp-srv 617|rightsIdHex|`gameExternalKeyUnregister 01006F8002326800000000000000000B`|
+|gameExternalKeyPrepareCommon|Computes the current boot's AccessKey from the ticket's title_key_block via spl:es `PrepareCommonEsTitleKey` (keygen argument: secure monitor subtracts one, so 11 selects titlekek index 0x0A) and registers it with fsp-srv 607|rightsIdHex, blockHex, keygen|`gameExternalKeyPrepareCommon 01006F8002326800000000000000000B 44FDFC7D7F789693C24E5AA64112658E 11`|
+|gameMemDump|Reads a memory window of fs/es/pid via the debug syscalls|target, addrHex, sizeHex|`gameMemDump es 0x68CFF3C300 0x100`|
+|gameBisDump|Reads a raw BIS partition window (System/User/SafeMode)|partition, offsetHex, sizeHex|`gameBisDump System 0x18adc000 0x100`|
+|gameBisScan|Scans a raw BIS partition region for a byte pattern on-device|partition, offsetHex, sizeHex, patternHex|`gameBisScan System 0x18adc000 0x8630000 01006F8002326800000000000000000B`|
+
+`gameExternalKeyScan` attaches a debug handle to fsp-srv/es; do not run it while the FTP
+server is mid-transfer or during a C-level search. The rights id must be 16 bytes
+(32 hex digits). See `docs/headless-launch-rights-key-notes.md` for the recovery workflow.
+`gameExternalKeyPrepareCommon` is the headless-launch fix path: the client reads the
+title-key block + keygen from the customized `SDcard/switch/title.keys` line and calls this before
+launching, so every boot works without a manual game start.
 
 ## SD card FTP server
 

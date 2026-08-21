@@ -74,8 +74,26 @@ only reachable by system applets. `launch-headless` and `terminate` take effect 
 with no confirmation. Numeric arguments (including Title IDs) accept `0x`-prefixed hex, bare
 hex, or decimal.
 
-`game launch-headless` automatically tries SD card, built-in user storage, game card, then the
-generic `None` storage, and reports which one succeeded in the `storage=` response field.
+`game launch-headless` auto-detects the storage holding the title's update (Patch) by querying
+each storage's ncm content meta database and launches through that storage first, so the
+running process is the updated build rather than the base build; it reports the detected
+storage in `updateStorage=` and the storage that actually launched in `storage=`. An optional
+second positional argument forces a specific storage:
+`game launch-headless 0x01006F8002326000 BuiltInUser` (valid values: `SdCard`,
+`BuiltInUser`, `GameCard`, `None`). Launch failures list every storage attempt in `attempts=`.
+
+For updates whose code NCA uses rights-id encryption, `launch-headless` also registers the
+external key before starting: it resolves the update's rights id and looks the rights id up
+in the workspace `SDcard/switch/title.keys` mirror (override with `--titlekeys <path>`).
+Preferred: a customized line `rightsId = <title_key_block hex> <keygen>` — the client asks
+the sysmodule (`gameExternalKeyPrepareCommon`) to compute the current boot's AccessKey via
+`spl:es PrepareCommonEsTitleKey` and register it, reported as
+`externalKey=titlekey.block+spl`. This works on every boot without a manual game start.
+Legacy fallbacks: a plain `rightsId = key` line (a boot-specific AccessKey value, stale
+after a reboot; `externalKey=title.keys`), then `--keys <prod.keys>` (ticket + titlekek
+decryption), then a plain launch (`externalKey=none`). Only the title-key block/keygen or
+the titlekey travels to the console; `prod.keys` never leaves the host. See
+`docs/headless-launch-rights-key-notes.md` for the full mechanism.
 
 ## Audio
 

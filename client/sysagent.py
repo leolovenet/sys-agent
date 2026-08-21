@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import os
+import re
 import socket
 import sys
 import time
@@ -23,6 +25,223 @@ RESPONSE_LIMIT = 4 * 1024 * 1024
 
 class SysAgentProtocolError(RuntimeError):
     pass
+
+
+# --- AES-128 (FIPS-197), single-block ECB decrypt, dependency-free ----------
+# Used to decrypt the ticket titlekey on the host with a titlekek from
+# prod.keys. The kek itself never leaves the host.
+
+_AES_SBOX = (
+    0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
+    0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
+    0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
+    0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
+    0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
+    0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
+    0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
+    0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
+    0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
+    0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
+    0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
+    0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
+    0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
+    0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
+    0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
+    0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16,
+)
+
+_AES_INV_SBOX = bytes(_AES_SBOX.index(i) for i in range(256))
+
+_AES_RCON = (0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36)
+
+
+def _aes_gf_mul(a: int, b: int) -> int:
+    """Multiply two GF(2^8) elements (AES polynomial 0x11B)."""
+    result = 0
+    for _ in range(8):
+        if b & 1:
+            result ^= a
+        high = a & 0x80
+        a = (a << 1) & 0xFF
+        if high:
+            a ^= 0x1B
+        b >>= 1
+    return result
+
+
+def _aes_expand_key_128(key: bytes) -> list[list[list[int]]]:
+    """Expand a 128-bit key; returns 11 round keys as 4x4 grids [round][row][col]."""
+    if len(key) != 16:
+        raise ValueError("AES-128 requires a 16-byte key")
+    words = [list(key[4 * i:4 * i + 4]) for i in range(4)]
+    for i in range(4, 44):
+        temp = words[i - 1]
+        if i % 4 == 0:
+            temp = temp[1:] + temp[:1]
+            temp = [_AES_SBOX[b] for b in temp]
+            temp[0] ^= _AES_RCON[i // 4]
+        words.append([words[i - 4][j] ^ temp[j] for j in range(4)])
+    # words[i] is column i (rows 0..3); round key grid[r][c] = words[4*round+c][r].
+    return [
+        [[words[4 * rnd + col][row] for col in range(4)] for row in range(4)]
+        for rnd in range(11)
+    ]
+
+
+def _aes128_ecb_decrypt_block(key: bytes, block: bytes) -> bytes:
+    """Decrypt one 16-byte block with AES-128 (no padding, ECB)."""
+    if len(block) != 16:
+        raise ValueError("AES block must be 16 bytes")
+    round_keys = _aes_expand_key_128(key)
+    state = [[block[row + 4 * col] for col in range(4)] for row in range(4)]
+
+    state = [[state[row][col] ^ round_keys[10][row][col] for col in range(4)] for row in range(4)]
+    for rnd in range(9, 0, -1):
+        state = [[state[row][(col - row) % 4] for col in range(4)] for row in range(4)]  # InvShiftRows
+        state = [[_AES_INV_SBOX[state[row][col]] for col in range(4)] for row in range(4)]  # InvSubBytes
+        state = [[state[row][col] ^ round_keys[rnd][row][col] for col in range(4)] for row in range(4)]
+        for col in range(4):  # InvMixColumns
+            a0, a1, a2, a3 = (state[row][col] for row in range(4))
+            state[0][col] = _aes_gf_mul(a0, 14) ^ _aes_gf_mul(a1, 11) ^ _aes_gf_mul(a2, 13) ^ _aes_gf_mul(a3, 9)
+            state[1][col] = _aes_gf_mul(a0, 9) ^ _aes_gf_mul(a1, 14) ^ _aes_gf_mul(a2, 11) ^ _aes_gf_mul(a3, 13)
+            state[2][col] = _aes_gf_mul(a0, 13) ^ _aes_gf_mul(a1, 9) ^ _aes_gf_mul(a2, 14) ^ _aes_gf_mul(a3, 11)
+            state[3][col] = _aes_gf_mul(a0, 11) ^ _aes_gf_mul(a1, 13) ^ _aes_gf_mul(a2, 9) ^ _aes_gf_mul(a3, 14)
+
+    state = [[state[row][(col - row) % 4] for col in range(4)] for row in range(4)]  # InvShiftRows
+    state = [[_AES_INV_SBOX[state[row][col]] for col in range(4)] for row in range(4)]  # InvSubBytes
+    state = [[state[row][col] ^ round_keys[0][row][col] for col in range(4)] for row in range(4)]
+    return bytes(state[row][col] for col in range(4) for row in range(4))
+
+
+# --- Common-ticket parsing and titlekey decryption --------------------------
+
+_TICKET_SIG_BLOCK_SIZES = {
+    0x10000: 0x240,  # RSA-4096 SHA-1
+    0x10001: 0x140,  # RSA-2048 SHA-1
+    0x10002: 0x80,   # ECC-480 SHA-1
+    0x10003: 0x240,  # RSA-4096 SHA-256
+    0x10004: 0x140,  # RSA-2048 SHA-256
+    0x10005: 0x80,   # ECC-480 SHA-256
+    0x10006: 0x40,   # HMAC-160 SHA-1
+}
+
+
+def parse_common_ticket(ticket: bytes) -> tuple[bytes, bytes, int]:
+    """Return (rights_id, encrypted_titlekey, master_key_revision) for a common ticket.
+
+    Offsets verified against a real ACNH update ticket (RSA-2048, 0x2C0 bytes):
+    title_key_type at data+0x141, master_key_revision at data+0x145, rights id
+    at data+0x160, encrypted titlekey at data+0x40.
+    """
+    if len(ticket) < 0x140:
+        raise SysAgentProtocolError("ticket is too short")
+    sig_type = int.from_bytes(ticket[0:4], "little")
+    data_offset = _TICKET_SIG_BLOCK_SIZES.get(sig_type)
+    if data_offset is None:
+        raise SysAgentProtocolError(f"unsupported ticket signature type 0x{sig_type:X}")
+    if len(ticket) < data_offset + 0x180:
+        raise SysAgentProtocolError("ticket data is truncated")
+    data = ticket[data_offset:data_offset + 0x180]
+    if data[0x141] != 0:
+        raise SysAgentProtocolError("personalized ticket is not supported (common ticket required)")
+    rights_id = data[0x160:0x170]
+    encrypted_key = data[0x40:0x50]
+    key_gen = data[0x145]
+    return rights_id, encrypted_key, key_gen
+
+
+def load_titlekek(keys_path: str, key_gen: int) -> bytes:
+    """Read titlekek_<keygen> from a prod.keys file (host-side, read-only)."""
+    wanted = f"titlekek_{key_gen:02x}"
+    with open(keys_path, "r", encoding="utf-8", errors="replace") as keys_file:
+        for raw_line in keys_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            if name.strip().lower() == wanted:
+                try:
+                    key = bytes.fromhex(value.strip())
+                except ValueError as exc:
+                    raise SysAgentProtocolError(
+                        f"invalid {wanted} value in {keys_path}") from exc
+                if len(key) != 16:
+                    raise SysAgentProtocolError(f"{wanted} in {keys_path} is not 16 bytes")
+                return key
+    raise SysAgentProtocolError(f"{wanted} not found in {keys_path}")
+
+
+def load_titlekey_from_titlekeys(keys_path: str, rights_id_hex: str) -> bytes | None:
+    """Read a decrypted 16-byte titlekey for a rights id from a title.keys file.
+
+    Line format is the standard ``<rights id hex> = <16-byte key hex>``. Returns
+    None when the rights id is absent so callers can fall back to ticket
+    decryption; raises on a malformed matching line.
+    """
+    wanted = rights_id_hex.upper()
+    with open(keys_path, "r", encoding="utf-8", errors="replace") as keys_file:
+        for raw_line in keys_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            if name.strip().upper() != wanted:
+                continue
+            try:
+                key = bytes.fromhex(value.strip())
+            except ValueError as exc:
+                raise SysAgentProtocolError(
+                    f"invalid key for {rights_id_hex} in {keys_path}") from exc
+            if len(key) != 16:
+                raise SysAgentProtocolError(
+                    f"key for {rights_id_hex} in {keys_path} is not 16 bytes")
+            return key
+    return None
+
+
+def load_titlekey_block_from_blocks(blocks_path: str, rights_id_hex: str) -> tuple[str, int] | None:
+    """Read a titlekey-block source entry from a title.keys file.
+
+    Customized line format (same file as ``title.keys``):
+    ``<rights id hex> = <16-byte title_key_block hex> <keygen>``.
+    The block is the ticket's encrypted title key (titlekek-wrapped); the
+    console computes the current boot's AccessKey from it via spl:es
+    ``PrepareCommonEsTitleKey``, so this material is boot-independent.
+    Returns None when the matching line is a plain 16-byte titlekey (the
+    standard format) or when the rights id is absent.
+    """
+    wanted = rights_id_hex.upper()
+    with open(blocks_path, "r", encoding="utf-8", errors="replace") as blocks_file:
+        for raw_line in blocks_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            if name.strip().upper() != wanted:
+                continue
+            parts = value.strip().split()
+            if len(parts) == 1:
+                # Standard title.keys line (plain decrypted key): not a
+                # block source; let the legacy registration path handle it.
+                return None
+            if len(parts) != 2:
+                raise SysAgentProtocolError(
+                    f"invalid titlekey-block entry for {rights_id_hex} in {blocks_path}")
+            block_hex = parts[0]
+            if len(block_hex) != 32:
+                raise SysAgentProtocolError(
+                    f"titlekey block for {rights_id_hex} in {blocks_path} is not 16 bytes")
+            try:
+                gen = int(parts[1], 0)
+            except ValueError as exc:
+                raise SysAgentProtocolError(
+                    f"invalid keygen for {rights_id_hex} in {blocks_path}") from exc
+            return block_hex.upper(), gen
+    return None
+
+
+def decrypt_ticket_titlekey(titlekek: bytes, encrypted_key: bytes) -> bytes:
+    return _aes128_ecb_decrypt_block(titlekek, encrypted_key)
 
 
 def parse_response(line: str) -> dict[str, str]:
@@ -494,10 +713,184 @@ class SysAgentClient:
             raise ValueError("field must be icon, version, rating, author, or name")
         return self._bare_command(f"game {field}")
 
-    def game_launch_headless(self, title_id: int) -> dict[str, str]:
+    def game_launch_headless(self, title_id: int, storage: str | None = None) -> dict[str, str]:
         if not 0 < title_id <= 0xFFFFFFFFFFFFFFFF:
             raise ValueError("title_id must be a positive 64-bit Title ID")
-        return require_ok(self.command(f"gameLaunchHeadless 0x{title_id:016X}"))
+        if storage is not None and storage not in {"SdCard", "BuiltInUser", "GameCard", "None"}:
+            raise ValueError("storage must be SdCard, BuiltInUser, GameCard, or None")
+        command = f"gameLaunchHeadless 0x{title_id:016X}"
+        if storage is not None:
+            command += f" {storage}"
+        return require_ok(self.command(command))
+
+    def game_ticket_read(self, title_id: int) -> dict[str, str]:
+        if not 0 < title_id <= 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("title_id must be a positive 64-bit Title ID")
+        return require_ok(self.command(f"gameTicketRead 0x{title_id:016X}"))
+
+    def game_external_key_register(self, rights_id_hex: str, title_key_hex: str) -> dict[str, str]:
+        return require_ok(self.command(
+            f"gameExternalKeyRegister {rights_id_hex} {title_key_hex}"))
+
+    def game_external_key_unregister(self, rights_id_hex: str) -> dict[str, str]:
+        """Remove a rights id's external key with fsp-srv 617."""
+        return require_ok(self.command(f"gameExternalKeyUnregister {rights_id_hex}"))
+
+    def game_external_key_prepare_common(
+        self, rights_id_hex: str, block_hex: str, gen: int
+    ) -> dict[str, str]:
+        """Compute the current boot's AccessKey via spl:es and register it.
+
+        ``block_hex`` is the ticket's 16-byte title_key_block; ``gen`` is the
+        spl:es generation argument (the secure monitor subtracts one, so
+        ``gen=11`` selects titlekek index 0x0A). The returned AccessKey is
+        wrapped with this boot's random seal, so it is valid only for this
+        boot — exactly like the key es provides during a manual launch.
+        """
+        return require_ok(self.command(
+            f"gameExternalKeyPrepareCommon {rights_id_hex} {block_hex} {gen}"))
+
+    def game_launch_headless_with_keys(
+        self,
+        title_id: int,
+        storage: str | None = None,
+        keys_path: str | None = None,
+    ) -> dict[str, str]:
+        """Launch headless after registering the update external key.
+
+        Reads the update's encrypted ticket from the console, decrypts the
+        titlekey on this host with ``titlekek_<keygen>`` from ``keys_path``
+        (the kek never leaves the host), sends only the 16-byte titlekey back
+        to sys-agent for fsp-srv ``RegisterExternalKey``, then launches.
+        """
+        if keys_path is None:
+            raise ValueError("keys_path is required for external-key registration")
+        ticket_response = self.game_ticket_read(title_id)
+        rights_id_hex = ticket_response.get("rightsId", "")
+        ticket_hex = ticket_response.get("ticket", "")
+        if len(rights_id_hex) != 32 or len(ticket_hex) == 0:
+            raise SysAgentProtocolError(
+                "no common ticket returned for the update title; is the game "
+                "owned digitally on this console?")
+        try:
+            ticket = bytes.fromhex(ticket_hex)
+        except ValueError as exc:
+            raise SysAgentProtocolError("sys-agent returned a malformed ticket") from exc
+
+        ticket_rights_id, encrypted_key, key_gen = parse_common_ticket(ticket)
+        if ticket_rights_id.hex().upper() != rights_id_hex.upper():
+            raise SysAgentProtocolError(
+                f"ticket rights id {ticket_rights_id.hex().upper()} does not match "
+                f"update rights id {rights_id_hex}")
+
+        titlekek = load_titlekek(keys_path, key_gen)
+        title_key = decrypt_ticket_titlekey(titlekek, encrypted_key)
+        self.game_external_key_register(rights_id_hex, title_key.hex().upper())
+
+        result = self.game_launch_headless(title_id, storage=storage)
+        result["externalKey"] = "ok"
+        result["rightsId"] = rights_id_hex
+        return result
+
+    def resolve_update_rights_id(self, title_id: int) -> str:
+        """Resolve the installed update's rights id (read-only probe)."""
+        line = self._bare_command(f"gameExternalKeyProbe 0x{title_id:016X}")
+        if line is None:
+            raise SysAgentProtocolError(
+                "gameExternalKeyProbe returned no response")
+        match = re.search(r"\brightsId=([0-9A-Fa-f]{32})\b", line)
+        if match is None:
+            raise SysAgentProtocolError(
+                "could not resolve the update rights id from gameExternalKeyProbe")
+        return match.group(1).upper()
+
+    def game_launch_headless_auto(
+        self,
+        title_id: int,
+        storage: str | None = None,
+        titlekeys_path: str | None = None,
+        fallback_keys_path: str | None = None,
+    ) -> dict[str, str]:
+        """Launch headless, registering the update external key when available.
+
+        Key priority:
+        1. a customized title.keys line (``rightsId = title_key_block keygen``):
+           the ticket's encrypted title key + keygen; the console computes the
+           current boot's AccessKey via spl:es ``PrepareCommonEsTitleKey`` and
+           registers it (works every boot, no manual game start needed);
+        2. a decrypted titlekey from a title.keys file
+           (``titlekeys_path``) — a boot-specific AccessKey value that goes
+           stale after a reboot;
+        3. ticket decryption with a prod.keys file (``fallback_keys_path``);
+        4. a plain launch.
+        """
+        rights_id_hex = self.resolve_update_rights_id(title_id)
+        source = "none"
+
+        # Preferred: per-boot AccessKey computed by spl:es from the ticket's
+        # encrypted title key block. No manual launch ever required.
+        block_info = None
+        if titlekeys_path is not None and os.path.isfile(titlekeys_path):
+            block_info = load_titlekey_block_from_blocks(
+                titlekeys_path, rights_id_hex)
+        if block_info is not None:
+            block_hex, gen = block_info
+            # Drop any stale direct registration first (see note below).
+            try:
+                self.game_external_key_unregister(rights_id_hex)
+            except SysAgentProtocolError:
+                pass
+            self.game_external_key_prepare_common(rights_id_hex, block_hex, gen)
+            source = "titlekey.block+spl"
+            try:
+                result = self.game_launch_headless(title_id, storage=storage)
+            except Exception:
+                # The launch failed, so the key we just registered is useless;
+                # drop it so a later manual launch does not hit es's
+                # NcaExternalKeyInconsistent assertion.
+                try:
+                    self.game_external_key_unregister(rights_id_hex)
+                except SysAgentProtocolError:
+                    pass
+                raise
+            result["rightsId"] = rights_id_hex
+            result["externalKey"] = source
+            return result
+
+        title_key = None
+        if titlekeys_path is not None:
+            title_key = load_titlekey_from_titlekeys(titlekeys_path, rights_id_hex)
+            if title_key is not None:
+                source = "title.keys"
+        if title_key is None and fallback_keys_path is not None:
+            result = self.game_launch_headless_with_keys(
+                title_id, storage=storage, keys_path=fallback_keys_path)
+            result["externalKey"] = "ticket+titlekek"
+            return result
+        if title_key is not None:
+            # Drop any stale direct registration first. A key registered
+            # directly via fsp-srv 607 is NOT cleaned up when a game exits, so
+            # it would make es's own registration at the next manual launch
+            # fail with NcaExternalKeyInconsistent (which crashes es).
+            try:
+                self.game_external_key_unregister(rights_id_hex)
+            except SysAgentProtocolError:
+                pass  # nothing registered yet is fine
+            self.game_external_key_register(rights_id_hex, title_key.hex().upper())
+        try:
+            result = self.game_launch_headless(title_id, storage=storage)
+        except Exception:
+            # The launch failed, so the key we just registered is useless;
+            # drop it so a later manual launch does not hit es's
+            # NcaExternalKeyInconsistent assertion.
+            try:
+                self.game_external_key_unregister(rights_id_hex)
+            except SysAgentProtocolError:
+                pass
+            raise
+        result["rightsId"] = rights_id_hex
+        result["externalKey"] = source
+        return result
 
     def get_version(self) -> str:
         return self._bare_command("getVersion")
@@ -963,7 +1356,34 @@ def _cmd_game_status(client: SysAgentClient, args: argparse.Namespace) -> None:
 
 
 def _cmd_game_launch_headless(client: SysAgentClient, args: argparse.Namespace) -> None:
-    print_fields(client.game_launch_headless(args.title_id))
+    titlekeys_path = args.titlekeys
+    if titlekeys_path is None:
+        titlekeys_path = _default_titlekeys_path()
+    if titlekeys_path is not None and os.path.isfile(titlekeys_path):
+        result = client.game_launch_headless_auto(
+            args.title_id, storage=args.storage,
+            titlekeys_path=titlekeys_path, fallback_keys_path=args.keys)
+    elif args.keys:
+        result = client.game_launch_headless_with_keys(
+            args.title_id, storage=args.storage, keys_path=args.keys)
+    else:
+        result = client.game_launch_headless(args.title_id, storage=args.storage)
+    print_fields(result)
+
+
+def _default_titlekeys_path() -> str | None:
+    """Locate the workspace title.keys mirror for automatic key registration."""
+    # realpath follows PATH symlinks (e.g. ~/bin/sysagent.py), so the
+    # file-relative candidate works regardless of how the client was invoked.
+    client_dir = os.path.dirname(os.path.realpath(__file__))
+    candidates = (
+        os.path.join(os.getcwd(), "SDcard", "switch", "title.keys"),
+        os.path.join(client_dir, "..", "..", "..", "SDcard", "switch", "title.keys"),
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def _cmd_game_terminate(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -1101,7 +1521,19 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
         Command("launch-headless", "Experimental: start a game process without showing it "
                                    "on screen (headless; foreground launch is not possible "
                                    "from a sysmodule)", _cmd_game_launch_headless,
-                (Arg("title_id", "Title ID (hex or decimal)", type=parse_int),)),
+                (Arg("title_id", "Title ID (hex or decimal)", type=parse_int),
+                 Arg("storage", "Storage to force (auto-detected when omitted)",
+                     nargs="?", choices=("SdCard", "BuiltInUser", "GameCard", "None"),
+                     default=None),
+                 Arg("keys", "prod.keys path; read the update ticket on the console, decrypt "
+                             "the titlekey on this host, and register it before launching",
+                     flags=("--keys",), default=None),
+                 Arg("titlekeys", "title.keys path with decrypted titlekeys "
+                                  "(rightsId = key, or customized "
+                                  "rightsId = title_key_block keygen for "
+                                  "per-boot spl:es AccessKey computation); "
+                                  "auto-registers before launching",
+                     flags=("--titlekeys",), default=None),)),
         Command("terminate", "Experimental: force-close the foreground game (system-level "
                              "final termination; hard kill: the Switch shows the "
                              "software-error dialog, then returns to the game-selection "
