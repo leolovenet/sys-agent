@@ -191,6 +191,79 @@ still ask dmnt to attach, and Atmosphere retains ownership of that shared debug 
 direct mode, sys-agent owns the handle only for the current command, freeze cycle, mapping
 query, or search read and closes it immediately afterward.
 
+## Hardware watchpoint (debug watch)
+
+`debug watch` attaches the current application directly with
+`svcDebugActiveProcess`, links a data watchpoint through a context-IDR
+breakpoint (exactly like Atmosphere dmnt.gen2's `HardwareWatchPointManager`),
+and reports the PC of the writing instruction on every hit. It is intended for
+the ACNH in-process agent project and is the recommended replacement for the
+standalone gdbstub when all you need is "who writes this address".
+
+The watch runs on its own thread and never writes unsolicited data to a client
+socket; poll with `debug watch-status`. The NPDM kernel CPU capability was
+widened to cores 0-3 so the watch thread can arm the per-core breakpoint
+registers on all four cores; every other thread keeps its core-3 affinity.
+Each core transition is verified with `svcGetCurrentProcessorNumber` before
+the register is programmed, and partial failures are rolled back before the
+original affinity is restored.
+
+Requirements and conflict rules:
+
+- The game must be running. `debug watch` resolves the gen1 (`dmnt:cht`)
+  conflict automatically: if gen1 already owns the debug handle (because a
+  memory command force-opened it, or cheats attached at launch), `debug watch`
+  closes it first (`dmntClosed=1`), then attaches directly. No game restart or
+  console reboot is needed. Closing gen1's handle pauses active cheats
+  immediately (the cheat VM skips execution without a valid handle); the next
+  auto-mode memory command re-attaches gen1 and cheats resume working
+  (verified 2026-08-24 with the trigger-based chat-code cheat: force-close
+  pauses it, re-attach restores it, and the same holds after `debug watch`'s
+  automatic force-close).
+- The one unresolvable owner is the gdbstub: when it is attached,
+  `debug watch` fails with `0xF401` and an explanatory `hint`. Keep
+  `enable_standalone_gdbstub` disabled during diagnostics.
+- While a watch is armed, memory commands are rejected with a clear
+  `OwnedByAnotherProcess` result instead of attempting a conflicting second
+  debug attach; this is expected.
+- The watch thread continues the process after every event, so the game keeps
+  running at full speed. The counter itself advances ~30/s, but the watchpoint
+  may fire much more often (see known anomaly below).
+- A duration failsafe (default 60 s, `duration 0` disables it) detaches the
+  session even if the control client disconnects. Initial debug events
+  (CreateProcess/CreateThread/DebuggerAttached) are drained before the
+  watchpoint is armed, and a pending exception is explicitly continued before
+  detach when the session stops on a hit limit, stop, or timeout.
+
+|Command|Description|Parameters|Usage|
+|--|--|--|--|
+|debug watch|Arms a hardware write watchpoint and returns immediately; the thread detaches automatically after `hits` hits or `duration` seconds|1. absolute address or `main+offset`<br>2. optional size 1-8 (default 4)<br>3. optional `hits N` (default 1)<br>4. optional `duration N` seconds (default 60, 0 = unlimited)|`debug watch main+0x4B485E8 4 hits 100`<br>`debug watch 0x2E1000 2 hits 20 duration 300`|
+|debug watch-status|Reports arming state, process, address, hit count, discovered breakpoint slots (ctx/wp), and the latest hit's PC/LR/SP/data/thread|none|`debug watch-status`|
+|debug watch-last|Dumps the full register snapshot (x0-x30, sp, pc) and the instruction window at pc-8..pc+3 of the most recent hit|none|`debug watch-last`|
+|debug watch-stop|Requests the watch thread to detach and waits for it|none|`debug watch-stop`|
+|debug force-close|Closes gen1's (`dmnt:cht`) debug handle to the game if it is attached; the next memory command re-attaches it automatically|none|`debug force-close`|
+
+`debug watch` first live-checks whether gen1 owns the debug handle and, if so,
+closes it (`dmntClosed=1` in the response) before attaching directly -- so it
+works even after `game status` or other memory commands, without restarting the
+game. Manual `debug force-close` does the same explicitly. It then waits up to
+one second for the attach/arm result, so any remaining conflict (`0xF401`, for
+example when the gdbstub owns the handle) is reported synchronously as
+`ERR code=DEBUG_HANDLE_IN_USE result=0xF401 stage=... hint=...`. Other
+attach/setup failures are reported by `debug watch-status` (which also carries
+the same `hint` field). `lastPc` is the PC of the instruction that wrote the
+watched address; `debug watch-last` also gives LR/SP and the raw instruction
+bytes so the writer can be verified in a disassembler (base register +
+immediate == watched address). For the ACNH frame counter at `main+0x4B485E8`,
+the captured writer PC is stable across sessions even though the hit rate can
+be much higher than the ~30 Hz increment rate (see known anomaly below).
+
+Known anomaly: on this setup the hardware write watchpoint can fire tens of
+thousands of times per second at `main+0x4B485E8` while the counter itself
+only advances ~30/s. The captured PC/LR/registers/instruction window are still
+valid for identifying the writer, but `hitCount`/`hits N` do not reflect the
+real increment rate and a large `hits` value completes almost instantly.
+
 ## Asynchronous exact memory search
 
 The search extension is additive: existing commands and responses are unchanged. Legacy search

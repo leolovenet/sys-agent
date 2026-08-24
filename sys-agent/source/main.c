@@ -14,6 +14,8 @@
 #include "freeze.h"
 #include "search.h"
 #include "process_memory.h"
+#include "debug_watch.h"
+#include "dmnt_client.h"
 #include "ftp_server.h"
 #include "system_commands.h"
 #include <poll.h>
@@ -22,7 +24,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.6"
+#define VERSION_S "2.7.0"
 
 typedef enum {
     Active = 0,
@@ -291,6 +293,216 @@ int argmain(int argc, char** argv)
             processMemoryPolicyName(status.policy), processMemoryBackendName(status.active),
             status.dmntAvailable, status.dmntAttached, status.processId, status.titleId,
             status.lastError);
+        return 0;
+    }
+
+    if (!strcmp(argv[0], "debug"))
+    {
+        if (argc < 2) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        if (!strcmp(argv[1], "watch"))
+        {
+            /* debug watch <address|main+offset> [size] [hits N] [duration N] */
+            u64 address = 0;
+            u64 size = 4;
+            u32 maxHits = 1;
+            u64 duration = 60;
+            int index = 2;
+            if (index >= argc) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            if (strncmp(argv[index], "main+", 5) == 0) {
+                u64 mainBase = 0;
+                Result rc = debugWatchResolveMainBase(&mainBase);
+                if (R_FAILED(rc)) {
+                    printf("ERR code=MAIN_BASE_UNAVAILABLE result=0x%X\n", rc);
+                    return 0;
+                }
+                u64 offset = 0;
+                if (!tryParseStringToInt(argv[index] + 5, &offset)) {
+                    printf("ERR code=INVALID_ADDRESS\n");
+                    return 0;
+                }
+                address = mainBase + offset;
+            } else if (!tryParseStringToInt(argv[index], &address)) {
+                printf("ERR code=INVALID_ADDRESS\n");
+                return 0;
+            }
+            index++;
+            if (index < argc) {
+                u64 parsed = 0;
+                if (!tryParseStringToInt(argv[index], &parsed)
+                    || parsed == 0 || parsed > 8) {
+                    printf("ERR code=INVALID_SIZE\n");
+                    return 0;
+                }
+                size = parsed;
+                index++;
+            }
+            while (index < argc) {
+                if (!strcmp(argv[index], "hits") && index + 1 < argc) {
+                    u64 parsed = 0;
+                    if (!tryParseStringToInt(argv[index + 1], &parsed)
+                        || parsed == 0 || parsed > 0xFFFF) {
+                        printf("ERR code=INVALID_HITS\n");
+                        return 0;
+                    }
+                    maxHits = (u32)parsed;
+                    index += 2;
+                } else if (!strcmp(argv[index], "duration")
+                    && index + 1 < argc) {
+                    u64 parsed = 0;
+                    if (!tryParseStringToInt(argv[index + 1], &parsed)
+                        || parsed > 0x7FFFFFFF) {
+                        printf("ERR code=INVALID_DURATION\n");
+                        return 0;
+                    }
+                    duration = parsed;
+                    index += 2;
+                } else {
+                    break;
+                }
+            }
+            if (index != argc) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            /* If gen1 (dmnt:cht) already owns the debug handle, close it so
+             * the watch can attach directly without a game restart.  This is
+             * a live query (no cached state) and harmless when not attached. */
+            bool dmntClosed = false;
+            if (R_SUCCEEDED(dmntClientInitialize())) {
+                bool attached = false;
+                if (R_SUCCEEDED(dmntClientHasProcess(&attached)) && attached) {
+                    dmntClientForceClose();
+                    dmntClosed = true;
+                }
+            }
+            if (!debugWatchStart(address, size, maxHits, duration)) {
+                DebugWatchStatus status;
+                debugWatchGetStatus(&status);
+                printf("ERR code=WATCH_BUSY lastError=0x%X\n", status.lastError);
+                return 0;
+            }
+            /* Wait briefly for attach/arm so failures (e.g. the debug handle
+             * already owned by dmnt:cht or gdbstub) are reported here instead
+             * of requiring a separate watch-status poll. */
+            DebugWatchStatus status;
+            u32 attempts = 0;
+            do {
+                svcSleepThread(50 * 1000 * 1000LL);
+                debugWatchGetStatus(&status);
+            } while (!status.armed && status.active && ++attempts < 20);
+            if (!status.active && status.lastError != 0) {
+                printf("ERR code=DEBUG_HANDLE_IN_USE result=0x%X stage=%s"
+                    " hint=%s\n", status.lastError, status.stage, status.hint);
+                return 0;
+            }
+            printf("OK state=started address=%016lX size=%lu hits=%u"
+                " duration=%lu dmntClosed=%d\n", address, size, maxHits,
+                duration, dmntClosed);
+            return 0;
+        }
+        if (!strcmp(argv[1], "force-close"))
+        {
+            if (argc != 2) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            Result rc = dmntClientInitialize();
+            if (R_SUCCEEDED(rc))
+                rc = dmntClientForceClose();
+            printf("OK dmntForceClose=0x%X\n", rc);
+            return 0;
+        }
+        if (!strcmp(argv[1], "watch-stop"))
+        {
+            if (argc != 2) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            debugWatchStop();
+            printf("OK state=stopped\n");
+            return 0;
+        }
+        if (!strcmp(argv[1], "watch-status"))
+        {
+            if (argc != 2) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            DebugWatchStatus status;
+            debugWatchGetStatus(&status);
+            printf("OK active=%d armed=%d pid=%016lX address=%016lX size=%lu"
+                " maxHits=%u hitCount=%u ctxSlot=%u wpSlot=%u duration=%lu"
+                " lastPc=%016lX lastLr=%016lX lastSp=%016lX lastData=%016lX"
+                " lastThread=%016lX stage=%s lastError=0x%X hint=%s\n",
+                status.active, status.armed, status.processId,
+                status.watchAddress, status.watchSize, status.maxHits,
+                status.hitCount, status.ctxSlot, status.wpSlot,
+                status.durationSeconds, status.lastPc, status.lastLr,
+                status.lastSp, status.lastDataAddress, status.lastThreadId,
+                status.stage, status.lastError, status.hint);
+            return 0;
+        }
+        if (!strcmp(argv[1], "modules"))
+        {
+            if (argc != 2) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            u64 pid = 0;
+            Result rc = pmdmntGetApplicationProcessId(&pid);
+            if (R_FAILED(rc) || pid == 0) {
+                printf("ERR code=NO_APP result=0x%X\n", rc);
+                return 0;
+            }
+            /* Requesting more than 2 modules over ldr:dmnt closes the session
+             * on this stack (ConnectionClosed 0xF601); the full module map is
+             * derived from the main base by acnh-agent/tools/
+             * inspect-live-modules.py instead. */
+            LoaderModuleInfo modules[2];
+            s32 count = 0;
+            rc = ldrDmntGetProcessModuleInfo(pid, modules, 2, &count);
+            if (R_FAILED(rc) || count <= 0) {
+                printf("ERR code=MODULES_UNAVAILABLE result=0x%X\n", rc);
+                return 0;
+            }
+            printf("OK pid=%016lX count=%d modules=", pid, count);
+            s32 i = 0;
+            for (i = 0; i < count; i++) {
+                printf("%s%d=%016lX+%lX", i ? "," : "", i,
+                    modules[i].base_address, modules[i].size);
+            }
+            printf("\n");
+            return 0;
+        }
+        if (!strcmp(argv[1], "watch-last"))
+        {
+            if (argc != 2) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            DebugWatchHit hit;
+            if (!debugWatchGetLastHit(&hit)) {
+                printf("ERR code=NO_HIT\n");
+                return 0;
+            }
+            printf("OK pc=%016lX sp=%016lX lr=%016lX data=%016lX thread=%016lX"
+                " insnBytes=%u insn=", hit.pc, hit.sp, hit.x[30],
+                hit.dataAddress, hit.threadId, hit.insnBytes);
+            u32 i = 0;
+            for (i = 0; i < hit.insnBytes; i++)
+                printf("%02X", hit.insn[i]);
+            for (i = 0; i < 31; i++)
+                printf(" x%u=%016lX", i, hit.x[i]);
+            printf("\n");
+            return 0;
+        }
+        printf("ERR code=UNKNOWN_DEBUG_COMMAND\n");
         return 0;
     }
 
@@ -1310,6 +1522,7 @@ int main()
 
     initFreezes();
     processMemoryInitialize();
+    debugWatchInitialize();
     searchInitialize(searchSdMounted);
     ftpServerInitialize(searchSdMounted);
 

@@ -46,6 +46,11 @@ Result dmntClientForceOpen(void)
     return serviceDispatch(&dmntService, 65003);
 }
 
+Result dmntClientForceClose(void)
+{
+    return serviceDispatch(&dmntService, 65006);
+}
+
 Result dmntClientRead(u64 address, void* buffer, size_t size)
 {
     const struct { u64 address; u64 size; } in = { address, size };

@@ -196,7 +196,7 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 state.key_ops.append("unreg")
                 response = f"OK action=externalKeyUnregistered rightsId={command[1]}"
             elif command[0] == "getVersion":
-                response = "2.6"
+                response = "2.7.0"
             elif command[0] == "charge":
                 response = "85"
             elif command[0] == "fdCount":
@@ -464,7 +464,7 @@ class ClientTests(unittest.TestCase):
 
     def test_utility_commands(self) -> None:
         with self.client() as client:
-            self.assertEqual(client.get_version(), "2.6")
+            self.assertEqual(client.get_version(), "2.7.0")
             self.assertEqual(client.get_title_id(), "01006F8002326000")
             self.assertEqual(client.get_title_version(), "0000000000100000")
             self.assertEqual(client.get_system_language(), "1")
@@ -755,7 +755,7 @@ class ClientTests(unittest.TestCase):
         from client.sysagent import main
         with self.client() as client:
             client.configure("freezeRate", 10)
-            self.assertEqual(client.raw_command("getVersion"), "2.6")
+            self.assertEqual(client.raw_command("getVersion"), "2.7.0")
             self.assertEqual(self.server.state.commands[-2], ["configure", "freezeRate", "10"])
         code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
                      "--timeout", "1", "config", "set", "notAParam", "1"])

@@ -25,6 +25,7 @@ bool dmntClientIsInitialized(void);
 Result dmntClientHasProcess(bool* out);
 Result dmntClientGetMetadata(DmntProcessMetadata* out);
 Result dmntClientForceOpen(void);
+Result dmntClientForceClose(void);
 Result dmntClientRead(u64 address, void* buffer, size_t size);
 Result dmntClientWrite(u64 address, const void* buffer, size_t size);
 Result dmntClientQuery(MemoryInfo* info, u64 address);
