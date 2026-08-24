@@ -117,8 +117,12 @@ def request_reboot(host: str, cmd_port: int, reboot_command: str) -> None:
             line = sock.recv(256).decode("ascii", "replace").strip()
             if line:
                 print(f"reboot response: {line}")
+            else:
+                print("no reboot response (empty); reboot NOT confirmed - "
+                      "check the console manually")
         except OSError:
-            print("reboot requested (no response read; console is shutting down)")
+            print("no reboot response (timeout); reboot NOT confirmed - the "
+                  "command port may be wedged; check the console manually")
 
 
 def verify_build(host: str, cmd_port: int, timeout: float) -> bool:
