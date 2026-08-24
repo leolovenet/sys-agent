@@ -16,9 +16,15 @@ process-memory backend that can coexist with Atmosphère cheats.
 - The default `auto` policy prefers Atmosphère's `dmnt:cht` service, sharing dmnt's existing
   debug handle instead of attempting a conflicting second `svcDebugActiveProcess` attachment.
 - `dmnt` and `direct` policies are available for diagnostics. Direct-debug handles are scoped
-  to an operation and released afterward; this fork never force-closes a dmnt-owned handle.
+  to an operation and released afterward. `debug watch` / `debug force-close` may close the
+  dmnt-owned debug handle when a hardware watchpoint is needed; the next memory command
+  re-attaches dmnt automatically.
 - Asynchronous exact and typed `u8`/`u16`/`u32`/`u64` memory search supports absolute, main,
   and heap-relative ranges, alignment, progress, cancellation, sessions, and paged results.
+- A hardware watchpoint (`debug watch`) reports the PC of the instruction that writes a
+  watched address, with per-core debug registers linked through a context-IDR breakpoint.
+  It auto-resolves the dmnt-owned debug-handle conflict (`dmntClosed=1`), and a manual
+  `debug force-close` is available; memory commands are rejected while a watch is armed.
 - SD-backed unknown-value sessions support exact, changed, unchanged, increased, and decreased
   multi-pass refinement without keeping millions of candidates in the sysmodule heap.
 - Search sessions pin their process ID and backend, preventing a running scan from silently
@@ -62,6 +68,8 @@ trusted isolated network and restrict it with the surrounding network firewall.
   the cheat VM, with an explicit direct-debug fallback.
 - Run asynchronous exact and typed memory searches with progress, cancellation, and paged
   results.
+- Hardware write watchpoints (`debug watch` / `watch-status` / `watch-last` / `watch-stop`)
+  capture the writer's PC, registers, and instruction bytes; see `commands.md`.
 
 ### Screen Capture:
 - Capture current screen and return as JPG
