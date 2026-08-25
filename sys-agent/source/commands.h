@@ -6,6 +6,7 @@ extern HiddbgHdlsHandle controllerHandle;
 extern HiddbgHdlsDeviceInfo controllerDevice;
 extern HiddbgHdlsState controllerState;
 extern HiddbgKeyboardAutoPilotState dummyKeyboardState;
+extern Mutex controllerMutex;
 extern u64 buttonClickSleepTime;
 extern u64 keyPressSleepTime;
 extern u64 pollRate;

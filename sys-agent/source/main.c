@@ -1142,7 +1142,9 @@ int argmain(int argc, char** argv)
         if (!strcmp(argv[1], "controllerType")) {
             detachController();
             u8 fControllerType = (u8)parseStringToInt(argv[2]);
+            mutexLock(&controllerMutex);
             controllerInitializedType = fControllerType;
+            mutexUnlock(&controllerMutex);
         }
     }
 
@@ -1662,6 +1664,11 @@ int main()
     Result rc;
     int fr_count = 0;
 
+    // Hackfix found by Red: an unused key press (KBD_MEDIA_CALC) is required to
+    // allow sequential same-key presses. Set once before threads start so the
+    // keyboard worker never races with controller (re)initialization.
+    dummyKeyboardState.keys[3] = 0x800000000000000UL; // bitfield[3]
+
     initFreezes();
     processMemoryInitialize();
     debugWatchInitialize();
@@ -1688,6 +1695,7 @@ int main()
 
     // click sequence thread
     mutexInit(&clickMutex);
+    mutexInit(&controllerMutex);
     rc = threadCreate(&clickThread, sub_click, (void*)currentClick, NULL, THREAD_SIZE, 0x2C, -2);
     if (R_SUCCEEDED(rc))
         rc = threadStart(&clickThread);

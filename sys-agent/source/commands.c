@@ -15,6 +15,7 @@ HidDeviceType controllerInitializedType = HidDeviceType_FullKey3;
 HiddbgHdlsHandle controllerHandle = { 0 };
 HiddbgHdlsDeviceInfo controllerDevice = { 0 };
 HiddbgHdlsState controllerState = { 0 };
+Mutex controllerMutex;
 
 //Keyboard:
 HiddbgKeyboardAutoPilotState dummyKeyboardState = { 0 };
@@ -126,7 +127,7 @@ bool getIsProgramOpen(u64 id)
     return true;
 }
 
-void initController()
+static void initControllerLocked()
 {
     if (bControllerIsInitialised) return;
     //taken from switchexamples github
@@ -161,6 +162,9 @@ void initController()
     controllerState.analog_stick_l.y = -0x0;
     controllerState.analog_stick_r.x = 0x0;
     controllerState.analog_stick_r.y = -0x0;
+    // Never carry held buttons across detach/re-attach: stale bits suppress the
+    // next press edge for that button and leave the game seeing it as held.
+    controllerState.buttons = 0;
 
     rc = hiddbgAttachHdlsWorkBuffer(&sessionId, workmem, workmem_size);
     if (R_FAILED(rc) && debugResultCodes)
@@ -168,14 +172,16 @@ void initController()
     rc = hiddbgAttachHdlsVirtualDevice(&controllerHandle, &controllerDevice);
     if (R_FAILED(rc) && debugResultCodes)
         printf("hiddbgAttachHdlsVirtualDevice: %d\n", rc);
-    //init a dummy keyboard state for assignment between keypresses
-    dummyKeyboardState.keys[3] = 0x800000000000000UL; // Hackfix found by Red: an unused key press (KBD_MEDIA_CALC) is required to allow sequential same-key presses. bitfield[3]
+    rc = hiddbgSetHdlsState(controllerHandle, &controllerState);
+    if (R_FAILED(rc) && debugResultCodes)
+        printf("hiddbgSetHdlsState: %d\n", rc);
     bControllerIsInitialised = true;
 }
 
 void detachController()
 {
-    initController();
+    mutexLock(&controllerMutex);
+    initControllerLocked();
 
     Result rc = hiddbgDetachHdlsVirtualDevice(controllerHandle);
     if (R_FAILED(rc) && debugResultCodes)
@@ -186,8 +192,10 @@ void detachController()
     hiddbgExit();
     free(workmem);
     bControllerIsInitialised = false;
+    controllerState.buttons = 0;
 
     sessionId.id = 0;
+    mutexUnlock(&controllerMutex);
 }
 
 void poke(u64 offset, u64 size, u8* val)
@@ -315,7 +323,6 @@ void peekMulti(u64* offset, u64* size, u64 count)
 
 void click(HidNpadButton btn)
 {
-    initController();
     press(btn);
     svcSleepThread(buttonClickSleepTime * 1e+6L);
     release(btn);
@@ -323,25 +330,30 @@ void click(HidNpadButton btn)
 
 void press(HidNpadButton btn)
 {
-    initController();
+    mutexLock(&controllerMutex);
+    initControllerLocked();
     controllerState.buttons |= btn;
     Result rc = hiddbgSetHdlsState(controllerHandle, &controllerState);
     if (R_FAILED(rc) && debugResultCodes)
         printf("hiddbgSetHdlsState: %d\n", rc);
+    mutexUnlock(&controllerMutex);
 }
 
 void release(HidNpadButton btn)
 {
-    initController();
+    mutexLock(&controllerMutex);
+    initControllerLocked();
     controllerState.buttons &= ~btn;
     Result rc = hiddbgSetHdlsState(controllerHandle, &controllerState);
     if (R_FAILED(rc) && debugResultCodes)
         printf("hiddbgSetHdlsState: %d\n", rc);
+    mutexUnlock(&controllerMutex);
 }
 
 void setStickState(int side, int dxVal, int dyVal)
 {
-    initController();
+    mutexLock(&controllerMutex);
+    initControllerLocked();
     if (side == JOYSTICK_LEFT)
     {
         controllerState.analog_stick_l.x = dxVal;
@@ -353,6 +365,7 @@ void setStickState(int side, int dxVal, int dyVal)
         controllerState.analog_stick_r.y = dyVal;
     }
     hiddbgSetHdlsState(controllerHandle, &controllerState);
+    mutexUnlock(&controllerMutex);
 }
 
 void reverseArray(u8* arr, int start, int end)
@@ -415,7 +428,9 @@ u64 followMainPointer(s64* jumps, size_t count)
 
 void touch(HidTouchState* state, u64 sequentialCount, u64 holdTime, bool hold, u8* token)
 {
-    initController();
+    mutexLock(&controllerMutex);
+    initControllerLocked();
+    mutexUnlock(&controllerMutex);
     state->delta_time = holdTime; // only the first touch needs this for whatever reason
     for (u32 i = 0; i < sequentialCount; i++)
     {
@@ -442,7 +457,9 @@ void touch(HidTouchState* state, u64 sequentialCount, u64 holdTime, bool hold, u
 
 void key(HiddbgKeyboardAutoPilotState* states, u64 sequentialCount)
 {
-    initController();
+    mutexLock(&controllerMutex);
+    initControllerLocked();
+    mutexUnlock(&controllerMutex);
     HiddbgKeyboardAutoPilotState tempState = { 0 };
     u32 i;
     for (i = 0; i < sequentialCount; i++)
@@ -482,7 +499,9 @@ void clickSequence(char* seq, u8* token)
     HidNpadButton currKey = { 0 };
     u64 currentWait = 0;
 
-    initController();
+    mutexLock(&controllerMutex);
+    initControllerLocked();
+    mutexUnlock(&controllerMutex);
     while (command != NULL)
     {
         if ((*token) == 1)
