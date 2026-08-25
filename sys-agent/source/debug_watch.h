@@ -11,6 +11,11 @@ typedef struct {
     u64 threadId;
     u8 insn[12];    /* bytes at pc-8 .. pc+3, for base_reg+imm verification */
     u32 insnBytes;  /* 0 when the window could not be read */
+    u8 fpStack[0x200]; /* bytes at x29 .. x29+0x200 at hit time; lets the
+                        * host walk the frame-pointer chain offline */
+    u32 fpStackBytes;  /* 0 when the stack window could not be read */
+    u8 spStack[0x100]; /* bytes at sp .. sp+0x100 (current frame locals) */
+    u32 spStackBytes;
 } DebugWatchHit;
 
 typedef struct {

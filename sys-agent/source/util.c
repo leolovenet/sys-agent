@@ -74,14 +74,28 @@ int setupServerSocket()
 }
 
 u64 parseStringToInt(char* arg) {
-    if (strlen(arg) > 2) {
-        if (arg[1] == 'x') {
-            u64 ret = strtoul(arg, NULL, 16);
-            return ret;
-        }
+    /* Conventions: "0x"/"0X" prefix = hexadecimal, otherwise decimal.
+     * The whole string must be consumed; invalid input (e.g. bare "12AB",
+     * which would previously parse as decimal 12) returns 0 instead of a
+     * silently wrong partial value. */
+    if (arg == NULL || arg[0] == 0)
+        return 0;
+
+    int base = 10;
+    const char* digits = arg;
+    if (arg[0] == '0' && (arg[1] == 'x' || arg[1] == 'X')) {
+        base = 16;
+        digits += 2;
+        if (digits[0] == 0)
+            return 0;
     }
-    u64 ret = strtoul(arg, NULL, 10);
-    return ret;
+
+    char* end = NULL;
+    errno = 0;
+    const unsigned long long ret = strtoull(digits, &end, base);
+    if (errno != 0 || end == digits || *end != 0)
+        return 0;
+    return (u64)ret;
 }
 
 bool tryParseStringToInt(const char* arg, u64* value)
@@ -108,61 +122,74 @@ bool tryParseStringToInt(const char* arg, u64* value)
 }
 
 s64 parseStringToSignedLong(char* arg) {
-    if (strlen(arg) > 2) {
-        if (arg[1] == 'x' || arg[2] == 'x') {
-            s64 ret = strtol(arg, NULL, 16);
-            return ret;
-        }
-    }
-    s64 ret = strtol(arg, NULL, 10);
-    return ret;
+    /* Signed variant used for pointer jumps.  Handles an optional sign,
+     * then the same 0x/0X-hex else decimal convention, with full-string
+     * validation (invalid input returns 0). */
+    if (arg == NULL || arg[0] == 0)
+        return 0;
+
+    int base = 10;
+    const char* signless = arg;
+    if (*signless == '-' || *signless == '+')
+        signless++;
+    if (signless[0] == '0' && (signless[1] == 'x' || signless[1] == 'X'))
+        base = 16;
+
+    char* end = NULL;
+    errno = 0;
+    const long long ret = strtoll(arg, &end, base);
+    if (errno != 0 || end == arg || *end != 0)
+        return 0;
+    return (s64)ret;
 }
 
 u8* parseStringToByteBuffer(char* arg, u64* size)
 {
-    char toTranslate[3] = { 0 };
-    int length = strlen(arg);
-    bool isHex = false;
+    if (arg == NULL || size == NULL) {
+        if (size != NULL)
+            *size = 0;
+        return NULL;
+    }
 
-    if (length > 2) {
-        if (arg[1] == 'x') {
-            isHex = true;
-            length -= 2;
-            arg = &arg[2]; //cut off 0x
+    int length = strlen(arg);
+
+    /* Accept an optional 0x prefix.  The payload is ALWAYS hex byte pairs;
+     * parsing it as decimal silently corrupts multi-byte data (e.g. a code
+     * patch "50 00..." became decimal 0x32 0x00..., corrupting B and
+     * crashing the game). */
+    if (length > 2 && arg[0] == '0' && (arg[1] == 'x' || arg[1] == 'X')) {
+        length -= 2;
+        arg = &arg[2]; /* cut off 0x */
+    }
+
+    /* Validate every character before allocating/parsing; silently accepting
+     * non-hex input produced the wrong-bytes crash class.  Empty payload and
+     * odd length are also rejected (a bare "F" would otherwise mean 0x0F,
+     * which is too easy to misread). */
+    if (length == 0 || (length % 2) != 0) {
+        *size = 0;
+        return NULL;
+    }
+    int i = 0;
+    for (i = 0; i < length; i++) {
+        const char c = arg[i];
+        const bool isHexDigit =
+            (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+            || (c >= 'A' && c <= 'F');
+        if (!isHexDigit) {
+            *size = 0;
+            return NULL;
         }
     }
 
-    bool isFirst = true;
-    bool isOdd = (length % 2 == 1);
+    char toTranslate[3] = { 0 };
     u64 bufferSize = length / 2;
-    if (isOdd) bufferSize++;
     u8* buffer = malloc(bufferSize);
 
-
-
-    u64 i;
     for (i = 0; i < bufferSize; i++) {
-        if (isOdd) {
-            if (isFirst) {
-                toTranslate[0] = '0';
-                toTranslate[1] = arg[i];
-            }
-            else {
-                toTranslate[0] = arg[(2 * i) - 1];
-                toTranslate[1] = arg[(2 * i)];
-            }
-        }
-        else {
-            toTranslate[0] = arg[i * 2];
-            toTranslate[1] = arg[(i * 2) + 1];
-        }
-        isFirst = false;
-        if (isHex) {
-            buffer[i] = strtoul(toTranslate, NULL, 16);
-        }
-        else {
-            buffer[i] = strtoul(toTranslate, NULL, 10);
-        }
+        toTranslate[0] = arg[i * 2];
+        toTranslate[1] = arg[(i * 2) + 1];
+        buffer[i] = (u8)strtoul(toTranslate, NULL, 16);
     }
     *size = bufferSize;
     return buffer;
@@ -251,7 +278,9 @@ HidNpadButton parseStringToButton(char* arg)
         return BIT(20);
     }
 
-    return HidNpadButton_A; //I guess lol
+    /* Unknown button names must NOT fall back to a real button (returning A
+     * here would silently press A on a typo).  Return "no button". */
+    return 0;
 }
 
 Result capsscCaptureForDebug(void* buffer, size_t buffer_size, u64* size) {

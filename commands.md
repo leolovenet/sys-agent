@@ -34,6 +34,26 @@ The system-management protocol is additive and uses single-line `OK key=value` o
 |gameLaunchHeadless|Experimental: headless-launches a game by Title ID: starts the process without bringing it to the screen (16 hex digits, non-zero; optional storage name forces that storage)|titleId [storage]|`gameLaunchHeadless 01006F8002326000`|
 
 Arbitrary strings are returned as uppercase hexadecimal bytes with an adjacent `*Len` field.
+All byte-payload arguments (the data of `poke`/`pokeAbsolute`/`pokeMain`/`pointerPoke`,
+the value of `freeze`, and the expected/new bytes of `debug patch-code`) are **hex byte
+pairs**; an optional `0x` prefix is accepted but never required. They are parsed as
+hexadecimal only — decimal input is not interpreted and will silently produce wrong bytes,
+so always send e.g. `DEADBEEF` / `0xDEADBEEF`, never a decimal number.
+
+### Numeric argument conventions (addresses, offsets, sizes, times, values)
+
+- **`0x` / `0X` prefix = hexadecimal**, otherwise the number is **decimal**.
+  Example: `0x45075880` is hex, `45075880` is decimal (a very different value).
+- Bare letters are invalid for plain numbers: `12AB` is rejected and parses as `0`
+  (it is NOT hex — write `0x12AB`). When in doubt, always add the `0x` prefix.
+- Signed pointer jumps accept an optional leading `-`/`+`, e.g. `-0x10`.
+- Button tokens are case-sensitive uppercase names (`A`, `B`, `X`, `Y`, `L`, `R`,
+  `ZL`, `ZR`, `PLUS`, `MINUS`, `DUP`, `DDOWN`, `DLEFT`, `DRIGHT`, `HOME`, `CAPTURE`,
+  `RSTICK`, `LSTICK`, `PALMA`, `UNUSED`); an unknown token sends **no button** instead
+  of silently pressing a default key.
+- Malformed numeric or payload arguments make the command return
+  `ERR code=INVALID_ADDRESS` / `ERR code=INVALID_HEX_PAYLOAD` instead of silently
+  proceeding with a wrong value.
 Grouped queries return `NA` for unavailable optional fields and append native Result values in
 `errors`. Power actions, sleep, wireless disable, and application termination can interrupt
 searches, FTP transfers, open files, and the command connection. A successful response may not
@@ -196,9 +216,9 @@ query, or search read and closes it immediately afterward.
 `debug watch` attaches the current application directly with
 `svcDebugActiveProcess`, links a data watchpoint through a context-IDR
 breakpoint (exactly like Atmosphere dmnt.gen2's `HardwareWatchPointManager`),
-and reports the PC of the writing instruction on every hit. It is intended for
-the ACNH in-process agent project and is the recommended replacement for the
-standalone gdbstub when all you need is "who writes this address".
+and reports the PC of the writing instruction on every hit. It is the
+recommended replacement for the standalone gdbstub when all you need is "who
+writes this address".
 
 The watch runs on its own thread and never writes unsolicited data to a client
 socket; poll with `debug watch-status`. The NPDM kernel CPU capability was
@@ -237,9 +257,10 @@ Requirements and conflict rules:
 
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
-|debug watch|Arms a hardware write watchpoint and returns immediately; the thread detaches automatically after `hits` hits or `duration` seconds|1. absolute address or `main+offset`<br>2. optional size 1-8 (default 4)<br>3. optional `hits N` (default 1)<br>4. optional `duration N` seconds (default 60, 0 = unlimited)|`debug watch main+0x4B485E8 4 hits 100`<br>`debug watch 0x2E1000 2 hits 20 duration 300`|
+|debug watch|Arms a hardware write watchpoint and returns immediately; the thread detaches automatically after `hits` hits or `duration` seconds|1. absolute address or `main+offset`<br>2. optional size 1-8 (default 4)<br>3. optional `hits N` (default 1)<br>4. optional `duration N` seconds (default 60, 0 = unlimited)|`debug watch main+0x123456 4 hits 100`<br>`debug watch 0x2E1000 2 hits 20 duration 300`|
 |debug watch-status|Reports arming state, process, address, hit count, discovered breakpoint slots (ctx/wp), and the latest hit's PC/LR/SP/data/thread|none|`debug watch-status`|
-|debug watch-last|Dumps the full register snapshot (x0-x30, sp, pc) and the instruction window at pc-8..pc+3 of the most recent hit|none|`debug watch-last`|
+|debug watch-last|Dumps the full register snapshot (x0-x30, sp, pc), the instruction window at pc-8..pc+3, and the stack windows captured at hit time: `fpStack` (0x200 bytes at x29, caller frame chain) and `spStack` (0x100 bytes at sp, current frame locals)|none|`debug watch-last`|
+|debug patch-code|Generic transactional code patch (any process, any size up to 1 KiB): pause, optionally verify no thread PC is inside the patched range, optionally verify the original bytes, write, read back, resume; resume is guaranteed on every error path. Target cache maintenance is handled by the kernel debug-write path — never add explicit cache ops on a target address from this sysmodule|1. absolute address (0x-hex or decimal)<br>2. expected bytes as hex pairs of the same length as the patch, or `-` to skip verification<br>3. new bytes as hex pairs (0x optional; length 1..1024 bytes)<br>optional: `pid=<hex>` target process (default: foreground application), `no-pc-check` (only for provably cold code)|`debug patch-code 0x2B5D9CF4C8 FD7BBAA9FC6F01A9FD030091FA6702A9 5000005800021FD6...`<br>`debug patch-code 0x2B5D9CF4C8 - 5000005800021FD6...`<br>`debug patch-code 0x2B5D9CF4C8 FD7B... 5000... pid=0x2B5D900000`|
 |debug watch-stop|Requests the watch thread to detach and waits for it|none|`debug watch-stop`|
 |debug force-close|Closes gen1's (`dmnt:cht`) debug handle to the game if it is attached; the next memory command re-attaches it automatically|none|`debug force-close`|
 
@@ -254,12 +275,12 @@ attach/setup failures are reported by `debug watch-status` (which also carries
 the same `hint` field). `lastPc` is the PC of the instruction that wrote the
 watched address; `debug watch-last` also gives LR/SP and the raw instruction
 bytes so the writer can be verified in a disassembler (base register +
-immediate == watched address). For the ACNH frame counter at `main+0x4B485E8`,
-the captured writer PC is stable across sessions even though the hit rate can
-be much higher than the ~30 Hz increment rate (see known anomaly below).
+immediate == watched address). For a per-frame counter, the captured writer
+PC is stable across sessions even though the hit rate can be much higher than
+the ~30 Hz increment rate (see known anomaly below).
 
 Known anomaly: on this setup the hardware write watchpoint can fire tens of
-thousands of times per second at `main+0x4B485E8` while the counter itself
+thousands of times per second at the watched address while the counter itself
 only advances ~30/s. The captured PC/LR/registers/instruction window are still
 valid for identifying the writer, but `hitCount`/`hits N` do not reflect the
 real increment rate and a large `hits` value completes almost instantly.
@@ -346,16 +367,16 @@ search; wait for the terminal status before retrying or closing the session.
 ### Single Read
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
-|peek  |Reads memory at given address relative to heap  |1. address to read from relative to heap in hex<br>2. amount of bytes to read<br>Return: hex string |peek 0x45075880 344   |
-|peekAbsolute  |Reads memory at given absolute address  |1. address to read from in hex<br>2. amount of bytes to read<br>Return: hex string |peekAbsolute 0x45075880 344   |
-|peekMain  |Reads memory at given address relative to NSOMain |1. address to read from relative to NSOMain in hex<br>2. amount of bytes to read<br>Return: hex string |peekAbsolute 0x45075880 344   |
+|peek  |Reads memory at given address relative to heap  |1. heap-relative offset (0x-hex or decimal)<br>2. amount of bytes to read<br>Return: hex string |peek 0x45075880 344   |
+|peekAbsolute  |Reads memory at given absolute address  |1. absolute address (0x-hex or decimal)<br>2. amount of bytes to read<br>Return: hex string |peekAbsolute 0x45075880 344   |
+|peekMain  |Reads memory at given address relative to NSOMain |1. NSOMain-relative offset (0x-hex or decimal)<br>2. amount of bytes to read<br>Return: hex string |peekAbsolute 0x45075880 344   |
 
 ### Multiple Reads
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
-|peekMulti  |Reads memory at given addresses relative to heap  |1. address to read from relative to heap in hex<br>2. amount of bytes to read<br>...<br>n. address to read from relative to heap in hex<br>n+1. amount of bytes to read <br>Return: hex string |peekMulti 0x45075880 344 0x45097552 344 0x45774450 344  |
-|peekAbsoluteMulti  |Reads memory at given absolute addresses  |1. address to read in hex<br>2. amount of bytes to read<br>...<br>n. address to read in hex<br>n+1. amount of bytes to read <br>Return: hex string |peekMulti 0x45075880 344 0x45097552 344 0x45774450 344  |
-|peekMainMulti  |Reads memory at given absolute addresses  |1. address to read relative to NSOMain in hex<br>2. amount of bytes to read<br>...<br>n. address to read relative to NSOMain in hex<br>n+1. amount of bytes to read <br>Return: hex string |peekMulti 0x45075880 344 0x45097552 344 0x45774450 344  |
+|peekMulti  |Reads memory at given addresses relative to heap  |1. heap-relative offset (0x-hex or decimal)<br>2. amount of bytes to read<br>...<br>n. heap-relative offset (0x-hex or decimal)<br>n+1. amount of bytes to read <br>Return: hex string |peekMulti 0x45075880 344 0x45097552 344 0x45774450 344  |
+|peekAbsoluteMulti  |Reads memory at given absolute addresses  |1. absolute address (0x-hex or decimal)<br>2. amount of bytes to read<br>...<br>n. absolute address (0x-hex or decimal)<br>n+1. amount of bytes to read <br>Return: hex string |peekMulti 0x45075880 344 0x45097552 344 0x45774450 344  |
+|peekMainMulti  |Reads memory at given absolute addresses  |1. NSOMain-relative offset (0x-hex or decimal)<br>2. amount of bytes to read<br>...<br>n. NSOMain-relative offset (0x-hex or decimal)<br>n+1. amount of bytes to read <br>Return: hex string |peekMulti 0x45075880 344 0x45097552 344 0x45774450 344  |
 
 ### Pointer Reads
 |Command|Description|Parameters|Usage|
@@ -370,19 +391,19 @@ search; wait for the terminal status before retrying or closing the session.
 ### Single Write
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
-|poke  |Writes bytes to given address relative to heap  |1. address to write to relative to heap in hex<br>2. data in hex to write |poke 0x45075880 0xDEADBEEF   |
-|pokeAbsolute  |Writes bytes to given absolute address  |1. absolute address to write to in hex<br>2. data in hex to write |poke 0x45075880 0xDEADBEEF   |
-|pokeMain  |Writes bytes to given address relative to NSOMain  |1. address to write to relative to NSOMain in hex<br>2. data in hex to write |poke 0x45075880 0xDEADBEEF   |
+|poke  |Writes bytes to given address relative to heap  |1. heap-relative offset (0x-hex or decimal)<br>2. data as hex byte pairs (0x optional, never decimal) |poke 0x45075880 DEADBEEF   |
+|pokeAbsolute  |Writes bytes to given absolute address  |1. absolute address (0x-hex or decimal)<br>2. data as hex byte pairs (0x optional, never decimal) |pokeAbsolute 0x45075880 DEADBEEF   |
+|pokeMain  |Writes bytes to given address relative to NSOMain  |1. NSOMain-relative offset (0x-hex or decimal)<br>2. data as hex byte pairs (0x optional, never decimal) |pokeMain 0x45075880 DEADBEEF   |
 
 ### Pointer Write
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
-|pointerPoke  |Writes bytes to address resulting of following a pointer chain  |1. bytes in hex to write <br>2. first jump relative to NSOMain<br>3. offset after following first pointer<br>...<br>n. offset after following previous pointer<br>n+1. offset after following previous pointer (will **not** jump to this one) |pointerPoke 0xDEADBEEF 0x45075880 0x10 0x20 0x30   |
+|pointerPoke  |Writes bytes to address resulting of following a pointer chain  |1. bytes as hex byte pairs (0x optional, never decimal)<br>2. first jump relative to NSOMain<br>3. offset after following first pointer<br>...<br>n. offset after following previous pointer<br>n+1. offset after following previous pointer (will **not** jump to this one) |pointerPoke DEADBEEF 0x45075880 0x10 0x20 0x30   |
 
 ### Freezing of values
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
-|freeze|Freezes a value in RAM (writing every X milliseconds to it to ensure it does not get overwritten by game logic|1. absolute address to freeze<br>2. value to freeze it to in hex|freeze 0x45097552 200|
+|freeze|Freezes a value in RAM (writing every X milliseconds to it to ensure it does not get overwritten by game logic|1. absolute address (0x-hex or decimal)<br>2. value as hex byte pairs (0x optional, never decimal)|freeze 0x45097552 000000C8|
 |unFreeze|Unfreezes a previously frozen value in RAM|1. absolute address to unfreeze|unFreeze 0x45097552|
 |freezeCount|Returns number of frozen addresses in RAM|none|freezeCount|
 |freezeClear|Unfreezes all values in RAM|none|freezeClear|

@@ -9,6 +9,24 @@ process-memory backend that can coexist with Atmosphère cheats.
 > `atmosphere/contents/43000000000000A6` directory before installing, and use it only on a
 > console where you understand the risks.
 
+## Project scope and philosophy
+
+**sys-agent is a generic Switch automation and research toolbox.**
+Every feature here is process- and game-agnostic: it targets "the foreground application"
+or an explicit process id, never a specific title. Game-specific offsets, hook layouts,
+signatures, and state tables belong in consumer projects, never in this sysmodule. New
+commands should follow this rule:
+
+- Addresses, sizes, and values are plain numeric arguments (0x/0X hex or decimal) or hex
+  byte pairs; nothing is hard-coded to a particular game's layout.
+- The single exception to "target the foreground application" must be an explicit
+  `pid=` argument, not an implicit title check.
+- Transactional operations (like `debug patch-code`) must own their full lifecycle:
+  pause/verify/write/readback/resume in one command, with resume guaranteed on every error
+  path, so clients never manage debugger state themselves.
+- Parse failures return explicit `ERR code=` lines; never silently proceed with a wrong
+  value (hex payloads are hex only, odd length or non-hex characters are rejected).
+
 ## Changes in this fork
 
 - A unified `ProcessMemoryBackend` routes legacy `peek`/`poke`, multi, pointer, freeze,
@@ -25,6 +43,16 @@ process-memory backend that can coexist with Atmosphère cheats.
   watched address, with per-core debug registers linked through a context-IDR breakpoint.
   It auto-resolves the dmnt-owned debug-handle conflict (`dmntClosed=1`), and a manual
   `debug force-close` is available; memory commands are rejected while a watch is armed.
+- A transactional code-patch primitive (`debug patch-code`) pauses the target process,
+  optionally verifies no thread PC is inside the patched range, verifies the original
+  bytes, writes any payload up to 1 KiB, reads it back, and resumes — one command, with
+  resume guaranteed on every error path. It targets the foreground application by default
+  or any process via `pid=`. Cache maintenance for the target is handled by the kernel's
+  debug-write path; the primitive never issues cache ops on a target address.
+- Numeric and payload parsing is strict: byte payloads are hex pairs only (optional `0x`,
+  odd length or non-hex characters rejected with `INVALID_HEX_PAYLOAD`); plain numbers are
+  0x/0X-hex or decimal and invalid strings parse as 0 instead of a silent partial value;
+  unknown button tokens send no button.
 - SD-backed unknown-value sessions support exact, changed, unchanged, increased, and decreased
   multi-pass refinement without keeping millions of candidates in the sysmodule heap.
 - Search sessions pin their process ID and backend, preventing a running scan from silently

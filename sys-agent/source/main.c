@@ -15,6 +15,7 @@
 #include "search.h"
 #include "process_memory.h"
 #include "debug_watch.h"
+#include "patch_code.h"
 #include "dmnt_client.h"
 #include "ftp_server.h"
 #include "system_commands.h"
@@ -24,7 +25,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.7.0"
+#define VERSION_S "2.7.1"
 
 typedef enum {
     Active = 0,
@@ -462,8 +463,7 @@ int argmain(int argc, char** argv)
             }
             /* Requesting more than 2 modules over ldr:dmnt closes the session
              * on this stack (ConnectionClosed 0xF601); the full module map is
-             * derived from the main base by acnh-agent/tools/
-             * inspect-live-modules.py instead. */
+             * derived from the main base by host-side tooling instead. */
             LoaderModuleInfo modules[2];
             s32 count = 0;
             rc = ldrDmntGetProcessModuleInfo(pid, modules, 2, &count);
@@ -497,9 +497,115 @@ int argmain(int argc, char** argv)
             u32 i = 0;
             for (i = 0; i < hit.insnBytes; i++)
                 printf("%02X", hit.insn[i]);
+            printf(" fpStackBytes=%u fpStack=", hit.fpStackBytes);
+            for (i = 0; i < hit.fpStackBytes; i++)
+                printf("%02X", hit.fpStack[i]);
+            printf(" spStackBytes=%u spStack=", hit.spStackBytes);
+            for (i = 0; i < hit.spStackBytes; i++)
+                printf("%02X", hit.spStack[i]);
             for (i = 0; i < 31; i++)
                 printf(" x%u=%016lX", i, hit.x[i]);
             printf("\n");
+            return 0;
+        }
+        if (!strcmp(argv[1], "patch-code"))
+        {
+            if (argc < 4) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            u64 address = 0;
+            if (!tryParseStringToInt(argv[2], &address)) {
+                printf("ERR code=INVALID_ADDRESS arg=%s\n", argv[2]);
+                return 0;
+            }
+            bool skipVerify = false;
+            u64 expectedSize = 0;
+            u8* expected = NULL;
+            if (strcmp(argv[3], "-") == 0) {
+                skipVerify = true;
+            } else {
+                expected = parseStringToByteBuffer(argv[3], &expectedSize);
+                if (expected == NULL) {
+                    printf("ERR code=INVALID_HEX_PAYLOAD arg=%s\n", argv[3]);
+                    return 0;
+                }
+            }
+            u64 patchSize = 0;
+            u8* patch = parseStringToByteBuffer(argv[4], &patchSize);
+            if (patch == NULL || patchSize == 0
+                || patchSize > PATCH_CODE_MAX_SIZE) {
+                printf("ERR code=INVALID_PATCH_SIZE size=%lu max=%u\n",
+                    patchSize, PATCH_CODE_MAX_SIZE);
+                free(expected);
+                free(patch);
+                return 0;
+            }
+            if (!skipVerify && expectedSize != patchSize) {
+                printf("ERR code=INVALID_PATCH_SIZE\n");
+                free(expected);
+                free(patch);
+                return 0;
+            }
+            bool checkPc = true;
+            u64 pid = 0;
+            int a = 0;
+            for (a = 5; a < argc; a++) {
+                if (strncmp(argv[a], "pid=", 4) == 0) {
+                    if (!tryParseStringToInt(argv[a] + 4, &pid)) {
+                        printf("ERR code=INVALID_PID arg=%s\n", argv[a]);
+                        free(expected);
+                        free(patch);
+                        return 0;
+                    }
+                } else if (strcmp(argv[a], "no-pc-check") == 0) {
+                    checkPc = false;
+                } else {
+                    printf("ERR code=INVALID_OPTION arg=%s\n", argv[a]);
+                    free(expected);
+                    free(patch);
+                    return 0;
+                }
+            }
+            PatchCodeResult result;
+            Result rc = patchCodeRun(address, expected, expectedSize,
+                skipVerify, patch, patchSize, checkPc, pid, &result);
+            if (R_FAILED(rc)) {
+                printf("ERR code=PATCH_FAILED result=0x%X dmntClosed=%d"
+                    " pausedThreads=%u nearestPc=%016lX\n", rc,
+                    result.dmntClosed, result.pausedThreads,
+                    result.nearestPc);
+            } else if (result.status == PatchCodeBusyPcInRange) {
+                printf("ERR code=PATCH_BUSY_PC_IN_RANGE thread=%lu"
+                    " pc=%016lX dmntClosed=%d\n", result.pcHitThread,
+                    result.pcHitValue, result.dmntClosed);
+            } else if (result.status == PatchCodeExpectedMismatch) {
+                printf("ERR code=PATCH_EXPECTED_MISMATCH old=");
+                u32 i = 0;
+                for (i = 0; i < result.patchSize; i++)
+                    printf("%02X", result.oldBytes[i]);
+                printf(" dmntClosed=%d\n", result.dmntClosed);
+            } else if (result.status == PatchCodeReadbackFailed) {
+                printf("ERR code=PATCH_READBACK_FAILED got=");
+                u32 i = 0;
+                for (i = 0; i < result.patchSize; i++)
+                    printf("%02X", result.newBytes[i]);
+                printf(" dmntClosed=%d\n", result.dmntClosed);
+            } else {
+                printf("OK state=patched size=%lu dmntClosed=%d"
+                    " pausedThreads=%u nearestPc=%016lX old=",
+                    result.patchSize, result.dmntClosed,
+                    result.pausedThreads, result.nearestPc);
+                u32 i = 0;
+                for (i = 0; i < result.patchSize; i++)
+                    printf("%02X", result.oldBytes[i]);
+                printf(" new=");
+                for (i = 0; i < result.patchSize; i++)
+                    printf("%02X", result.newBytes[i]);
+                printf(" readbackOk=1\n");
+            }
+            free(expected);
+            free(patch);
             return 0;
         }
         printf("ERR code=UNKNOWN_DEBUG_COMMAND\n");
@@ -801,9 +907,17 @@ int argmain(int argc, char** argv)
             return 0;
         }
 
-        u64 offset = parseStringToInt(argv[1]);
+        u64 offset = 0;
+        if (!tryParseStringToInt(argv[1], &offset)) {
+            printf("ERR code=INVALID_ADDRESS arg=%s\n", argv[1]);
+            return 0;
+        }
         u64 size = 0;
         u8* data = parseStringToByteBuffer(argv[2], &size);
+        if (data == NULL) {
+            printf("ERR code=INVALID_HEX_PAYLOAD arg=%s\n", argv[2]);
+            return 0;
+        }
         poke(meta.heap_base + offset, size, data);
         free(data);
     }
@@ -813,9 +927,17 @@ int argmain(int argc, char** argv)
         if (argc != 3)
             return 0;
 
-        u64 offset = parseStringToInt(argv[1]);
+        u64 offset = 0;
+        if (!tryParseStringToInt(argv[1], &offset)) {
+            printf("ERR code=INVALID_ADDRESS arg=%s\n", argv[1]);
+            return 0;
+        }
         u64 size = 0;
         u8* data = parseStringToByteBuffer(argv[2], &size);
+        if (data == NULL) {
+            printf("ERR code=INVALID_HEX_PAYLOAD arg=%s\n", argv[2]);
+            return 0;
+        }
         poke(offset, size, data);
         free(data);
     }
@@ -832,9 +954,17 @@ int argmain(int argc, char** argv)
             return 0;
         }
 
-        u64 offset = parseStringToInt(argv[1]);
+        u64 offset = 0;
+        if (!tryParseStringToInt(argv[1], &offset)) {
+            printf("ERR code=INVALID_ADDRESS arg=%s\n", argv[1]);
+            return 0;
+        }
         u64 size = 0;
         u8* data = parseStringToByteBuffer(argv[2], &size);
+        if (data == NULL) {
+            printf("ERR code=INVALID_HEX_PAYLOAD arg=%s\n", argv[2]);
+            return 0;
+        }
         poke(meta.main_nso_base + offset, size, data);
         free(data);
     }
@@ -1250,6 +1380,10 @@ int argmain(int argc, char** argv)
 
         u64 size;
         u8* data = parseStringToByteBuffer(argv[1], &size);
+        if (data == NULL) {
+            printf("ERR code=INVALID_HEX_PAYLOAD arg=%s\n", argv[1]);
+            return 0;
+        }
         poke(solved, size, data);
         free(data);
     }
@@ -1267,9 +1401,17 @@ int argmain(int argc, char** argv)
             return 0;
         }
 
-        u64 offset = parseStringToInt(argv[1]);
+        u64 offset = 0;
+        if (!tryParseStringToInt(argv[1], &offset)) {
+            printf("ERR code=INVALID_ADDRESS arg=%s\n", argv[1]);
+            return 0;
+        }
         u64 size = 0;
         u8* data = parseStringToByteBuffer(argv[2], &size);
+        if (data == NULL) {
+            printf("ERR code=INVALID_HEX_PAYLOAD arg=%s\n", argv[2]);
+            return 0;
+        }
         addToFreezeMap(offset, data, size, meta.titleID);
     }
 

@@ -4,7 +4,7 @@
 #include "debug_watch.h"
 
 /*
- * Hardware watchpoint support for the ACNH in-process agent project.
+ * Hardware watchpoint support (generic in-process debugging primitive).
  *
  * The NPDM already grants every debug syscall (svcDebugActiveProcess,
  * svcGetDebugEvent, svcContinueDebugEvent, svcGetDebugThreadContext,
@@ -419,6 +419,27 @@ static void captureHit(Handle debugHandle, const DebugEventInfo* event,
                     hit->pc - 8, sizeof(insn)))) {
                 memcpy(hit->insn, insn, sizeof(insn));
                 hit->insnBytes = sizeof(insn);
+            }
+        }
+
+        /* Snapshot the stack while the target is still stopped at the
+         * exception. The fp window (x29 upward) holds the saved frame
+         * pointers / return addresses of every caller, so the host can walk
+         * the call chain without racing the resumed process. */
+        if (hit->x[29] != 0) {
+            u8 stack[0x200];
+            if (R_SUCCEEDED(svcReadDebugProcessMemory(stack, debugHandle,
+                    hit->x[29], sizeof(stack)))) {
+                memcpy(hit->fpStack, stack, sizeof(stack));
+                hit->fpStackBytes = sizeof(stack);
+            }
+        }
+        if (hit->sp != 0) {
+            u8 stack[0x100];
+            if (R_SUCCEEDED(svcReadDebugProcessMemory(stack, debugHandle,
+                    hit->sp, sizeof(stack)))) {
+                memcpy(hit->spStack, stack, sizeof(stack));
+                hit->spStackBytes = sizeof(stack);
             }
         }
     }
