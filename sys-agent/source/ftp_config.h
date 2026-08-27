@@ -17,6 +17,7 @@ typedef struct {
     char username[FTP_CREDENTIAL_SIZE];
     char password[FTP_CREDENTIAL_SIZE];
     uint32_t timeout;
+    bool use_localtime;
 } FtpConfig;
 
 typedef enum {

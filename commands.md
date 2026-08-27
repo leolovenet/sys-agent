@@ -174,11 +174,13 @@ large transfers are interleaved and share network and SD-card throughput.
 |ftpStart|Asynchronously starts the server using the loaded configuration|none|`ftpStart`|
 |ftpStop|Asynchronously closes the listener, clients, transfers, and open FTP files|none|`ftpStop`|
 |ftpRestart|Restarts the server without rereading the configuration file|none|`ftpRestart`|
-|ftpReload|Stops the server, rereads `/config/sys-agent/ftp.ini`, and applies `enabled`|none|`ftpReload`|
+|ftpReload|Stops the server, rereads `/config/sys-agent/ftp.ini`, and applies the configuration|none|`ftpReload`|
 
-The configuration defaults to `enabled=1`, `port=6001`, `anonymous=1`, and `timeout=30` when
-the file is absent. If anonymous access is disabled, both `username` and `password` are
-required. Commands are additive and never emit unsolicited FTP events on a sys-agent client.
+The configuration defaults to `enabled=1`, `port=6001`, `anonymous=1`, `timeout=30`, and
+`use_localtime=1` when the file is absent. `use_localtime=1` renders file modification times
+in the console's configured time zone; set it to `0` for UTC. If anonymous access is disabled,
+both `username` and `password` are required. Commands are additive and never emit unsolicited
+FTP events on a sys-agent client.
 
 FTP grants complete SD read/write/create/rename/delete access. During a queued or running
 C-level search, mutations within `/switch/sys-agent/search` return an FTP error; reads and

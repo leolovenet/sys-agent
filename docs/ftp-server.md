@@ -24,7 +24,7 @@ The implementation is deliberately isolated from the original port-6000 command 
 - `sys-agent/source/ftp_server.c` owns lifecycle state, the low-priority worker thread,
   counters, retry behavior, and the five additive control commands.
 - `sys-agent/source/ftp_config.c` parses `/config/sys-agent/ftp.ini` and validates the
-  port and authentication settings.
+  port, authentication, and time-zone display settings.
 - `sys-agent/source/ftp_path.c` normalizes FTP paths and prevents traversal or access to
   non-SD device namespaces.
 - `sys-agent/source/ftp_vfs_sd.c` adapts the FTP core to libnx `FsFileSystem` operations.
@@ -47,7 +47,8 @@ not ready yet.
 
 ## Configuration and control
 
-With no configuration file, FTP is enabled, anonymous, and listens on port `6001`. An example
+With no configuration file, FTP is enabled, anonymous, listens on port `6001`, and renders
+file modification times in the console's configured time zone (`use_localtime=1`). An example
 is available at `config/ftp.ini.template`; the runtime location is:
 
 ```text
@@ -65,9 +66,9 @@ ftpReload
 ```
 
 They are asynchronous and additive, so existing sys-agent clients remain compatible.
-`ftpStatus` reports lifecycle state, clients, transfers, byte counters, the lifecycle error,
-and `lastFsResult` for the latest native filesystem error. Complete syntax and configuration
-rules are in `commands.md`.
+`ftpStatus` reports lifecycle state, clients, transfers, byte counters, the effective
+`use_localtime` setting, the lifecycle error, and `lastFsResult` for the latest native
+filesystem error. Complete syntax and configuration rules are in `commands.md`.
 
 Anonymous access grants complete read, create, upload, append, rename, and delete rights over
 the SD card. Use it only on a trusted network. Stop or reconfigure any old sys-ftpd instance

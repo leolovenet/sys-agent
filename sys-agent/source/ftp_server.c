@@ -60,6 +60,7 @@ static void populateLibraryConfig(struct FtpSrvConfig* output, const FtpConfig* 
     output->port = input->port;
     output->anon = input->anonymous;
     output->timeout = input->timeout;
+    output->use_localtime = input->use_localtime;
 }
 
 static void ftpWorker(void* argument)

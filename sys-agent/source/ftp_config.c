@@ -54,6 +54,7 @@ void ftpConfigDefaults(FtpConfig* config)
     config->port = FTP_DEFAULT_PORT;
     config->anonymous = true;
     config->timeout = FTP_DEFAULT_TIMEOUT;
+    config->use_localtime = true;
 }
 
 FtpConfigResult ftpConfigParseText(const char* text, FtpConfig* config)
@@ -116,6 +117,8 @@ FtpConfigResult ftpConfigParseText(const char* text, FtpConfig* config)
                 result = FtpConfigInvalidValue;
             else
                 config->timeout = (uint32_t)timeout;
+        } else if (!strcmp(key, "use_localtime")) {
+            if (!parseBool(value, &config->use_localtime)) result = FtpConfigInvalidValue;
         } else if (!strcmp(key, "username")) {
             if (!copyCredential(config->username, value)) result = FtpConfigInvalidValue;
         } else if (!strcmp(key, "password")) {

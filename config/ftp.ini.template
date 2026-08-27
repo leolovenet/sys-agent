@@ -10,3 +10,7 @@ password=
 
 # Close an inactive FTP session after this many seconds. Zero disables the timeout.
 timeout=30
+
+# Render file modification times using the console's configured time zone (1) or UTC (0).
+# Defaults to 1 when the key is absent.
+use_localtime=1
