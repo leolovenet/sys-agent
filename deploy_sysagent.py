@@ -2,13 +2,13 @@
 """Build sys-agent and update an installed copy on a running Switch.
 
 Updates the current source tree onto an existing installation: runs the pinned devkitPro
-Docker build, uploads the generated exefs.nsp to
-``atmosphere/contents/43000000000000A6`` under a temporary ASCII name, verifies the
-transfer, atomically renames it over the running file, and requests a full console reboot
-directly into the virtual system (emuMMC) so the new sysmodule loads. It requires sys-agent
-to already be running on the Switch because it uses the built-in FTP server (port 6001) and
-the reboot command (port 6000); first-time installation must follow the manual SD-card
-instructions in the README.
+Docker build, uploads the generated ``exefs.nsp`` and ``toolbox.json`` to
+``atmosphere/contents/43000000000000A6`` under temporary ASCII names, verifies each
+transfer, atomically renames them over the running files, and requests a full console
+reboot directly into the virtual system (emuMMC) so the new sysmodule loads. It requires
+sys-agent to already be running on the Switch because it uses the built-in FTP server
+(port 6001) and the reboot command (port 6000); first-time installation must follow the
+manual SD-card instructions in the README.
 
 By design this script does NOT back up the Switch-side sys-agent. The console's existing
 ``atmosphere/contents/43000000000000A6`` directory is overwritten in place. Roll back by
@@ -28,9 +28,12 @@ import time
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 ARTIFACT = os.path.join(REPO_ROOT, "sys-agent", "43000000000000A6", "exefs.nsp")
+TOOLBOX_ARTIFACT = os.path.join(REPO_ROOT, "sys-agent", "43000000000000A6", "toolbox.json")
 REMOTE_DIR = "atmosphere/contents/43000000000000A6"
 REMOTE_NAME = "exefs.nsp"
 TEMP_NAME = "exefs.nsp.new"
+TOOLBOX_REMOTE_NAME = "toolbox.json"
+TOOLBOX_TEMP_NAME = "toolbox.json.new"
 DOCKER_IMAGE = "devkitpro/devkita64:20260219"
 EXPECTED_AUDIO_CAPABILITY = "volume,mute"
 
@@ -73,7 +76,33 @@ def remove_if_present(ftp: ftplib.FTP, name: str) -> None:
         pass
 
 
-def upload_and_rename(host: str, ftp_port: int, local_size: int) -> None:
+def upload_verified_and_rename(
+        ftp: ftplib.FTP, local_path: str, temp_name: str, remote_name: str) -> None:
+    """Upload one file under a temporary ASCII name, verify its size, and rename it."""
+    local_size = os.path.getsize(local_path)
+    with open(local_path, "rb") as source:
+        ftp.storbinary(f"STOR {temp_name}", source)
+    remote_size = ftp.size(temp_name)
+    if remote_size != local_size:
+        remove_if_present(ftp, temp_name)
+        raise RuntimeError(
+            f"transfer verification failed: remote {remote_size} != local {local_size} bytes")
+    print(f"uploaded {temp_name} ({remote_size} bytes), renaming to {remote_name}")
+    try:
+        ftp.rename(temp_name, remote_name)
+    except ftplib.error_perm as error:
+        # The built-in FTP server refuses to rename over an existing file.
+        # The verified new copy is already on the SD card as temp_name, so
+        # remove the old file and retry the atomic rename.
+        if "553" not in str(error):
+            raise
+        print(f"destination exists; removing old {remote_name} and retrying the rename")
+        remove_if_present(ftp, remote_name)
+        ftp.rename(temp_name, remote_name)
+    print(f"deployed {REMOTE_DIR}/{remote_name}")
+
+
+def upload_and_rename(host: str, ftp_port: int) -> None:
     ftp = ftplib.FTP()
     try:
         ftp.connect(host, ftp_port, timeout=15)
@@ -81,26 +110,10 @@ def upload_and_rename(host: str, ftp_port: int, local_size: int) -> None:
         print(f"connected to ftp://{host}:{ftp_port}/")
         ensure_remote_dir(ftp, REMOTE_DIR)
         remove_if_present(ftp, TEMP_NAME)
-        with open(ARTIFACT, "rb") as source:
-            ftp.storbinary(f"STOR {TEMP_NAME}", source)
-        remote_size = ftp.size(TEMP_NAME)
-        if remote_size != local_size:
-            remove_if_present(ftp, TEMP_NAME)
-            raise RuntimeError(
-                f"transfer verification failed: remote {remote_size} != local {local_size} bytes")
-        print(f"uploaded {TEMP_NAME} ({remote_size} bytes), renaming to {REMOTE_NAME}")
-        try:
-            ftp.rename(TEMP_NAME, REMOTE_NAME)
-        except ftplib.error_perm as error:
-            # The built-in FTP server refuses to rename over an existing file.
-            # The verified new copy is already on the SD card as TEMP_NAME, so
-            # remove the old file and retry the atomic rename.
-            if "553" not in str(error):
-                raise
-            print("destination exists; removing old exefs.nsp and retrying the rename")
-            remove_if_present(ftp, REMOTE_NAME)
-            ftp.rename(TEMP_NAME, REMOTE_NAME)
-        print(f"deployed {REMOTE_DIR}/{REMOTE_NAME}")
+        upload_verified_and_rename(ftp, ARTIFACT, TEMP_NAME, REMOTE_NAME)
+        remove_if_present(ftp, TOOLBOX_TEMP_NAME)
+        upload_verified_and_rename(
+            ftp, TOOLBOX_ARTIFACT, TOOLBOX_TEMP_NAME, TOOLBOX_REMOTE_NAME)
     finally:
         try:
             ftp.quit()
@@ -190,15 +203,16 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_build:
         run_build()
 
-    if not os.path.isfile(ARTIFACT) or os.path.getsize(ARTIFACT) == 0:
-        print(f"error: build artifact missing or empty: {ARTIFACT}", file=sys.stderr)
-        return 1
+    for artifact in (ARTIFACT, TOOLBOX_ARTIFACT):
+        if not os.path.isfile(artifact) or os.path.getsize(artifact) == 0:
+            print(f"error: build artifact missing or empty: {artifact}", file=sys.stderr)
+            return 1
     local_size = os.path.getsize(ARTIFACT)
     print(f"artifact: {ARTIFACT} ({local_size} bytes)")
 
     if args.dry_run:
-        print(f"plan: upload {REMOTE_NAME} to {REMOTE_DIR} via "
-              f"ftp://{args.host}:{args.ftp_port} (temp {TEMP_NAME} + atomic rename)")
+        print(f"plan: upload {REMOTE_NAME} + {TOOLBOX_REMOTE_NAME} to {REMOTE_DIR} via "
+              f"ftp://{args.host}:{args.ftp_port} (temp names + atomic rename)")
         if not args.no_reboot:
             reboot_command = "systemReboot" if args.normal_reboot else "systemRebootEmuMMC"
             print(f"plan: send {reboot_command} to {args.host}:{args.cmd_port}")
@@ -206,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"plan: wait up to {args.verify_timeout:.0f}s and verify the installed build")
         return 0
 
-    upload_and_rename(args.host, args.ftp_port, local_size)
+    upload_and_rename(args.host, args.ftp_port)
 
     if not args.no_reboot:
         reboot_command = "systemReboot" if args.normal_reboot else "systemRebootEmuMMC"

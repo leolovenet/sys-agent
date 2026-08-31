@@ -100,8 +100,9 @@ all: sd-layout
 sd-layout: $(BUILD)
 	@mkdir -p "$(SD_LAYOUT_DIR)/flags"
 	@[ -e "$(SD_LAYOUT_DIR)/flags/boot2.flag" ] || touch "$(SD_LAYOUT_DIR)/flags/boot2.flag"
+	@cp -f "$(TOPDIR)/../toolbox.json" "$(SD_LAYOUT_DIR)/toolbox.json"
 	@cp -f "$(TARGET).nsp" "$(SD_LAYOUT_DIR)/exefs.nsp"
-	@echo updated ... $(ATMOSPHERE_TITLE_ID)/exefs.nsp
+	@echo updated ... $(ATMOSPHERE_TITLE_ID)/exefs.nsp + toolbox.json
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@

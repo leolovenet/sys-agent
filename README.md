@@ -152,6 +152,7 @@ This project was created for the purpose of development for bot automation. The 
    ```text
    atmosphere/contents/43000000000000A6/exefs.nsp
    atmosphere/contents/43000000000000A6/flags/boot2.flag
+   atmosphere/contents/43000000000000A6/toolbox.json
    ```
 
 4. Safely eject the SD card and fully restart the Switch. Restarting only the game is not
@@ -189,13 +190,14 @@ python3 deploy_sysagent.py
 python3 deploy_sysagent.py --no-build --dry-run   # preview only, no Switch access
 ```
 
-The update uploads the new `exefs.nsp` as `exefs.nsp.new`, verifies the byte count, renames
-it atomically over the running file, requests `systemRebootEmuMMC` to reboot directly into
-the virtual system (pass `--normal-reboot` for a plain reboot), and waits until the console
-answers a command round-trip before checking that the new build advertises
-`audio=volume,mute`. `--verify-only` performs just that wait-and-check on a console that is
-already rebooting. The script intentionally does not back up the Switch-side sys-agent; to
-roll back, re-deploy an older build or edit the SD card manually.
+The update uploads the new `exefs.nsp` and `toolbox.json` under temporary ASCII names,
+verifies the byte counts, renames them atomically over the running files, requests
+`systemRebootEmuMMC` to reboot directly into the virtual system (pass `--normal-reboot`
+for a plain reboot), and waits until the console answers a command round-trip before
+checking that the new build advertises `audio=volume,mute`. `--verify-only` performs just
+that wait-and-check on a console that is already rebooting. The script intentionally does
+not back up the Switch-side sys-agent; to roll back, re-deploy an older build or edit the
+SD card manually.
 
 ### Build with Docker
 
