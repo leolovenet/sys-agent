@@ -41,9 +41,15 @@ u64 GetTitleVersion(u64 pid) {
     u64 titleV = 0;
     s32 out;
 
-    Result rc = nsInitialize();
-    if (R_FAILED(rc))
-        fatalThrow(rc);
+    Result rc = initServiceWithRetry(nsInitialize);
+    if (R_FAILED(rc)) {
+        /* Return 0 ("version unavailable") instead of an error line:
+         * getMetaData() feeds 13 commands, so printing ERR here would corrupt
+         * their responses, and 0.0.0 is never a real version for a running
+         * title. */
+        logDiagnostic("nsInitialize (GetTitleVersion)", rc);
+        return 0;
+    }
 
     NsApplicationContentMetaStatus* MetaStatus = malloc(sizeof(NsApplicationContentMetaStatus[100U]));
     if (MetaStatus == NULL) {
@@ -66,9 +72,12 @@ u64 GetTitleVersion(u64 pid) {
 }
 
 u64 getoutsize(NsApplicationControlData* buf) {
-    Result rc = nsInitialize();
-    if (R_FAILED(rc))
-        fatalThrow(rc);
+    Result rc = initServiceWithRetry(nsInitialize);
+    if (R_FAILED(rc)) {
+        printf("ERR code=SERVICE_UNAVAILABLE service=ns result=0x%X\n", rc);
+        logDiagnostic("nsInitialize (getoutsize)", rc);
+        return 0;
+    }
     u64 outsize = 0;
     u64 pid = 0;
     pmdmntGetApplicationProcessId(&pid);

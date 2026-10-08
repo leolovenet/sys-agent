@@ -25,7 +25,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.7.3"
+#define VERSION_S "2.7.4"
 
 typedef enum {
     Active = 0,
@@ -64,6 +64,7 @@ int fd_size = 5;
 // we aren't an applet
 u32 __nx_applet_type = AppletType_None;
 static bool searchSdMounted = false;
+static bool socketServiceReady = false;
 
 // we override libnx internals to do a minimal init
 void __libnx_initheap(void)
@@ -77,13 +78,23 @@ void __libnx_initheap(void)
     fake_heap_end = inner_heap + sizeof(inner_heap);
 }
 
+static Result initViForRetry(void)
+{
+    return viInitialize(ViServiceType_Default);
+}
+
 void __appInit(void)
 {
     Result rc;
     svcSleepThread(20000000000L);
-    rc = smInitialize();
-    if (R_FAILED(rc))
-        fatalThrow(rc);
+
+    rc = initServiceWithRetry(smInitialize);
+    if (R_FAILED(rc)) {
+        /* No service manager means nothing else is reachable and the SD card is
+         * not mounted, so this failure cannot be logged.  Return without a fatal
+         * screen; main() keeps the module resident but idle. */
+        return;
+    }
     rc = fsInitialize();
     if (R_SUCCEEDED(rc)) {
         rc = fsdevMountSdmc();
@@ -101,24 +112,26 @@ void __appInit(void)
             setsysExit();
         }
     }
-    rc = pmdmntInitialize();
+    rc = initServiceWithRetry(pmdmntInitialize);
     if (R_FAILED(rc))
-        fatalThrow(rc);
-    rc = ldrDmntInitialize();
+        logDiagnostic("pmdmntInitialize", rc);
+    rc = initServiceWithRetry(ldrDmntInitialize);
     if (R_FAILED(rc))
-        fatalThrow(rc);
-    rc = pminfoInitialize();
+        logDiagnostic("ldrDmntInitialize", rc);
+    rc = initServiceWithRetry(pminfoInitialize);
     if (R_FAILED(rc))
-        fatalThrow(rc);
-    rc = socketInitializeDefault();
+        logDiagnostic("pminfoInitialize", rc);
+    rc = initServiceWithRetry(socketInitializeDefault);
+    if (R_SUCCEEDED(rc))
+        socketServiceReady = true;
+    else
+        logDiagnostic("socketInitializeDefault", rc);
+    rc = initServiceWithRetry(capsscInitialize);
     if (R_FAILED(rc))
-        fatalThrow(rc);
-    rc = capsscInitialize();
+        logDiagnostic("capsscInitialize", rc);
+    rc = initServiceWithRetry(initViForRetry);
     if (R_FAILED(rc))
-        fatalThrow(rc);
-    rc = viInitialize(ViServiceType_Default);
-    if (R_FAILED(rc))
-        fatalThrow(rc);
+        logDiagnostic("viInitialize", rc);
 }
 
 void __appExit(void)
@@ -1576,9 +1589,12 @@ int argmain(int argc, char** argv)
             svcSleepThread(1e+6l);
             viCloseDisplay(&temp_display);
 
-            rc = lblInitialize();
-            if (R_FAILED(rc))
-                fatalThrow(rc);
+            rc = initServiceWithRetry(lblInitialize);
+            if (R_FAILED(rc)) {
+                printf("ERR code=SERVICE_UNAVAILABLE service=lbl result=0x%X\n", rc);
+                logDiagnostic("lblInitialize (screenOff)", rc);
+                return 0;
+            }
             lblSwitchBacklightOff(1ul);
             lblExit();
         }
@@ -1597,9 +1613,12 @@ int argmain(int argc, char** argv)
             svcSleepThread(1e+6l);
             viCloseDisplay(&temp_display);
 
-            rc = lblInitialize();
-            if (R_FAILED(rc))
-                fatalThrow(rc);
+            rc = initServiceWithRetry(lblInitialize);
+            if (R_FAILED(rc)) {
+                printf("ERR code=SERVICE_UNAVAILABLE service=lbl result=0x%X\n", rc);
+                logDiagnostic("lblInitialize (screenOn)", rc);
+                return 0;
+            }
             lblSwitchBacklightOn(1ul);
             lblExit();
         }
@@ -1608,9 +1627,12 @@ int argmain(int argc, char** argv)
     if (!strcmp(argv[0], "charge"))
     {
         u32 charge;
-        Result rc = psmInitialize();
-        if (R_FAILED(rc))
-            fatalThrow(rc);
+        Result rc = initServiceWithRetry(psmInitialize);
+        if (R_FAILED(rc)) {
+            printf("ERR code=SERVICE_UNAVAILABLE service=psm result=0x%X\n", rc);
+            logDiagnostic("psmInitialize (charge)", rc);
+            return 0;
+        }
         psmGetBatteryChargePercentage(&charge);
         printf("%d\n", charge);
         psmExit();
@@ -1647,6 +1669,14 @@ void del_from_pfds(struct pollfd pfds[], int i, int* fd_count)
 
 int main()
 {
+    /* Without the BSD socket service there is no server to run; stay resident
+     * quietly instead of spinning forever in setupServerSocket() or throwing a
+     * fatal error screen. */
+    if (!socketServiceReady) {
+        while (true)
+            svcSleepThread(1e+9L);
+    }
+
     char* linebuf = malloc(sizeof(char) * MAX_LINE_LENGTH);
 
     int c = sizeof(struct sockaddr_in);

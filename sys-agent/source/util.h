@@ -11,4 +11,6 @@ s64 parseStringToSignedLong(char* arg);
 u8* parseStringToByteBuffer(char* arg, u64* size);
 HidNpadButton parseStringToButton(char* arg);
 Result capsscCaptureForDebug(void* buffer, size_t buffer_size, u64* size); //big thanks to Behemoth from the Reswitched Discord!
+Result initServiceWithRetry(Result (*init)(void));
+void logDiagnostic(const char* what, Result rc);
 void flashLed(void);

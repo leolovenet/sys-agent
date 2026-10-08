@@ -7,6 +7,13 @@
 #include <unistd.h>
 #include <switch.h>
 #include "util.h"
+#include "search_store.h"
+#include "result_check.h"
+
+/* Failure diagnostics go under the project's runtime-data namespace so the SD
+ * root stays clean and the file is easy to find (and pull over FTP). */
+#define SYS_AGENT_LOG_DIR "sdmc:/switch/sys-agent"
+#define SYS_AGENT_LOG_PATH SYS_AGENT_LOG_DIR "/sys-agent.log"
 
 // taken from sys-httpd (thanks jolan!)
 static const HidsysNotificationLedPattern breathingpattern = {
@@ -58,6 +65,8 @@ int setupServerSocket()
     int yes = 1;
     struct sockaddr_in server;
     lissock = socket(AF_INET, SOCK_STREAM, 0);
+    if (lissock < 0)
+        return -1; // socket service unavailable; let the caller decide
 
     setsockopt(lissock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
 
@@ -307,11 +316,41 @@ static void sendPatternStatic(const HidsysNotificationLedPattern* pattern, const
         rc = hidsysSetNotificationLedPattern(pattern, unique_pad_ids[i]);
 }
 
+void logDiagnostic(const char* what, Result rc)
+{
+    /* fopen() does not create parents; prepare the directory first so the very
+     * first failure is not lost.  Idempotent, and cheap given it only runs on
+     * error paths. */
+    searchStorePrepareDirectory(SYS_AGENT_LOG_DIR);
+    FILE* f = fopen(SYS_AGENT_LOG_PATH, "a");
+    if (f == NULL)
+        return;
+    fprintf(f, "[sys-agent] %s failed: 0x%X (module=%u description=%u)\n",
+        what, rc, R_MODULE(rc), R_DESCRIPTION(rc));
+    fclose(f);
+}
+
+Result initServiceWithRetry(Result (*init)(void))
+{
+    const int maxAttempts = 6;
+    Result rc = 0;
+    int attempt = 0;
+    for (attempt = 0; attempt < maxAttempts; attempt++) {
+        rc = init();
+        if (R_SUCCEEDED(rc) || !resultIsOutOfSessions(rc))
+            break;
+        svcSleepThread(500LL * 1000LL * 1000LL);
+    }
+    return rc;
+}
+
 void flashLed()
 {
-    Result rc = hidsysInitialize();
-    if (R_FAILED(rc))
-        fatalThrow(rc);
+    Result rc = initServiceWithRetry(hidsysInitialize);
+    if (R_FAILED(rc)) {
+        logDiagnostic("hidsysInitialize (flashLed)", rc);
+        return;
+    }
     sendPatternStatic(&breathingpattern, HidNpadIdType_Handheld); // glow in and out x2 for docked joycons
     sendPatternStatic(&flashpattern, HidNpadIdType_No1); // big hard single glow for wireless/wired joycons or controllers
     hidsysExit();
