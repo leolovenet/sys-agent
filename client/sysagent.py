@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import sys
+import textwrap
 import time
 from collections.abc import Iterator, Sequence
 
@@ -1468,6 +1469,56 @@ def _cmd_search(client: SysAgentClient, args: argparse.Namespace) -> int:
     return 0 if status.state == "done" else 1
 
 
+# ---- input button table -----------------------------------------------------
+
+# Button names accepted by the sysmodule's parseStringToButton(). The table is
+# repeated here so that the client help stands on its own offline; keep it in
+# sync with src/sys-agent/sys-agent/source/util.c when buttons change.
+BUTTON_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("face buttons", ("A", "B", "X", "Y")),
+    ("shoulders and triggers", ("L", "R", "ZL", "ZR")),
+    ("stick clicks", ("LSTICK", "RSTICK")),
+    ("D-pad", ("DUP", "DDOWN", "DLEFT", "DRIGHT")),
+    ("system", ("PLUS", "MINUS", "HOME", "CAPTURE")),
+    ("miscellaneous", ("PALMA", "UNUSED")),
+)
+
+BUTTON_ALIASES: tuple[tuple[str, str], ...] = (
+    ("DU", "DUP"),
+    ("DD", "DDOWN"),
+    ("DL", "DLEFT"),
+    ("DR", "DRIGHT"),
+)
+
+
+def _button_help() -> str:
+    """Render the accepted button names as a multi-line help block."""
+    lines = ["BUTTON is one of the following case-sensitive names:"]
+    lines.extend(f"  {label}: {', '.join(names)}" for label, names in BUTTON_GROUPS)
+    aliases = ", ".join(f"{alias}={name}" for alias, name in BUTTON_ALIASES)
+    lines.append(f"  D-pad aliases: {aliases}")
+    lines.append("An unknown name sends no button at all (never a default key).")
+    return "\n".join(lines)
+
+
+BUTTON_ARG = Arg("button", "button name; the accepted names are listed below",
+                 metavar="BUTTON")
+
+BUTTON_HELP = _button_help()
+
+CLICK_SEQ_HELP = "\n".join((
+    "Sequence tokens (comma separated, no spaces):",
+    "  BUTTON      click the button",
+    "  +BUTTON     press and hold",
+    "  -BUTTON     release",
+    "  W<milliseconds>   wait, e.g. W1000",
+    "  %LX,LY      move the left stick, e.g. %5000,1500",
+    "  &RX,RY      move the right stick, e.g. &0,0",
+    "",
+    BUTTON_HELP,
+))
+
+
 # ---- command registry -------------------------------------------------------
 
 
@@ -1611,11 +1662,11 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
 
     CommandGroup("input", "Send controller, touch, or keyboard input", (
         Command("press", "Press and hold a button", _cmd_press,
-                (Arg("button", "HidNpadButton name, e.g. A"),)),
+                (BUTTON_ARG,), BUTTON_HELP),
         Command("release", "Release a held button", _cmd_release,
-                (Arg("button", "HidNpadButton name, e.g. A"),)),
+                (BUTTON_ARG,), BUTTON_HELP),
         Command("click", "Press and release a button", _cmd_click,
-                (Arg("button", "HidNpadButton name, e.g. A"),)),
+                (BUTTON_ARG,), BUTTON_HELP),
         Command("set-stick", "Set a stick position", _cmd_set_stick,
                 (Arg("side", "LEFT or RIGHT", choices=("LEFT", "RIGHT")),
                  Arg("x", "X coordinate in -0x8000..0x7FFF", type=parse_int),
@@ -1624,8 +1675,7 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 (Arg("sequence", "e.g. A,W1000,B,+X,-X,%%5000,1500"),
                  Arg("no_wait", "send without waiting for 'done'", action="store_true",
                      default=False, flags=("--no-wait",))),
-                "Tokens: button=click, +button=press, -button=release, Wms=wait, "
-                "%LX,LY left stick, &RX,RY right stick."),
+                CLICK_SEQ_HELP),
         Command("click-cancel", "Interrupt the current click sequence",
                 _silent("click_cancel")),
         Command("detach-controller", "Force-detach the virtual controller",
@@ -1770,6 +1820,26 @@ class _HelpfulParser(argparse.ArgumentParser):
         super().error(message)
 
 
+class _BlockHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Keep the line structure of descriptions, wrapping only long lines.
+
+    The default formatter collapses every run of whitespace, which turns the
+    button/sequence tables in the input command help into one paragraph.
+    """
+
+    def _fill_text(self, text: str, width: int, indent: str) -> str:
+        lines = []
+        for line in textwrap.dedent(text).splitlines():
+            if not line.strip():
+                lines.append("")
+                continue
+            leading = line[: len(line) - len(line.lstrip())]
+            lines.append(textwrap.fill(line.strip(), width,
+                                       initial_indent=indent + leading,
+                                       subsequent_indent=indent + leading + " "))
+        return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _HelpfulParser(description=__doc__)
     parser.add_argument("--host", default="switch", help="sys-agent host (default: switch)")
@@ -1782,19 +1852,22 @@ def build_parser() -> argparse.ArgumentParser:
     for item in COMMANDS:
         if isinstance(item, CommandGroup):
             group_parser = subparsers.add_parser(item.name, help=item.help,
-                                                 description=item.help)
+                                                 description=item.help,
+                                                 formatter_class=_BlockHelpFormatter)
             group_subparsers = group_parser.add_subparsers(
                 dest=f"{item.name}_action", required=True, metavar="COMMAND",
                 title="commands")
             for child in item.children:
                 child_parser = group_subparsers.add_parser(
                     child.name, help=child.help,
-                    description=child.description or child.help)
+                    description=child.description or child.help,
+                    formatter_class=_BlockHelpFormatter)
                 for argument in child.args:
                     argument.add_to(child_parser)
         else:
             subparser = subparsers.add_parser(item.name, help=item.help,
-                                              description=item.description or item.help)
+                                              description=item.description or item.help,
+                                              formatter_class=_BlockHelpFormatter)
             for argument in item.args:
                 argument.add_to(subparser)
     return parser

@@ -171,6 +171,10 @@ Input subcommands are `press`, `release`, `click`, `set-stick`, `click-seq`, `cl
 `detach-controller`, `touch`, `touch-hold`, `touch-draw`, `touch-cancel`, `key`, `key-mod`, and
 `key-multi`. `click-seq` blocks until the server reports `done` unless `--no-wait` is given;
 `touch`, `touch-hold`, and `touch-draw` expect `x y` coordinate pairs.
+`input press|release|click|click-seq -h` prints the full table of accepted button names
+(`A`, `B`, `X`, `Y`, `L`, `R`, `ZL`, `ZR`, `PLUS`, `MINUS`, `DUP`/`DU`, `DDOWN`/`DD`,
+`DLEFT`/`DL`, `DRIGHT`/`DR`, `LSTICK`, `RSTICK`, `HOME`, `CAPTURE`, `PALMA`, `UNUSED`);
+names are case-sensitive, and an unknown name sends no button rather than a default key.
 
 ## Utility and config
 

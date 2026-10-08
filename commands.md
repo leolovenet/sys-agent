@@ -49,8 +49,10 @@ so always send e.g. `DEADBEEF` / `0xDEADBEEF`, never a decimal number.
 - Signed pointer jumps accept an optional leading `-`/`+`, e.g. `-0x10`.
 - Button tokens are case-sensitive uppercase names (`A`, `B`, `X`, `Y`, `L`, `R`,
   `ZL`, `ZR`, `PLUS`, `MINUS`, `DUP`, `DDOWN`, `DLEFT`, `DRIGHT`, `HOME`, `CAPTURE`,
-  `RSTICK`, `LSTICK`, `PALMA`, `UNUSED`); an unknown token sends **no button** instead
-  of silently pressing a default key.
+  `RSTICK`, `LSTICK`, `PALMA`, `UNUSED`); the D-pad names also accept the short
+  aliases `DU`, `DD`, `DL`, `DR`. An unknown token sends **no button** instead of
+  silently pressing a default key. The client repeats this table in
+  `sysagent.py input press|release|click|click-seq -h`.
 - Malformed numeric or payload arguments make the command return
   `ERR code=INVALID_ADDRESS` / `ERR code=INVALID_HEX_PAYLOAD` instead of silently
   proceeding with a wrong value.
