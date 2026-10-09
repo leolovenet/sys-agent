@@ -64,6 +64,13 @@ void poke(u64 offset, u64 size, u8* val);
  * are always written. */
 Result pokeVerified(u64 offset, u64 size, u8* val, u8* readback, bool* mismatch,
     Result* readResult);
+/* Read the range twice and accept it only when both reads agree, retrying up to
+ * `attempts` times (0 means one). Returns the last read Result when the reads
+ * failed, or 0 when they succeeded; *agreed then says whether two consecutive
+ * reads matched. So "read returned zeros" (*agreed=1) and "read failed"
+ * (nonzero Result) are distinguishable. `out` and `scratch` must each hold at
+ * least `size` bytes. */
+Result peekVerified(u64 offset, u64 size, u8* out, u8* scratch, u32 attempts, bool* agreed);
 void peek(u64 offset, u64 size);
 void peekInfinite(u64 offset, u64 size);
 void peekMulti(u64* offset, u64* size, u64 count);

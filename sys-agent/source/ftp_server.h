@@ -20,6 +20,9 @@ typedef struct {
     FtpConfig config;
     FtpConfigResult configResult;
     int lastError;
+    bool listenerUp;      /* the FTP listener is bound and listening on the data port */
+    uint32_t bindAttempts; /* ftpsrv_init calls (bind/listen attempts) so far */
+    int lastBindError;     /* errno of the last failed bind, or 0 */
     uint32_t lastFsResult;
     uint32_t activeTransfers;
     uint64_t bytesSent;

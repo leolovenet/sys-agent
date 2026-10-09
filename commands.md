@@ -172,7 +172,7 @@ large transfers are interleaved and share network and SD-card throughput.
 
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
-|ftpStatus|Reports lifecycle state, effective configuration, active file transfers, byte counters, lifecycle error, and the latest native FS Result|none|`ftpStatus`|
+|ftpStatus|Reports lifecycle state, whether the listener is bound (`listener=up/down`), the `ftpsrv_init` attempt count (`bindAttempts`) and the last bind error (`lastBindError`), effective configuration, active file transfers, byte counters, lifecycle error, and the latest native FS Result. Use it to tell "the listener never came up" apart from a network problem|none|`ftpStatus`|
 |ftpStart|Asynchronously starts the server using the loaded configuration|none|`ftpStart`|
 |ftpStop|Asynchronously closes the listener, clients, transfers, and open FTP files|none|`ftpStop`|
 |ftpRestart|Restarts the server without rereading the configuration file|none|`ftpRestart`|
@@ -381,6 +381,8 @@ search; wait for the terminal status before retrying or closing the session.
 |peekMulti  |Reads memory at given addresses relative to heap  |1. heap-relative offset (0x-hex or decimal)<br>2. amount of bytes to read<br>...<br>n. heap-relative offset (0x-hex or decimal)<br>n+1. amount of bytes to read <br>Return: hex string |peekMulti 0x45075880 344 0x45097552 344 0x45774450 344  |
 |peekAbsoluteMulti  |Reads memory at given absolute addresses  |1. absolute address (0x-hex or decimal)<br>2. amount of bytes to read<br>...<br>n. absolute address (0x-hex or decimal)<br>n+1. amount of bytes to read <br>Return: hex string |peekMulti 0x45075880 344 0x45097552 344 0x45774450 344  |
 |peekMainMulti  |Reads memory at given absolute addresses  |1. NSOMain-relative offset (0x-hex or decimal)<br>2. amount of bytes to read<br>...<br>n. NSOMain-relative offset (0x-hex or decimal)<br>n+1. amount of bytes to read <br>Return: hex string |peekMulti 0x45075880 344 0x45097552 344 0x45774450 344  |
+|peekVerified / peekAbsoluteVerified / peekMainVerified|Verified read: reads the range twice, retrying until two consecutive reads agree (default 3 attempts, max 16), so "read returned zeros" is distinguishable from a failed read. `OK addr=... size=... attempts=... data=<hex>`, or `ERR code=READ_FAILED result=...` / `ERR code=READ_UNSTABLE`|same as the corresponding `peek` command, plus optional `attempts N` (1..16)|`peekAbsoluteVerified 0x45075880 0x10 attempts=5`|
+|memoryQuery|Queries the memory mapping covering an address (svcQueryMemory semantics): `OK addr=... base=... size=... type=... typeName=... attr=... perm=... permName=...`, or `ERR code=QUERY_FAILED`|absolute address (0x-hex or decimal)|`memoryQuery 0x2C1A400000`|
 
 ### Pointer Reads
 |Command|Description|Parameters|Usage|

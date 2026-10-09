@@ -25,7 +25,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.8.0"
+#define VERSION_S "2.9.0"
 
 typedef enum {
     Active = 0,
@@ -314,6 +314,38 @@ static void printHexBytes(const u8* bytes, u64 size)
         printf("%02X", bytes[i]);
 }
 
+/* Readable name for the memory types `memoryQuery` reports (MemType_*). */
+static const char* memoryTypeName(u32 type)
+{
+    switch (type) {
+    case MemType_Unmapped: return "unmapped";
+    case MemType_Io: return "io";
+    case MemType_Normal: return "normal";
+    case MemType_CodeStatic: return "codeStatic";
+    case MemType_CodeMutable: return "codeMutable";
+    case MemType_Heap: return "heap";
+    case MemType_SharedMem: return "sharedMem";
+    case MemType_WeirdMappedMem: return "weirdMapped";
+    case MemType_ModuleCodeStatic: return "moduleCode";
+    case MemType_ModuleCodeMutable: return "moduleCodeMutable";
+    case MemType_IpcBuffer0: return "ipcBuffer0";
+    case MemType_MappedMemory: return "mappedMemory";
+    case MemType_ThreadLocal: return "threadLocal";
+    case MemType_TransferMemIsolated: return "transferMemIsolated";
+    case MemType_TransferMem: return "transferMem";
+    case MemType_ProcessMem: return "processMem";
+    case MemType_Reserved: return "reserved";
+    case MemType_IpcBuffer1: return "ipcBuffer1";
+    case MemType_IpcBuffer3: return "ipcBuffer3";
+    case MemType_KernelStack: return "kernelStack";
+    case MemType_CodeReadOnly: return "codeReadOnly";
+    case MemType_CodeWritable: return "codeWritable";
+    case MemType_Coverage: return "coverage";
+    case MemType_Insecure: return "insecure";
+    default: return "unknown";
+    }
+}
+
 int argmain(int argc, char** argv)
 {
     if (argc == 0)
@@ -330,11 +362,14 @@ int argmain(int argc, char** argv)
         }
         FtpServerStatus status;
         ftpServerGetStatus(&status);
-        printf("OK state=%s enabled=%d port=%u anonymous=%d use_localtime=%d transfers=%u bytesSent=%lu bytesReceived=%lu config=%s lastError=%d lastFsResult=0x%X\n",
-            ftpServerStateName(status.state), status.config.enabled, status.config.port,
-            status.config.anonymous, status.config.use_localtime, status.activeTransfers, status.bytesSent,
-            status.bytesReceived, ftpConfigResultName(status.configResult), status.lastError,
-            status.lastFsResult);
+        printf("OK state=%s listener=%s enabled=%d port=%u anonymous=%d use_localtime=%d"
+            " bindAttempts=%u lastBindError=%d transfers=%u bytesSent=%lu bytesReceived=%lu"
+            " config=%s lastError=%d lastFsResult=0x%X\n",
+            ftpServerStateName(status.state), status.listenerUp ? "up" : "down",
+            status.config.enabled, status.config.port, status.config.anonymous,
+            status.config.use_localtime, status.bindAttempts, status.lastBindError,
+            status.activeTransfers, status.bytesSent, status.bytesReceived,
+            ftpConfigResultName(status.configResult), status.lastError, status.lastFsResult);
         return 0;
     }
 
@@ -1158,6 +1193,121 @@ int argmain(int argc, char** argv)
         }
         free(readback);
         free(data);
+        return 0;
+    }
+
+    /* memoryQuery <addr>: svcQueryMemory semantics, so a caller can tell an
+     * unmapped/read-only address apart from a transient read failure before it
+     * decides to read or write. */
+    if (!strcmp(argv[0], "memoryQuery"))
+    {
+        if (argc != 2)
+        {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        u64 address = 0;
+        if (!tryParseStringToInt(argv[1], &address)) {
+            printf("ERR code=INVALID_ADDRESS arg=%s\n", argv[1]);
+            return 0;
+        }
+        MemoryInfo info = { 0 };
+        ProcessMemorySession session;
+        Result rc = processMemoryOpen(&session, debugResultCodes);
+        if (R_SUCCEEDED(rc)) {
+            rc = processMemoryQuery(&session, &info, address);
+            processMemoryClose(&session);
+        }
+        if (R_FAILED(rc)) {
+            printf("ERR code=QUERY_FAILED addr=0x%lX result=0x%X\n", address, rc);
+            return 0;
+        }
+        char perm[4] = {
+            (info.perm & Perm_R) ? 'r' : '-',
+            (info.perm & Perm_W) ? 'w' : '-',
+            (info.perm & Perm_X) ? 'x' : '-',
+            0,
+        };
+        printf("OK addr=0x%lX base=0x%lX size=0x%lX type=0x%X typeName=%s"
+            " attr=0x%X perm=0x%X permName=%s\n",
+            address, info.addr, info.size, info.type, memoryTypeName(info.type),
+            info.attr, info.perm, perm);
+        return 0;
+    }
+
+    /* peek*Verified: read the range twice, retry until two reads agree, and only
+     * then return the bytes. This separates "read returned zeros" from "read
+     * failed" (empty line / no data) and rides out the intermittent read
+     * failures the plain peek* commands can only expose as an empty response. */
+    if (!strcmp(argv[0], "peekVerified") || !strcmp(argv[0], "peekAbsoluteVerified")
+        || !strcmp(argv[0], "peekMainVerified"))
+    {
+        if (argc != 3 && argc != 4)
+        {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        u32 attempts = 3;
+        if (argc == 4) {
+            if (strncmp(argv[3], "attempts=", 9) != 0) {
+                printf("ERR code=INVALID_ARGUMENTS arg=%s\n", argv[3]);
+                return 0;
+            }
+            u64 parsed = 0;
+            if (!tryParseStringToInt(argv[3] + 9, &parsed) || parsed == 0 || parsed > 16) {
+                printf("ERR code=INVALID_ATTEMPTS arg=%s\n", argv[3] + 9);
+                return 0;
+            }
+            attempts = (u32)parsed;
+        }
+
+        u64 target = 0;
+        if (strcmp(argv[0], "peekAbsoluteVerified") != 0)
+        {
+            MetaData meta = getMetaData();
+            target = !strcmp(argv[0], "peekMainVerified") ? meta.main_nso_base : meta.heap_base;
+            if (target == 0)
+            {
+                printf("ERR code=NO_APP\n");
+                return 0;
+            }
+        }
+
+        u64 offset = 0;
+        if (!tryParseStringToInt(argv[1], &offset)) {
+            printf("ERR code=INVALID_ADDRESS arg=%s\n", argv[1]);
+            return 0;
+        }
+        u64 size = 0;
+        if (!tryParseStringToInt(argv[2], &size) || size == 0) {
+            printf("ERR code=INVALID_SIZE arg=%s\n", argv[2]);
+            return 0;
+        }
+        u64 address = target + offset;
+
+        u8* out = malloc(size);
+        u8* scratch = malloc(size);
+        if (out == NULL || scratch == NULL) {
+            free(out);
+            free(scratch);
+            printf("ERR code=OUT_OF_MEMORY\n");
+            return 0;
+        }
+        bool agreed = false;
+        Result rc = peekVerified(address, size, out, scratch, attempts, &agreed);
+        if (R_FAILED(rc)) {
+            printf("ERR code=READ_FAILED addr=0x%lX size=%lu attempts=%u result=0x%X\n",
+                address, size, attempts, rc);
+        } else if (!agreed) {
+            printf("ERR code=READ_UNSTABLE addr=0x%lX size=%lu attempts=%u\n",
+                address, size, attempts);
+        } else {
+            printf("OK addr=0x%lX size=%lu attempts=%u data=", address, size, attempts);
+            printHexBytes(out, size);
+            printf("\n");
+        }
+        free(out);
+        free(scratch);
         return 0;
     }
 

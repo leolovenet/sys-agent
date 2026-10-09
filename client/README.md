@@ -56,6 +56,7 @@ automatically retries reboot, shutdown, sleep, wireless changes, or application 
 
 ```bash
 python3 client/sysagent.py --host switch game status
+python3 client/sysagent.py --host switch game wait --wait-timeout 60
 python3 client/sysagent.py --host switch game launch-headless 0x01006F8002326000
 python3 client/sysagent.py --host switch game terminate
 python3 client/sysagent.py --host switch game name
@@ -63,8 +64,10 @@ python3 client/sysagent.py --host switch game version
 python3 client/sysagent.py --host switch game icon --output icon.bin
 ```
 
-Game subcommands are `status`, `launch-headless`, `terminate`, `name`, `author`, `rating`,
-`version`, and `icon`. `status` reports the running application identity, version, memory
+Game subcommands are `status`, `wait`, `launch-headless`, `terminate`, `name`, `author`,
+`rating`, `version`, and `icon`. `wait` polls until a game is running (bounded by
+`--wait-timeout`, default 60s) instead of leaving the polling to the caller.
+`status` reports the running application identity, version, memory
 bases, Build ID, and name; `icon` writes a binary icon file with `--output` (default
 `game-icon-<unix time>.bin`). `launch-headless` starts the game process without showing it on
 screen (foreground launch requires the home-menu/applet flow, which a sysmodule cannot drive);
@@ -172,7 +175,10 @@ allows up to 4 MiB.
 ```bash
 python3 client/sysagent.py --host switch memory peek 0x100 0x10
 python3 client/sysagent.py --host switch memory peek-absolute 0x45075880 0x10
+python3 client/sysagent.py --host switch memory peek-absolute-verified 0x45075880 0x10
 python3 client/sysagent.py --host switch memory peek-multi 0x100 0x4 0x200 0x4
+python3 client/sysagent.py --host switch memory query 0x45075880
+python3 client/sysagent.py --host switch memory wait-value 0x45075880 4 DEADBEEF --wait-timeout 30
 python3 client/sysagent.py --host switch memory poke 0x100 DEADBEEF
 python3 client/sysagent.py --host switch memory pointer 0x45097552 0x10
 python3 client/sysagent.py --host switch memory pointer-all 0x45097552 0x10 0x4
@@ -182,9 +188,22 @@ python3 client/sysagent.py --host switch memory pointer-poke DEADBEEF 0x45097552
 ```
 
 Memory subcommands are `peek`, `peek-absolute`, `peek-main`, `peek-multi`,
-`peek-absolute-multi`, `peek-main-multi`, `poke`, `poke-absolute`, `poke-main`, `pointer`,
-`pointer-all`, `pointer-relative`, `pointer-peek`, `pointer-peek-multi`, and `pointer-poke`.
-Addresses and sizes accept decimal or `0x`; data is hex.
+`peek-absolute-multi`, `peek-main-multi`, `peek-verified`, `peek-absolute-verified`,
+`peek-main-verified`, `query`, `wait-value`, `poke`, `poke-absolute`, `poke-main`,
+`pointer`, `pointer-all`, `pointer-relative`, `pointer-peek`, `pointer-peek-multi`, and
+`pointer-poke`. Addresses and sizes accept decimal or `0x`; data is hex.
+
+`query` reports the mapping covering an address (`base`/`size`/`typeName`/`permName`), so an
+unmapped or read-only address can be told apart from a transient failure before reading or
+writing it. The `peek-*-verified` reads read the range twice and retry until two consecutive
+reads agree (default 3 attempts, `--attempts` up to 16), which separates "the value is zero"
+from "the read failed". `wait-value` polls a verified read until the bytes match.
+
+Read-only commands (`peek*`, `pointer*`, `query`, `freeze count`, the verified reads) retry
+automatically on an empty response or a dropped connection, rebuilding the socket between
+attempts; write commands never retry, because a lost reply can mean the write already landed.
+Two retries is the default (`--retries N` to change it, `--retries 0` to disable); the
+reconnect backoff is 50 ms then 100 ms.
 
 `memory poke`, `memory poke-absolute`, and `memory poke-main` verify by default: the
 sysmodule writes, reads the range back, and compares before answering, so a silent write

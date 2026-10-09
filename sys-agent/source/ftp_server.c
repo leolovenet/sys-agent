@@ -86,6 +86,7 @@ static void ftpWorker(void* argument)
             ftpsrv_exit();
             mutexLock(&manager.mutex);
             manager.serverInitialized = false;
+            manager.status.listenerUp = false;
             mutexUnlock(&manager.mutex);
             initialized = false;
         }
@@ -107,6 +108,7 @@ static void ftpWorker(void* argument)
             ftpsrv_exit();
             mutexLock(&manager.mutex);
             manager.serverInitialized = false;
+            manager.status.listenerUp = false;
             manager.status.state = FtpServerStopped;
             manager.status.activeTransfers = 0;
             mutexUnlock(&manager.mutex);
@@ -118,12 +120,17 @@ static void ftpWorker(void* argument)
             struct FtpSrvConfig libraryConfig;
             populateLibraryConfig(&libraryConfig, &config);
             int result = ftpsrv_init(&libraryConfig);
+            mutexLock(&manager.mutex);
+            manager.status.bindAttempts++;
+            mutexUnlock(&manager.mutex);
             if (result < 0) {
                 int error = errno ? errno : EIO;
                 ftpsrv_exit();
                 mutexLock(&manager.mutex);
                 manager.status.state = FtpServerError;
                 manager.status.lastError = error;
+                manager.status.lastBindError = error;
+                manager.status.listenerUp = false;
                 mutexUnlock(&manager.mutex);
                 svcSleepThread(1000 * 1000 * 1000L);
             } else {
@@ -131,6 +138,8 @@ static void ftpWorker(void* argument)
                 manager.serverInitialized = true;
                 manager.status.state = FtpServerRunning;
                 manager.status.lastError = 0;
+                manager.status.lastBindError = 0;
+                manager.status.listenerUp = true;
                 mutexUnlock(&manager.mutex);
                 initialized = true;
             }
@@ -145,6 +154,8 @@ static void ftpWorker(void* argument)
                 manager.serverInitialized = false;
                 manager.status.state = FtpServerError;
                 manager.status.lastError = error;
+                manager.status.lastBindError = error;
+                manager.status.listenerUp = false;
                 manager.status.activeTransfers = 0;
                 mutexUnlock(&manager.mutex);
                 svcSleepThread(1000 * 1000 * 1000L);
@@ -157,6 +168,7 @@ static void ftpWorker(void* argument)
     mutexLock(&manager.mutex);
     bool initialized = manager.serverInitialized;
     manager.serverInitialized = false;
+    manager.status.listenerUp = false;
     mutexUnlock(&manager.mutex);
     if (initialized)
         ftpsrv_exit();

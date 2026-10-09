@@ -36,6 +36,8 @@ class FakeState:
         self.last_key_unregister: list[str] | None = None
         self.key_ops: list[str] = []
         self.poke_verify_fails = False
+        self.peek_verify_unstable = False
+        self.flaky_peek_remaining = 0
 
 
 class FakeHandler(socketserver.StreamRequestHandler):
@@ -125,6 +127,9 @@ class FakeHandler(socketserver.StreamRequestHandler):
             elif command[0] in {"peek", "peekAbsolute", "peekMain"}:
                 if command[0] == "peek" and command[2] == "0x0":
                     response = ""
+                elif state.flaky_peek_remaining > 0:
+                    state.flaky_peek_remaining -= 1
+                    response = ""
                 else:
                     response = "DEADBEEF00"
             elif command[0] in {"peekMulti", "peekAbsoluteMulti", "peekMainMulti"}:
@@ -137,6 +142,14 @@ class FakeHandler(socketserver.StreamRequestHandler):
                                 "expected=AABB actual=0000")
                 else:
                     response = f"OK addr={command[1]} size=2 verified=1"
+            elif command[0] == "memoryQuery":
+                response = ("OK addr=0x2C1A400000 base=0x2C1A400000 size=0x1000 "
+                            "type=0x5 typeName=heap attr=0x0 perm=0x3 permName=rw")
+            elif command[0] in {"peekVerified", "peekAbsoluteVerified", "peekMainVerified"}:
+                if state.peek_verify_unstable:
+                    response = "ERR code=READ_UNSTABLE addr=0x100 size=4 attempts=3"
+                else:
+                    response = "OK addr=0x100 size=4 attempts=3 data=DEADBEEF"
             elif command[0] == "pointer":
                 response = "0000000080001000"
             elif command[0] in {"pointerAll", "pointerRelative"}:
@@ -407,6 +420,58 @@ class ClientTests(unittest.TestCase):
         with self.client() as client:
             with self.assertRaisesRegex(SysAgentProtocolError, "WRITE_VERIFY_FAILED"):
                 client.poke_absolute_verified(0x100, b"\xAA\xBB")
+
+    def test_memory_query(self) -> None:
+        with self.client() as client:
+            info = client.memory_query(0x2C1A400000)
+            self.assertEqual(info["typeName"], "heap")
+            self.assertEqual(info["permName"], "rw")
+            self.assertEqual(self.server.state.last_command[0], "memoryQuery")
+
+    def test_peek_verified(self) -> None:
+        with self.client() as client:
+            self.assertEqual(client.peek_absolute_verified(0x100, 4)["data"], "DEADBEEF")
+            self.assertEqual(self.server.state.last_command[0], "peekAbsoluteVerified")
+
+        from client.sysagent import main
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "memory", "peek-absolute-verified", "0x100", "4"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.server.state.last_command[0], "peekAbsoluteVerified")
+
+    def test_peek_verified_unstable_translated(self) -> None:
+        self.server.state.peek_verify_unstable = True
+        with self.client() as client:
+            with self.assertRaisesRegex(SysAgentProtocolError, "disagreed"):
+                client.peek_absolute_verified(0x100, 4)
+
+    def test_read_retries_on_empty_response(self) -> None:
+        self.server.state.flaky_peek_remaining = 2
+        with self.client() as client:
+            self.assertEqual(client.peek_absolute(0x100, 4), "DEADBEEF00")
+        self.assertEqual(self.server.state.flaky_peek_remaining, 0)
+
+    def test_write_does_not_retry(self) -> None:
+        self.server.state.poke_verify_fails = True
+        before = len(self.server.state.commands)
+        with self.client() as client:
+            with self.assertRaises(SysAgentProtocolError):
+                client.poke_absolute_verified(0x100, b"\xAA\xBB")
+        self.assertEqual(len(self.server.state.commands) - before, 1)
+
+    def test_wait_for_game(self) -> None:
+        with self.client() as client:
+            self.assertTrue(client.wait_for_game(timeout=2, poll=0.05))
+        self.server.state.application_running = False
+        with self.client() as client:
+            self.assertFalse(client.wait_for_game(timeout=0.2, poll=0.05))
+
+    def test_wait_for_value(self) -> None:
+        with self.client() as client:
+            self.assertTrue(client.wait_for_value(
+                0x100, 4, bytes.fromhex("DEADBEEF"), timeout=2, poll=0.05))
+            self.assertFalse(client.wait_for_value(
+                0x100, 4, bytes.fromhex("00000000"), timeout=0.2, poll=0.05))
 
     def test_error_code_translation(self) -> None:
         with self.assertRaisesRegex(SysAgentProtocolError, "could not be read"):

@@ -288,9 +288,11 @@ RESULT_CODE_NOTES = {
 
 ERROR_CODE_NOTES = {
     "READ_FAILED": "the target address could not be read",
+    "READ_UNSTABLE": "two reads of the address disagreed; the region is changing",
     "WRITE_FAILED": "the target address could not be written",
     "READBACK_FAILED": "the write landed but the verification read-back failed",
     "WRITE_VERIFY_FAILED": "the write did not read back as sent (concurrent writer?)",
+    "QUERY_FAILED": "the memory mapping for the address could not be queried",
     "NO_APP": "no foreground application is running",
     "BACKEND_UNAVAILABLE": "the process-memory backend could not be opened",
     "MODULES_UNAVAILABLE": "the module list could not be read",
@@ -426,10 +428,15 @@ class BackendStatus:
 
 
 class SysAgentClient:
-    def __init__(self, host: str = "switch", port: int = 6000, timeout: float = 10.0):
+    def __init__(self, host: str = "switch", port: int = 6000, timeout: float = 10.0,
+                 retries: int = 2):
         self.host = host
         self.port = port
         self.timeout = timeout
+        # Extra attempts for read-only commands only (see `command`/`_bare_command`).
+        # Write commands never retry: an empty reply can mean the write already
+        # landed, and repeating it would double the side effect.
+        self.retries = max(0, retries)
         self._socket: socket.socket | None = None
         self._buffer = bytearray()
         # Set after a command whose response is not a single line the client reads:
@@ -463,7 +470,26 @@ class SysAgentClient:
         self._buffer.clear()
         self._stream_dirty = False
 
-    def command(self, command: str) -> dict[str, str]:
+    def _retryable(self, action):
+        """Run a read-only action, rebuilding the stream between attempts."""
+        attempts = 1 + self.retries
+        for attempt in range(attempts):
+            try:
+                return action()
+            except (SysAgentProtocolError, OSError):
+                if attempt + 1 >= attempts:
+                    raise
+                # A half-read response would desynchronise the next command, so
+                # drop the socket and let the next attempt reconnect.
+                self.close()
+                time.sleep(min(0.05 * (2 ** attempt), 0.5))
+
+    def command(self, command: str, retry: bool = False) -> dict[str, str]:
+        if retry and self.retries > 0:
+            return self._retryable(lambda: self._command_once(command))
+        return self._command_once(command)
+
+    def _command_once(self, command: str) -> dict[str, str]:
         if "\r" in command or "\n" in command:
             raise ValueError("command must be a single line")
         self.connect()
@@ -486,7 +512,13 @@ class SysAgentClient:
             if len(self._buffer) > max_bytes:
                 raise SysAgentProtocolError(f"response exceeds {max_bytes} byte safety limit")
 
-    def _bare_command(self, command_line: str, expect_output: bool = True) -> str | None:
+    def _bare_command(self, command_line: str, expect_output: bool = True,
+                      retry: bool = False) -> str | None:
+        if retry and expect_output and self.retries > 0:
+            return self._retryable(lambda: self._bare_command_once(command_line, expect_output))
+        return self._bare_command_once(command_line, expect_output)
+
+    def _bare_command_once(self, command_line: str, expect_output: bool = True) -> str | None:
         """Send a legacy command that answers with a bare line instead of OK/ERR.
 
         Legacy commands print raw hex, plain text, or nothing. ``expect_output``
@@ -552,10 +584,10 @@ class SysAgentClient:
             raise SysAgentProtocolError(f"invalid screen capture response: {error}") from error
 
     def capabilities(self) -> dict[str, str]:
-        return require_ok(self.command("searchCapabilities"))
+        return require_ok(self.command("searchCapabilities", retry=True))
 
     def backend_status(self) -> BackendStatus:
-        return BackendStatus.from_response(self.command("memoryBackend"))
+        return BackendStatus.from_response(self.command("memoryBackend", retry=True))
 
     def set_backend_policy(self, policy: str) -> BackendStatus:
         if policy not in {"auto", "dmnt", "direct"}:
@@ -563,10 +595,10 @@ class SysAgentClient:
         return BackendStatus.from_response(self.command(f"memoryBackend {policy}"))
 
     def probe_backend(self) -> BackendStatus:
-        return BackendStatus.from_response(self.command("memoryBackendProbe"))
+        return BackendStatus.from_response(self.command("memoryBackendProbe", retry=True))
 
     def system_capabilities(self) -> dict[str, str]:
-        return require_ok(self.command("systemCapabilities"))
+        return require_ok(self.command("systemCapabilities", retry=True))
 
     def system_query(self, name: str) -> dict[str, str]:
         queries = {
@@ -581,12 +613,12 @@ class SysAgentClient:
         }
         if name not in queries:
             raise ValueError("unsupported system query")
-        return require_ok(self.command(queries[name]))
+        return require_ok(self.command(queries[name], retry=True))
 
     def process_list(self, offset: int = 0, count: int = 64) -> dict[str, str]:
         if offset < 0 or count < 1 or count > 64:
             raise ValueError("offset must be non-negative and count must be in 1..64")
-        return require_ok(self.command(f"processList {offset} {count}"))
+        return require_ok(self.command(f"processList {offset} {count}", retry=True))
 
     def system_action(self, action: str) -> dict[str, str]:
         commands = {
@@ -605,7 +637,7 @@ class SysAgentClient:
         return require_ok(self.command(f"networkSet {state}"))
 
     def lock_screen_status(self) -> dict[str, str]:
-        return require_ok(self.command("lockScreenStatus"))
+        return require_ok(self.command("lockScreenStatus", retry=True))
 
     def set_lock_screen(self, enabled: bool) -> dict[str, str]:
         state = "enabled" if enabled else "disabled"
@@ -626,48 +658,96 @@ class SysAgentClient:
     # ---- Legacy memory read -------------------------------------------------
 
     def peek(self, offset: int, size: int) -> str:
-        return self._bare_command(f"peek 0x{offset:X} 0x{size:X}")
+        return self._bare_command(f"peek 0x{offset:X} 0x{size:X}", retry=True)
 
     def peek_absolute(self, address: int, size: int) -> str:
-        return self._bare_command(f"peekAbsolute 0x{address:X} 0x{size:X}")
+        return self._bare_command(f"peekAbsolute 0x{address:X} 0x{size:X}", retry=True)
 
     def peek_main(self, offset: int, size: int) -> str:
-        return self._bare_command(f"peekMain 0x{offset:X} 0x{size:X}")
+        return self._bare_command(f"peekMain 0x{offset:X} 0x{size:X}", retry=True)
 
     def peek_multi(self, pairs: Sequence[tuple[int, int]]) -> str:
         args = " ".join(f"0x{address:X} 0x{size:X}" for address, size in pairs)
-        return self._bare_command(f"peekMulti {args}")
+        return self._bare_command(f"peekMulti {args}", retry=True)
 
     def peek_absolute_multi(self, pairs: Sequence[tuple[int, int]]) -> str:
         args = " ".join(f"0x{address:X} 0x{size:X}" for address, size in pairs)
-        return self._bare_command(f"peekAbsoluteMulti {args}")
+        return self._bare_command(f"peekAbsoluteMulti {args}", retry=True)
 
     def peek_main_multi(self, pairs: Sequence[tuple[int, int]]) -> str:
         args = " ".join(f"0x{address:X} 0x{size:X}" for address, size in pairs)
-        return self._bare_command(f"peekMainMulti {args}")
+        return self._bare_command(f"peekMainMulti {args}", retry=True)
+
+    # ---- Mapping query and verified read ------------------------------------
+
+    def memory_query(self, address: int) -> dict[str, str]:
+        """svcQueryMemory semantics: the mapping type/permission covering an address."""
+        return require_ok(self.command(f"memoryQuery 0x{address:X}", retry=True))
+
+    def peek_verified(self, offset: int, size: int, attempts: int = 3) -> dict[str, str]:
+        return require_ok(self.command(
+            f"peekVerified 0x{offset:X} 0x{size:X} attempts={attempts}", retry=True))
+
+    def peek_absolute_verified(self, address: int, size: int, attempts: int = 3) -> dict[str, str]:
+        return require_ok(self.command(
+            f"peekAbsoluteVerified 0x{address:X} 0x{size:X} attempts={attempts}", retry=True))
+
+    def peek_main_verified(self, offset: int, size: int, attempts: int = 3) -> dict[str, str]:
+        return require_ok(self.command(
+            f"peekMainVerified 0x{offset:X} 0x{size:X} attempts={attempts}", retry=True))
+
+    # ---- Readiness / condition waits ----------------------------------------
+
+    def wait_for_game(self, timeout: float = 60.0, poll: float = 0.5) -> bool:
+        """Poll until a game is running; returns False on timeout."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if self.system_query("application").get("running") == "1":
+                    return True
+            except (SysAgentProtocolError, OSError):
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(poll)
+
+    def wait_for_value(self, address: int, size: int, value: bytes,
+                       timeout: float = 30.0, poll: float = 0.2) -> bool:
+        """Poll a verified absolute read until the bytes equal `value`."""
+        expected = value.hex().upper()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if self.peek_absolute_verified(address, size)["data"].upper() == expected:
+                    return True
+            except (SysAgentProtocolError, OSError):
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(poll)
 
     def pointer(self, jumps: Sequence[int]) -> str:
         args = " ".join(f"0x{value:X}" for value in jumps)
-        return self._bare_command(f"pointer {args}")
+        return self._bare_command(f"pointer {args}", retry=True)
 
     def pointer_all(self, jumps: Sequence[int], final: int) -> str:
         args = " ".join(f"0x{value:X}" for value in jumps) + f" 0x{final:X}"
-        return self._bare_command(f"pointerAll {args}")
+        return self._bare_command(f"pointerAll {args}", retry=True)
 
     def pointer_relative(self, jumps: Sequence[int], final: int) -> str:
         args = " ".join(f"0x{value:X}" for value in jumps) + f" 0x{final:X}"
-        return self._bare_command(f"pointerRelative {args}")
+        return self._bare_command(f"pointerRelative {args}", retry=True)
 
     def pointer_peek(self, size: int, jumps: Sequence[int], final: int) -> str:
         args = f"0x{size:X} " + " ".join(f"0x{value:X}" for value in jumps) + f" 0x{final:X}"
-        return self._bare_command(f"pointerPeek {args}")
+        return self._bare_command(f"pointerPeek {args}", retry=True)
 
     def pointer_peek_multi(self, chains: Sequence[tuple[int, Sequence[int], int]]) -> str:
         blocks = []
         for size, jumps, final in chains:
             args = f"0x{size:X} " + " ".join(f"0x{value:X}" for value in jumps) + f" 0x{final:X}"
             blocks.append(args)
-        return self._bare_command("pointerPeekMulti " + " * ".join(blocks))
+        return self._bare_command("pointerPeekMulti " + " * ".join(blocks), retry=True)
 
     # ---- Legacy memory write ------------------------------------------------
 
@@ -704,7 +784,7 @@ class SysAgentClient:
         self._bare_command(f"unFreeze 0x{address:X}", expect_output=False)
 
     def freeze_count(self) -> str:
-        return self._bare_command("freezeCount")
+        return self._bare_command("freezeCount", retry=True)
 
     def freeze_clear(self) -> None:
         self._bare_command("freezeClear", expect_output=False)
@@ -746,7 +826,7 @@ class SysAgentClient:
         self._bare_command("detachController", expect_output=False)
 
     def controller_status(self) -> dict[str, str]:
-        return require_ok(self.command("controllerStatus"))
+        return require_ok(self.command("controllerStatus", retry=True))
 
     def _read_block(self, command: str, end_token: str) -> str:
         """Send a command whose answer is a multi-line block ending in end_token."""
@@ -826,30 +906,30 @@ class SysAgentClient:
     # ---- Utility --------------------------------------------------------------
 
     def get_title_id(self) -> str:
-        return self._bare_command("getTitleID")
+        return self._bare_command("getTitleID", retry=True)
 
     def get_title_version(self) -> str:
-        return self._bare_command("getTitleVersion")
+        return self._bare_command("getTitleVersion", retry=True)
 
     def get_system_language(self) -> str:
-        return self._bare_command("getSystemLanguage")
+        return self._bare_command("getSystemLanguage", retry=True)
 
     def get_build_id(self) -> str:
-        return self._bare_command("getBuildID")
+        return self._bare_command("getBuildID", retry=True)
 
     def get_heap_base(self) -> str:
-        return self._bare_command("getHeapBase")
+        return self._bare_command("getHeapBase", retry=True)
 
     def get_main_nso_base(self) -> str:
-        return self._bare_command("getMainNsoBase")
+        return self._bare_command("getMainNsoBase", retry=True)
 
     def is_program_running(self, program_id: int) -> str:
-        return self._bare_command(f"isProgramRunning 0x{program_id:X}")
+        return self._bare_command(f"isProgramRunning 0x{program_id:X}", retry=True)
 
     def game(self, field: str) -> str:
         if field not in {"icon", "version", "rating", "author", "name"}:
             raise ValueError("field must be icon, version, rating, author, or name")
-        return self._bare_command(f"game {field}")
+        return self._bare_command(f"game {field}", retry=True)
 
     def game_launch_headless(self, title_id: int, storage: str | None = None) -> dict[str, str]:
         if not 0 < title_id <= 0xFFFFFFFFFFFFFFFF:
@@ -1031,7 +1111,7 @@ class SysAgentClient:
         return result
 
     def get_version(self) -> str:
-        return self._bare_command("getVersion")
+        return self._bare_command("getVersion", retry=True)
 
     def charge(self) -> str:
         return self._bare_command("charge")
@@ -1099,7 +1179,7 @@ class SysAgentClient:
         return parse_int(response["session"])
 
     def status(self, session: int) -> SearchStatus:
-        return SearchStatus.from_response(self.command(f"searchStatus {session}"))
+        return SearchStatus.from_response(self.command(f"searchStatus {session}", retry=True))
 
     def begin_unknown(
         self,
@@ -1148,7 +1228,8 @@ class SysAgentClient:
         require_ok(self.command(command))
 
     def results(self, session: int, offset: int, count: int) -> tuple[list[int], int]:
-        response = require_ok(self.command(f"searchResults {session} {offset} {count}"))
+        response = require_ok(
+            self.command(f"searchResults {session} {offset} {count}", retry=True))
         addresses_text = response.get("addresses", "")
         addresses = [] if not addresses_text else [int(value, 16) for value in addresses_text.split(",")]
         expected = parse_int(response["count"])
@@ -1379,6 +1460,39 @@ def _cmd_peek_absolute_multi(client: SysAgentClient, args: argparse.Namespace) -
 
 def _cmd_peek_main_multi(client: SysAgentClient, args: argparse.Namespace) -> None:
     print(client.peek_main_multi(pair_values(args.pairs)))
+
+
+def _cmd_memory_query(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.memory_query(args.address))
+
+
+def _cmd_peek_verified(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.peek_verified(args.offset, args.size, args.attempts)["data"])
+
+
+def _cmd_peek_absolute_verified(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.peek_absolute_verified(args.address, args.size, args.attempts)["data"])
+
+
+def _cmd_peek_main_verified(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.peek_main_verified(args.offset, args.size, args.attempts)["data"])
+
+
+def _cmd_memory_wait_value(client: SysAgentClient, args: argparse.Namespace) -> None:
+    if client.wait_for_value(args.address, args.size, args.value,
+                             args.wait_timeout, args.poll):
+        print("matched")
+    else:
+        raise SysAgentProtocolError(
+            f"address 0x{args.address:X} did not hold the value within "
+            f"{args.wait_timeout:g}s")
+
+
+def _cmd_game_wait(client: SysAgentClient, args: argparse.Namespace) -> None:
+    if client.wait_for_game(args.wait_timeout, args.poll):
+        print("running")
+    else:
+        raise SysAgentProtocolError(f"no game started within {args.wait_timeout:g}s")
 
 
 def _cmd_poke(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -1700,6 +1814,16 @@ BUTTON_ARG = Arg("button", "button name; the accepted names are listed below",
 NO_VERIFY_ARG = Arg("no_verify", "skip the server-side read-back check",
                     action="store_true", default=False, flags=("--no-verify",))
 
+# Verified reads retry until two consecutive reads agree (default 3 attempts).
+ATTEMPTS_ARG = Arg("attempts", "verified-read attempts (default 3, max 16)",
+                   type=parse_int, default=3, flags=("--attempts",))
+
+# Wait primitives poll; these bound the wait and its interval.
+WAIT_TIMEOUT_ARG = Arg("wait_timeout", "seconds to wait (default 60)",
+                       type=float, default=60.0, flags=("--wait-timeout",))
+POLL_ARG = Arg("poll", "poll interval in seconds (default 0.5)",
+               type=float, default=0.5, flags=("--poll",))
+
 BUTTON_HELP = _button_help()
 
 CLICK_SEQ_HELP = "\n".join((
@@ -1787,7 +1911,9 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
 
     CommandGroup("game", "Launch, close, or inspect the running game", (
         Command("status", "Show the running game identity and memory layout",
-                _cmd_game_status),
+               _cmd_game_status),
+        Command("wait", "Wait until a game is running", _cmd_game_wait,
+                (WAIT_TIMEOUT_ARG, POLL_ARG)),
         Command("launch-headless", "Experimental: start a game process without showing it "
                                    "on screen (headless; foreground launch is not possible "
                                    "from a sysmodule)", _cmd_game_launch_headless,
@@ -1837,6 +1963,28 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
         Command("peek-main-multi", "Read multiple main-relative ranges in one request",
                 _cmd_peek_main_multi,
                 (Arg("pairs", "address size address size ...", nargs="+", type=parse_int),)),
+        Command("query", "Query the memory mapping covering an address", _cmd_memory_query,
+                (Arg("address", "absolute address", type=parse_int),)),
+        Command("peek-verified", "Verified read relative to the heap", _cmd_peek_verified,
+                (Arg("offset", "heap-relative address", type=parse_int),
+                 Arg("size", "byte count", type=parse_int),
+                 ATTEMPTS_ARG)),
+        Command("peek-absolute-verified", "Verified read from an absolute address",
+                _cmd_peek_absolute_verified,
+                (Arg("address", "absolute address", type=parse_int),
+                 Arg("size", "byte count", type=parse_int),
+                 ATTEMPTS_ARG)),
+        Command("peek-main-verified", "Verified read relative to the main NSO base",
+                _cmd_peek_main_verified,
+                (Arg("offset", "main-relative address", type=parse_int),
+                 Arg("size", "byte count", type=parse_int),
+                 ATTEMPTS_ARG)),
+        Command("wait-value", "Wait until an absolute address holds a value",
+                _cmd_memory_wait_value,
+                (Arg("address", "absolute address", type=parse_int),
+                 Arg("size", "byte count", type=parse_int),
+                 Arg("value", "expected bytes as hex", type=parse_pattern),
+                 WAIT_TIMEOUT_ARG, POLL_ARG)),
         Command("poke", "Write bytes relative to the heap", _cmd_poke,
                 (Arg("offset", "heap-relative address", type=parse_int),
                  Arg("data", "hex bytes", type=parse_pattern),
@@ -2099,6 +2247,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="sys-agent TCP port (default: 6000)")
     parser.add_argument("--timeout", type=float, default=10.0,
                         help="socket timeout in seconds (default: 10.0)")
+    parser.add_argument("--retries", type=int, default=2,
+                        help="extra attempts for read-only commands (default: 2; "
+                             "write commands never retry)")
     subparsers = parser.add_subparsers(dest="action", required=True, metavar="COMMAND",
                                        title="commands", parser_class=_HelpfulParser)
     for item in COMMANDS:
@@ -2137,7 +2288,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     command = _resolve_command(args)
     try:
-        with SysAgentClient(args.host, args.port, args.timeout) as client:
+        with SysAgentClient(args.host, args.port, args.timeout, args.retries) as client:
             return command.handler(client, args) or 0
     except (OSError, ValueError, SysAgentProtocolError) as error:
         print(f"error: {error}", file=sys.stderr)

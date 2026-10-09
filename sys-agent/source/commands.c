@@ -1173,6 +1173,46 @@ Result pokeVerified(u64 offset, u64 size, u8* val, u8* readback, bool* mismatch,
     return writeRc;
 }
 
+Result peekVerified(u64 offset, u64 size, u8* out, u8* scratch, u32 attempts, bool* agreed)
+{
+    *agreed = false;
+    if (attempts == 0)
+        attempts = 1;
+
+    ProcessMemorySession session;
+    Result rc = processMemoryOpen(&session, debugResultCodes);
+    if (R_FAILED(rc))
+        return rc;
+
+    Result lastResult = 0;
+    bool sawMismatch = false;
+    u32 i;
+    for (i = 0; i < attempts; i++) {
+        Result first = processMemoryRead(&session, out, offset, size);
+        if (R_FAILED(first)) {
+            lastResult = first;
+            continue;
+        }
+        Result second = processMemoryRead(&session, scratch, offset, size);
+        if (R_FAILED(second)) {
+            lastResult = second;
+            continue;
+        }
+        lastResult = 0;
+        if (memcmp(out, scratch, size) == 0) {
+            *agreed = true;
+            break;
+        }
+        sawMismatch = true;
+    }
+    processMemoryClose(&session);
+
+    if (*agreed)
+        return 0;
+    /* A readable-but-unstable region is more informative than the last error. */
+    return sawMismatch ? 0 : lastResult;
+}
+
 void peek(u64 offset, u64 size)
 {
     u8* out = malloc(sizeof(u8) * size);
