@@ -304,10 +304,24 @@ int ftp_vfs_rename(const char* source, const char* destination)
     FsDirEntryType type;
     Result result = fsFsGetEntryType(sourceFs, nativeSource, &type);
     if (R_SUCCEEDED(result)) {
-        if (type == FsDirEntryType_File)
+        if (type == FsDirEntryType_File) {
             result = fsFsRenameFile(sourceFs, nativeSource, nativeDestination);
-        else
+            /* FTP RNTO replaces an existing file, but the console FS refuses to
+             * rename onto an existing path. Only after a failed rename, and only
+             * when a file destination really exists, drop it and retry -- so a
+             * "source missing" failure can never delete the destination. */
+            if (R_FAILED(result)) {
+                FsDirEntryType destinationType;
+                if (R_SUCCEEDED(fsFsGetEntryType(sourceFs, nativeDestination, &destinationType))
+                    && destinationType == FsDirEntryType_File) {
+                    Result removed = fsFsDeleteFile(sourceFs, nativeDestination);
+                    if (R_SUCCEEDED(removed))
+                        result = fsFsRenameFile(sourceFs, nativeSource, nativeDestination);
+                }
+            }
+        } else {
             result = fsFsRenameDirectory(sourceFs, nativeSource, nativeDestination);
+        }
     }
     return R_SUCCEEDED(result) ? 0 : setFsError(result);
 }

@@ -1213,6 +1213,46 @@ Result peekVerified(u64 offset, u64 size, u8* out, u8* scratch, u32 attempts, bo
     return sawMismatch ? 0 : lastResult;
 }
 
+Result hashRegion(u64 address, u64 size, u32* hash)
+{
+    *hash = 0x811C9DC5u; /* FNV-1a 32-bit offset basis */
+    ProcessMemorySession session;
+    Result rc = processMemoryOpen(&session, debugResultCodes);
+    if (R_FAILED(rc))
+        return rc;
+
+    /* A transient read failure must not abort the whole fingerprint: the caller
+     * compares hashes across time, so a chunk that reads on a retry is still
+     * useful. Only a chunk that keeps failing ends the command. */
+    const u32 chunkAttempts = 3;
+    u8 buffer[4096];
+    u64 done = 0;
+    while (done < size) {
+        u64 chunk = size - done;
+        if (chunk > sizeof(buffer))
+            chunk = sizeof(buffer);
+        Result chunkResult = 0;
+        u32 attempt;
+        for (attempt = 0; attempt < chunkAttempts; attempt++) {
+            chunkResult = processMemoryRead(&session, buffer, address + done, chunk);
+            if (R_SUCCEEDED(chunkResult))
+                break;
+        }
+        if (R_FAILED(chunkResult)) {
+            rc = chunkResult;
+            break;
+        }
+        u64 i;
+        for (i = 0; i < chunk; i++) {
+            *hash ^= buffer[i];
+            *hash *= 0x01000193u; /* FNV-1a 32-bit prime */
+        }
+        done += chunk;
+    }
+    processMemoryClose(&session);
+    return rc;
+}
+
 void peek(u64 offset, u64 size)
 {
     u8* out = malloc(sizeof(u8) * size);

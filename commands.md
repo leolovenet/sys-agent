@@ -383,6 +383,7 @@ search; wait for the terminal status before retrying or closing the session.
 |peekMainMulti  |Reads memory at given absolute addresses  |1. NSOMain-relative offset (0x-hex or decimal)<br>2. amount of bytes to read<br>...<br>n. NSOMain-relative offset (0x-hex or decimal)<br>n+1. amount of bytes to read <br>Return: hex string |peekMulti 0x45075880 344 0x45097552 344 0x45774450 344  |
 |peekVerified / peekAbsoluteVerified / peekMainVerified|Verified read: reads the range twice, retrying until two consecutive reads agree (default 3 attempts, max 16), so "read returned zeros" is distinguishable from a failed read. `OK addr=... size=... attempts=... data=<hex>`, or `ERR code=READ_FAILED result=...` / `ERR code=READ_UNSTABLE`|same as the corresponding `peek` command, plus optional `attempts N` (1..16)|`peekAbsoluteVerified 0x45075880 0x10 attempts=5`|
 |memoryQuery|Queries the memory mapping covering an address (svcQueryMemory semantics): `OK addr=... base=... size=... type=... typeName=... attr=... perm=... permName=...`, or `ERR code=QUERY_FAILED`|absolute address (0x-hex or decimal)|`memoryQuery 0x2C1A400000`|
+|memoryHash|FNV-1a 32 fingerprint of an absolute region, read in 4 KiB chunks: `OK addr=... size=... algo=fnv1a32 hash=0x........`, or `ERR code=READ_FAILED`. Compare hashes to find which of several regions changed without pulling the bytes back|1. absolute address (0x-hex or decimal)<br>2. byte count<br>optional: `algo=fnv1a32`|`memoryHash 0x2C1A400000 0x100`|
 
 ### Pointer Reads
 |Command|Description|Parameters|Usage|

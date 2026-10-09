@@ -161,6 +161,7 @@ state.
 
 ```bash
 python3 client/sysagent.py --host switch screen capture --output screen.jpg
+python3 client/sysagent.py --host switch screen capture --output after.jpg --diff before.jpg --json
 python3 client/sysagent.py --host switch screen off
 python3 client/sysagent.py --host switch screen on
 ```
@@ -168,7 +169,10 @@ python3 client/sysagent.py --host switch screen on
 Without `--output`, `screen capture` writes `screenshot-<unix timestamp>.jpg` in the current
 directory and prints the path. The Switch side exposes this as `screenCapture` (legacy name
 `pixelPeek`); the JPEG arrives as a single hex line, which is why the client response buffer
-allows up to 4 MiB.
+allows up to 4 MiB. With `--diff BASELINE`, the capture is compared against the baseline and
+the changed-pixel count, ratio, and bounding box are printed (`--json` for structured output).
+This is the only place the client needs an optional dependency: the comparison uses Pillow
+(`pip install pillow`), and the command fails with a clear message if it is missing.
 
 ## Memory
 
@@ -178,6 +182,8 @@ python3 client/sysagent.py --host switch memory peek-absolute 0x45075880 0x10
 python3 client/sysagent.py --host switch memory peek-absolute-verified 0x45075880 0x10
 python3 client/sysagent.py --host switch memory peek-multi 0x100 0x4 0x200 0x4
 python3 client/sysagent.py --host switch memory query 0x45075880
+python3 client/sysagent.py --host switch memory hash 0x45075880 0x100
+python3 client/sysagent.py --host switch memory dump --start 0x45075880 --size 0x400000 --output region.bin
 python3 client/sysagent.py --host switch memory wait-value 0x45075880 4 DEADBEEF --wait-timeout 30
 python3 client/sysagent.py --host switch memory poke 0x100 DEADBEEF
 python3 client/sysagent.py --host switch memory pointer 0x45097552 0x10
@@ -191,7 +197,14 @@ Memory subcommands are `peek`, `peek-absolute`, `peek-main`, `peek-multi`,
 `peek-absolute-multi`, `peek-main-multi`, `peek-verified`, `peek-absolute-verified`,
 `peek-main-verified`, `query`, `wait-value`, `poke`, `poke-absolute`, `poke-main`,
 `pointer`, `pointer-all`, `pointer-relative`, `pointer-peek`, `pointer-peek-multi`, and
-`pointer-poke`. Addresses and sizes accept decimal or `0x`; data is hex.
+`pointer-poke`, `hash`, and `dump`. Addresses and sizes accept decimal or `0x`; data is hex.
+
+`hash` returns an FNV-1a 32 fingerprint of an absolute region, so "which of these objects
+changed" costs one short reply per object instead of pulling every byte back. `dump` reads an
+absolute region to a local file in verified chunks (1 MiB by default, `--chunk` to change),
+so regions larger than one protocol response can be captured. `query`, `hash`, and the
+verified reads accept `--json` and `--out FILE`; `game status` and `system query` accept them
+too.
 
 `query` reports the mapping covering an address (`base`/`size`/`typeName`/`permName`), so an
 unmapped or read-only address can be told apart from a transient failure before reading or
@@ -334,6 +347,19 @@ python3 client/sysagent.py --host switch raw getVersion
 
 `raw` sends any single-line command and prints the raw response, so future or FTP commands can
 still be driven manually.
+
+## Conventions
+
+Numeric arguments accept `0x`-prefixed hex, decimal, or bare hex, so `10`, `0x10`, and `1A`
+all parse (`0x10` is sixteen); hex byte payloads are always even-length byte pairs with an
+optional `0x` prefix, never decimal. The parser rejects an odd length or a non-hex character
+instead of guessing.
+
+The client keeps one TCP connection to port 6000 and sends one command at a time; the sysmodule
+accepts several simultaneous connections, but each is served serially, so a long command on one
+connection delays another. Read-only commands transparently reconnect after an empty response
+(see the retry note above); command output is a single line of `key=value` fields unless
+`--json` is given.
 
 ## Safety
 

@@ -25,7 +25,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.9.0"
+#define VERSION_S "2.10.0"
 
 typedef enum {
     Active = 0,
@@ -1308,6 +1308,42 @@ int argmain(int argc, char** argv)
         }
         free(out);
         free(scratch);
+        return 0;
+    }
+
+    /* memoryHash <addr> <size> [algo=fnv1a32]: server-side region fingerprint,
+     * so "which of these objects changed" needs 4 bytes per object, not a full
+     * read-back, and is immune to read jitter. */
+    if (!strcmp(argv[0], "memoryHash"))
+    {
+        if (argc != 3 && argc != 4)
+        {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        if (argc == 4 && strcmp(argv[3], "algo=fnv1a32") != 0) {
+            printf("ERR code=UNSUPPORTED_ALGO arg=%s\n", argv[3]);
+            return 0;
+        }
+        u64 address = 0;
+        if (!tryParseStringToInt(argv[1], &address)) {
+            printf("ERR code=INVALID_ADDRESS arg=%s\n", argv[1]);
+            return 0;
+        }
+        u64 size = 0;
+        if (!tryParseStringToInt(argv[2], &size) || size == 0) {
+            printf("ERR code=INVALID_SIZE arg=%s\n", argv[2]);
+            return 0;
+        }
+        u32 hash = 0;
+        Result rc = hashRegion(address, size, &hash);
+        if (R_FAILED(rc)) {
+            printf("ERR code=READ_FAILED addr=0x%lX size=%lu result=0x%X\n",
+                address, size, rc);
+        } else {
+            printf("OK addr=0x%lX size=%lu algo=fnv1a32 hash=0x%08X\n",
+                address, size, hash);
+        }
         return 0;
     }
 

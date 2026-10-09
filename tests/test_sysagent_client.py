@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import socketserver
 import threading
 import time
@@ -145,6 +146,8 @@ class FakeHandler(socketserver.StreamRequestHandler):
             elif command[0] == "memoryQuery":
                 response = ("OK addr=0x2C1A400000 base=0x2C1A400000 size=0x1000 "
                             "type=0x5 typeName=heap attr=0x0 perm=0x3 permName=rw")
+            elif command[0] == "memoryHash":
+                response = "OK addr=0x100 size=4 algo=fnv1a32 hash=0x1234ABCD"
             elif command[0] in {"peekVerified", "peekAbsoluteVerified", "peekMainVerified"}:
                 if state.peek_verify_unstable:
                     response = "ERR code=READ_UNSTABLE addr=0x100 size=4 attempts=3"
@@ -444,6 +447,53 @@ class ClientTests(unittest.TestCase):
         with self.client() as client:
             with self.assertRaisesRegex(SysAgentProtocolError, "disagreed"):
                 client.peek_absolute_verified(0x100, 4)
+
+    def test_memory_hash(self) -> None:
+        with self.client() as client:
+            self.assertEqual(client.memory_hash(0x100, 4)["algo"], "fnv1a32")
+            self.assertEqual(self.server.state.last_command[0], "memoryHash")
+
+    def test_memory_dump_writes_file(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "dump.bin")
+            with self.client() as client:
+                written = client.dump(0x100, 8, path, chunk=4)
+            self.assertEqual(written, 8)
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(), bytes.fromhex("DEADBEEF" * 2))
+
+    def test_json_and_out(self) -> None:
+        import json
+        import tempfile
+        from client.sysagent import main
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "out.json")
+            code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                         "--timeout", "1", "memory", "query", "0x2C1A400000",
+                         "--json", "--out", path])
+            self.assertEqual(code, 0)
+            with open(path, encoding="utf-8") as handle:
+                parsed = json.load(handle)
+            self.assertEqual(parsed["typeName"], "heap")
+
+    def test_image_diff(self) -> None:
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        import tempfile
+        from client.sysagent import image_diff
+        with tempfile.TemporaryDirectory() as temp:
+            baseline = os.path.join(temp, "a.png")
+            current = os.path.join(temp, "b.png")
+            Image.new("RGB", (4, 4), (0, 0, 0)).save(baseline)
+            changed = Image.new("RGB", (4, 4), (0, 0, 0))
+            changed.putpixel((1, 1), (255, 255, 255))
+            changed.save(current)
+            report = image_diff(baseline, current)
+            self.assertEqual(report["changed_pixels"], 1)
+            self.assertEqual(report["bbox"], [1, 1, 2, 2])
 
     def test_read_retries_on_empty_response(self) -> None:
         self.server.state.flaky_peek_remaining = 2

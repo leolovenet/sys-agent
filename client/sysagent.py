@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import re
 import socket
@@ -684,6 +685,12 @@ class SysAgentClient:
         """svcQueryMemory semantics: the mapping type/permission covering an address."""
         return require_ok(self.command(f"memoryQuery 0x{address:X}", retry=True))
 
+    def memory_hash(self, address: int, size: int) -> dict[str, str]:
+        """FNV-1a 32 fingerprint of a region; compare hashes to find what changed."""
+        if size <= 0:
+            raise ValueError("size must be positive")
+        return require_ok(self.command(f"memoryHash 0x{address:X} 0x{size:X}", retry=True))
+
     def peek_verified(self, offset: int, size: int, attempts: int = 3) -> dict[str, str]:
         return require_ok(self.command(
             f"peekVerified 0x{offset:X} 0x{size:X} attempts={attempts}", retry=True))
@@ -725,6 +732,26 @@ class SysAgentClient:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(poll)
+
+    def dump(self, start: int, size: int, output: str, chunk: int = 0x100000) -> int:
+        """Read [start, start+size) with verified reads, writing raw bytes to `output`.
+
+        The sysmodule answers one text line per read, so the client chunks the
+        region (1 MiB by default, well under the 4 MiB response limit) rather than
+        asking for the whole range in one command.
+        """
+        if size <= 0:
+            raise ValueError("size must be positive")
+        if not 0 < chunk <= 0x100000:
+            raise ValueError("chunk must be in 1..0x100000")
+        written = 0
+        with open(output, "wb") as handle:
+            while written < size:
+                this_chunk = min(chunk, size - written)
+                data = self.peek_absolute_verified(start + written, this_chunk)["data"]
+                handle.write(bytes.fromhex(data))
+                written += this_chunk
+        return written
 
     def pointer(self, jumps: Sequence[int]) -> str:
         args = " ".join(f"0x{value:X}" for value in jumps)
@@ -1277,10 +1304,60 @@ def print_fields(response: dict[str, str]) -> None:
     print(" ".join(f"{key}={value}" for key, value in response.items()))
 
 
+def _emit(response: dict[str, str], args: argparse.Namespace) -> None:
+    """Print a response as fields (default), JSON (--json), or to a file (--out)."""
+    if getattr(args, "json", False):
+        payload = json.dumps(response, indent=2, sort_keys=True)
+    else:
+        payload = " ".join(f"{key}={value}" for key, value in response.items())
+    out = getattr(args, "out", None)
+    if out:
+        with open(out, "w", encoding="utf-8") as handle:
+            handle.write(payload + "\n")
+        print(out)
+    else:
+        print(payload)
+
+
 def pair_values(values: Sequence[int]) -> list[tuple[int, int]]:
     if len(values) % 2:
         raise ValueError("expected an even number of arguments")
     return list(zip(values[0::2], values[1::2]))
+
+
+def image_diff(baseline: str, current: str) -> dict[str, object]:
+    """Compare two JPEGs (Pillow) and report the changed ratio and bounding box.
+
+    Pillow is this client's one optional dependency: the standard library cannot
+    decode JPEG, so a real pixel comparison needs it. Without Pillow the caller
+    gets a clear error instead of a bogus result.
+    """
+    try:
+        from PIL import Image, ImageChops
+    except ImportError as error:
+        raise SysAgentProtocolError(
+            "image diff needs Pillow; install it (pip install pillow) or compare "
+            "the JPEGs yourself") from error
+    with Image.open(baseline) as image:
+        first = image.convert("RGB")
+    with Image.open(current) as image:
+        second = image.convert("RGB")
+    if first.size != second.size:
+        return {"same_size": False, "baseline_size": list(first.size),
+                "current_size": list(second.size)}
+    difference = ImageChops.difference(first, second).convert("L")
+    total = first.size[0] * first.size[1]
+    changed = total - difference.histogram()[0]
+    bbox = difference.getbbox()
+    return {
+        "same_size": True,
+        "width": first.size[0],
+        "height": first.size[1],
+        "changed_pixels": changed,
+        "total_pixels": total,
+        "changed_ratio": round(changed / total, 6),
+        "bbox": list(bbox) if bbox else None,
+    }
 
 
 def parse_pointer_chains(tokens: Sequence[str]) -> list[tuple[int, list[int], int]]:
@@ -1401,7 +1478,7 @@ def _cmd_system_capabilities(client: SysAgentClient, args: argparse.Namespace) -
 
 
 def _cmd_system_query(client: SysAgentClient, args: argparse.Namespace) -> None:
-    print_fields(client.system_query(args.query))
+    _emit(client.system_query(args.query), args)
 
 
 def _cmd_process_list(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -1435,7 +1512,16 @@ def _cmd_screenshot(client: SysAgentClient, args: argparse.Namespace) -> None:
     output = args.output or f"screenshot-{int(time.time())}.jpg"
     with open(output, "wb") as image:
         image.write(data)
-    print(output)
+    if not args.diff:
+        print(output)
+        return
+    report = image_diff(args.diff, output)
+    report["baseline"] = args.diff
+    report["current"] = output
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(f"{output} " + " ".join(f"{key}={value}" for key, value in report.items()))
 
 
 def _cmd_peek(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -1463,19 +1549,19 @@ def _cmd_peek_main_multi(client: SysAgentClient, args: argparse.Namespace) -> No
 
 
 def _cmd_memory_query(client: SysAgentClient, args: argparse.Namespace) -> None:
-    print_fields(client.memory_query(args.address))
+    _emit(client.memory_query(args.address), args)
 
 
 def _cmd_peek_verified(client: SysAgentClient, args: argparse.Namespace) -> None:
-    print(client.peek_verified(args.offset, args.size, args.attempts)["data"])
+    _emit(client.peek_verified(args.offset, args.size, args.attempts), args)
 
 
 def _cmd_peek_absolute_verified(client: SysAgentClient, args: argparse.Namespace) -> None:
-    print(client.peek_absolute_verified(args.address, args.size, args.attempts)["data"])
+    _emit(client.peek_absolute_verified(args.address, args.size, args.attempts), args)
 
 
 def _cmd_peek_main_verified(client: SysAgentClient, args: argparse.Namespace) -> None:
-    print(client.peek_main_verified(args.offset, args.size, args.attempts)["data"])
+    _emit(client.peek_main_verified(args.offset, args.size, args.attempts), args)
 
 
 def _cmd_memory_wait_value(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -1486,6 +1572,15 @@ def _cmd_memory_wait_value(client: SysAgentClient, args: argparse.Namespace) -> 
         raise SysAgentProtocolError(
             f"address 0x{args.address:X} did not hold the value within "
             f"{args.wait_timeout:g}s")
+
+
+def _cmd_memory_hash(client: SysAgentClient, args: argparse.Namespace) -> None:
+    _emit(client.memory_hash(args.address, args.size), args)
+
+
+def _cmd_memory_dump(client: SysAgentClient, args: argparse.Namespace) -> None:
+    written = client.dump(args.start, args.size, args.output, args.chunk)
+    print(f"{args.output} ({written} bytes)")
 
 
 def _cmd_game_wait(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -1648,7 +1743,7 @@ def _cmd_game_icon(client: SysAgentClient, args: argparse.Namespace) -> None:
 
 def _cmd_game_status(client: SysAgentClient, args: argparse.Namespace) -> None:
     _require_game_running(client, "game status")
-    print_fields(client.system_query("application"))
+    _emit(client.system_query("application"), args)
 
 
 def _cmd_game_launch_headless(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -1818,6 +1913,14 @@ NO_VERIFY_ARG = Arg("no_verify", "skip the server-side read-back check",
 ATTEMPTS_ARG = Arg("attempts", "verified-read attempts (default 3, max 16)",
                    type=parse_int, default=3, flags=("--attempts",))
 
+# Structured output for result commands.
+JSON_ARG = Arg("json", "print the response as JSON", action="store_true",
+               default=False, flags=("--json",))
+OUT_ARG = Arg("out", "write the response to this file instead of stdout",
+              flags=("--out",), default=None)
+DIFF_ARG = Arg("diff", "compare the capture against this baseline image",
+               flags=("--diff",), default=None)
+
 # Wait primitives poll; these bound the wait and its interval.
 WAIT_TIMEOUT_ARG = Arg("wait_timeout", "seconds to wait (default 60)",
                        type=float, default=60.0, flags=("--wait-timeout",))
@@ -1880,7 +1983,8 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 (Arg("query", "info, time, power, storage, network, network-profile, "
                               "account, or application",
                      choices=("info", "time", "power", "storage", "network",
-                              "network-profile", "account", "application")),)),
+                              "network-profile", "account", "application")),
+                 JSON_ARG, OUT_ARG)),
         Command("process-list", "List running processes (PID:TitleID)", _cmd_process_list,
                 (Arg("offset", "result page offset", type=parse_int, default=0,
                      flags=("--offset",)),
@@ -1911,7 +2015,7 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
 
     CommandGroup("game", "Launch, close, or inspect the running game", (
         Command("status", "Show the running game identity and memory layout",
-               _cmd_game_status),
+                _cmd_game_status, (JSON_ARG, OUT_ARG)),
         Command("wait", "Wait until a game is running", _cmd_game_wait,
                 (WAIT_TIMEOUT_ARG, POLL_ARG)),
         Command("launch-headless", "Experimental: start a game process without showing it "
@@ -1964,21 +2068,33 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 _cmd_peek_main_multi,
                 (Arg("pairs", "address size address size ...", nargs="+", type=parse_int),)),
         Command("query", "Query the memory mapping covering an address", _cmd_memory_query,
-                (Arg("address", "absolute address", type=parse_int),)),
+                (Arg("address", "absolute address", type=parse_int), JSON_ARG, OUT_ARG)),
+        Command("hash", "Fingerprint an absolute region (FNV-1a 32)", _cmd_memory_hash,
+                (Arg("address", "absolute address", type=parse_int),
+                 Arg("size", "byte count", type=parse_int),
+                 JSON_ARG, OUT_ARG)),
+        Command("dump", "Read an absolute region to a local file", _cmd_memory_dump,
+                (Arg("start", "absolute start address", type=parse_int,
+                     flags=("--start",)),
+                 Arg("size", "byte count", type=parse_int, flags=("--size",)),
+                 Arg("output", "write the raw bytes to this path",
+                     flags=("--output",)),
+                 Arg("chunk", "bytes per verified read (default 0x100000)",
+                     type=parse_int, default=0x100000, flags=("--chunk",)))),
         Command("peek-verified", "Verified read relative to the heap", _cmd_peek_verified,
                 (Arg("offset", "heap-relative address", type=parse_int),
                  Arg("size", "byte count", type=parse_int),
-                 ATTEMPTS_ARG)),
+                 ATTEMPTS_ARG, JSON_ARG, OUT_ARG)),
         Command("peek-absolute-verified", "Verified read from an absolute address",
                 _cmd_peek_absolute_verified,
                 (Arg("address", "absolute address", type=parse_int),
                  Arg("size", "byte count", type=parse_int),
-                 ATTEMPTS_ARG)),
+                 ATTEMPTS_ARG, JSON_ARG, OUT_ARG)),
         Command("peek-main-verified", "Verified read relative to the main NSO base",
                 _cmd_peek_main_verified,
                 (Arg("offset", "main-relative address", type=parse_int),
                  Arg("size", "byte count", type=parse_int),
-                 ATTEMPTS_ARG)),
+                 ATTEMPTS_ARG, JSON_ARG, OUT_ARG)),
         Command("wait-value", "Wait until an absolute address holds a value",
                 _cmd_memory_wait_value,
                 (Arg("address", "absolute address", type=parse_int),
@@ -2090,7 +2206,8 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
         Command("capture", "Capture the current screen as a JPEG", _cmd_screenshot,
                 (Arg("output", "write the JPEG to this path "
                                "(default: screenshot-<unix time>.jpg)",
-                     flags=("--output",)),)),
+                     flags=("--output",)),
+                 DIFF_ARG, JSON_ARG)),
         Command("off", "Turn the screen off", _silent("screen_off")),
         Command("on", "Turn the screen on", _silent("screen_on")),
     )),

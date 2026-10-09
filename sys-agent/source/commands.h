@@ -71,6 +71,11 @@ Result pokeVerified(u64 offset, u64 size, u8* val, u8* readback, bool* mismatch,
  * (nonzero Result) are distinguishable. `out` and `scratch` must each hold at
  * least `size` bytes. */
 Result peekVerified(u64 offset, u64 size, u8* out, u8* scratch, u32 attempts, bool* agreed);
+/* FNV-1a 32-bit fingerprint over [address, address+size), read in bounded
+ * chunks with a retry per chunk. Returns the failing read Result when a chunk
+ * cannot be read at all (hash is then invalid), or 0. Lets a caller tell "this
+ * region changed" without pulling the bytes back. */
+Result hashRegion(u64 address, u64 size, u32* hash);
 void peek(u64 offset, u64 size);
 void peekInfinite(u64 offset, u64 size);
 void peekMulti(u64* offset, u64* size, u64 count);

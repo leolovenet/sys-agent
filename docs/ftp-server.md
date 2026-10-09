@@ -6,16 +6,22 @@ The custom sys-agent branch contains a working FTP service for full SD-card CRUD
 leaving the running game. The core file operations, lifecycle controls, interruption cleanup,
 and coexistence with the original TCP service have passed real-device testing.
 
-Two acceptance checks remain before describing the FTP work as fully closed:
-
-1. Deploy and cold-boot test the build that automatically retries FTP startup after the
-   Switch network stack is not ready during sysmodule boot. The earlier diagnostic build
-   recovered with `ftpStart`; the current source retries after one second automatically.
-2. Run FTP concurrently with an active C-level memory search and verify the protection of
-   `/switch/sys-agent/search`, SD contention, status latency, and cancellation on hardware.
-
-These checks do not block ordinary FTP use, but they must be completed before making a final
+One acceptance check remains before describing the FTP work as fully closed: run FTP
+concurrently with an active C-level memory search and verify the protection of
+`/switch/sys-agent/search`, SD contention, status latency, and cancellation on hardware.
+This does not block ordinary FTP use, but it must be completed before making a final
 release-quality claim.
+
+Cold-boot startup is observable and retried: the worker keeps `desiredRunning` set and calls
+`ftpsrv_init` again one second after a failed bind, so a boot window where the network stack
+is not ready yet heals on its own. `ftpStatus` now reports `listener=up/down`,
+`bindAttempts`, and `lastBindError`, and a post-reboot check showed `bindAttempts=3` with
+`listener=up` -- the retry loop engaging before the listener came up. An earlier report of
+"port 6000 answers but 6001 times out" was not reproduced; the post-reboot outage observed
+during validation was the whole console dropping off Wi-Fi (both ports unreachable, both
+recovering together two minutes later), which is a network-level condition rather than a
+listener-level one. The listener-level report therefore stays open for a dedicated
+reproduction.
 
 ## Architecture
 
@@ -66,9 +72,11 @@ ftpReload
 ```
 
 They are asynchronous and additive, so existing sys-agent clients remain compatible.
-`ftpStatus` reports lifecycle state, clients, transfers, byte counters, the effective
-`use_localtime` setting, the lifecycle error, and `lastFsResult` for the latest native
-filesystem error. Complete syntax and configuration rules are in `commands.md`.
+`ftpStatus` reports lifecycle state, whether the listener is bound (`listener=up/down`), the
+`ftpsrv_init` attempt count and last bind error (`bindAttempts`, `lastBindError`), the active
+transfer count, byte counters, the effective `use_localtime` setting, the lifecycle error,
+and `lastFsResult` for the latest native filesystem error. Complete syntax and configuration
+rules are in `commands.md`.
 
 Anonymous access grants complete read, create, upload, append, rename, and delete rights over
 the SD card. Use it only on a trusted network. Stop or reconfigure any old sys-ftpd instance
@@ -86,6 +94,21 @@ While a C-level search is queued or running, FTP mutations under
 `/switch/sys-agent/search` are rejected. Reads there and operations elsewhere remain
 available. This prevents FTP from corrupting the search generation transaction. The remaining
 hardware concurrency acceptance test is listed in the status section above.
+
+## Rename and SIZE behaviour
+
+`RNTO` replaces an existing file. The console filesystem refuses to rename onto an existing
+path, so the SD VFS first tries the rename; only when that fails and a *file* destination
+really exists does it delete that destination and retry once. A rename that fails for any
+other reason (for example a missing source) therefore never deletes the destination.
+Directories keep the original non-overwriting behaviour.
+
+`SIZE` returns the open file's logical size. Treat it as advisory: a client that queries a
+file while it is still being uploaded can observe the size the SD VFS preallocated in 1 MiB
+increments rather than the bytes written so far. Verify transfers by content (compare the
+bytes or a hash after close) rather than trusting `SIZE` alone. The off-by-a-few-bytes
+`SIZE` report was not reproduced during validation; size-verified 16 MiB uploads matched
+exactly.
 
 ## Real-device validation
 
