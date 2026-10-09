@@ -19,9 +19,10 @@ HiddbgHdlsState controllerState = { 0 };
  * controllers: 0 = leave it alone (default: a connected Joy-Con and the virtual
  * pad can both drive the game, and kicking the player's controller leaves it
  * disconnected until it is re-synced), 1 = disconnect that controller and
- * rebuild our device, 2 = also accept the system's "press L+R / A" overlay with
- * a short virtual A. 1/2 are experimental. */
-u64 controllerTakeoverMode = 2;
+ * rebuild our device so HOS routes us. The value 2 is accepted and behaves like
+ * 1: the short confirming A was removed after measuring that the takeover works
+ * without it. */
+u64 controllerTakeoverMode = 1;
 /* The virtual pad always presents itself as a Bluetooth Pro Controller. */
 #define CONTROLLER_INTERFACE_TYPE HidNpadInterfaceType_Bluetooth
 static Result controllerLastStateError = 0;
@@ -31,7 +32,6 @@ static s32 controllerRealPadSample = -1;
 static s32 controllerRealPadRailSample = 0;
 static u64 controllerTopologySignature(void);
 static s32 kickControllerSlotHolders(void);
-static void acceptControllerOverlayLocked(void);
 static bool parseBluetoothAddress(const char* text, BtdrvAddress* out);
 Mutex controllerMutex;
 
@@ -75,9 +75,32 @@ static BtdrvAddress controllerSavedAddr[CONTROLLER_SAVED_ADDR_MAX];
 static s32 controllerSavedAddrCount = 0;
 static s32 controllerReconnectAttempts = 0;
 static u64 controllerReconnectNextTick = 0;
+/* armGetSystemTick() of the first pass of the current retry run; it only feeds the
+ * debug line, which is why it follows the run instead of the kick. */
+static u64 controllerReconnectStartTick = 0;
+
+/* Adds one address to the list the reconnect service pulls back. Returns false
+ * when it was already queued. A full list drops its oldest entry, because a
+ * manually requested address must never be silently ignored. */
+static bool controllerRememberAddressLocked(const BtdrvAddress* addr)
+{
+    for (s32 i = 0; i < controllerSavedAddrCount; i++) {
+        if (memcmp(&controllerSavedAddr[i], addr, sizeof *addr) == 0)
+            return false;
+    }
+    if (controllerSavedAddrCount >= CONTROLLER_SAVED_ADDR_MAX) {
+        memmove(&controllerSavedAddr[0], &controllerSavedAddr[1],
+                sizeof(BtdrvAddress) * (CONTROLLER_SAVED_ADDR_MAX - 1));
+        controllerSavedAddrCount = CONTROLLER_SAVED_ADDR_MAX - 1;
+    }
+    controllerSavedAddr[controllerSavedAddrCount++] = *addr;
+    return true;
+}
 
 static void controllerSaveAddress(HidsysUniquePadId pad)
 {
+    /* A full list means a reclaim is already queued for as many controllers as
+     * this kick can hold, so this pad simply is not added. */
     if (controllerSavedAddrCount >= CONTROLLER_SAVED_ADDR_MAX)
         return;
 
@@ -86,14 +109,12 @@ static void controllerSaveAddress(HidsysUniquePadId pad)
     if (R_FAILED(hidsysGetUniquePadBluetoothAddress(pad, &addr)))
         return;
 
-    for (s32 i = 0; i < controllerSavedAddrCount; i++) {
-        if (memcmp(&controllerSavedAddr[i], &addr, sizeof addr) == 0)
-            return;
-    }
-    controllerSavedAddr[controllerSavedAddrCount++] = addr;
+    if (!controllerRememberAddressLocked(&addr))
+        return;
     /* A new kick starts a fresh retry budget for the reconnect passes. */
     controllerReconnectAttempts = 0;
     controllerReconnectNextTick = 0;
+    controllerReconnectStartTick = 0;
 }
 
 /* btdrv sessions are opened per use: the guard in libnx only re-opens when the
@@ -108,32 +129,80 @@ static bool controllerBtdrvAcquire(void)
 /* Bring back the controllers a takeover disconnected. They stay paired but never
  * page the console again on their own (a button press, even SYNC, does nothing
  * until they are re-seated on the rail), so the console has to trigger the
- * connection itself. The first trigger often returns a "link busy" error for the
- * second controller of a pair, so this runs from the main loop and retries
- * failed addresses on later passes - never blocking command handling. */
-#define CONTROLLER_RECONNECT_RETRIES 3
-#define CONTROLLER_RECONNECT_INTERVAL_NS 1500000000ULL
+ * connection itself. The adapter pages one link at a time, so the second
+ * controller of a pair answers "link busy" (`0x2F4471`) until the first link has
+ * finished establishing; measured on hardware that window is 0.5-1.3 s, and a page
+ * that is never accepted inside it leaves that controller offline for good. This
+ * runs from the main loop and retries the failed addresses on later passes, so it
+ * never blocks command handling. */
+#define CONTROLLER_RECONNECT_FAST_RETRIES 40
+#define CONTROLLER_RECONNECT_RETRIES (CONTROLLER_RECONNECT_FAST_RETRIES + 3)
+
+/* Gap before the next reconnect pass, in nanoseconds. "Link busy" clears with the
+ * first link, so the whole busy window is polled at the main loop cadence (~50 ms)
+ * instead of waiting it out; only the tail backs off, for a controller that is
+ * slower than anything measured so far. */
+static u64 controllerReconnectGapNs(s32 attempt)
+{
+    if (attempt <= CONTROLLER_RECONNECT_FAST_RETRIES)
+        return 50000000ULL;
+    if (attempt == CONTROLLER_RECONNECT_FAST_RETRIES + 1)
+        return 250000000ULL;
+    return 600000000ULL;
+}
 
 void controllerServiceReconnect(void)
 {
+    /* The address list is written by the takeover (which can run on the click
+     * thread for clickSeq) and read/cleared here, so everything below happens
+     * under the controller lock. The btdrv trigger calls only queue the page -
+     * they return in milliseconds - so the lock is held briefly. */
+    mutexLock(&controllerMutex);
+
     if (controllerSavedAddrCount == 0)
+    {
+        mutexUnlock(&controllerMutex);
         return;
+    }
 
     u64 now = armGetSystemTick();
-    if (controllerReconnectNextTick != 0 && now < controllerReconnectNextTick)
+
+    /* Hold the trigger for as long as our device holds the slot: the takeover
+     * disconnected that controller on purpose, and a page issued while the slot is
+     * occupied was measured to be accepted without ever registering the controller
+     * (while still consuming the retry budget). The yield re-enters this service on
+     * the next loop tick, so the reclaim starts immediately after it. */
+    if (bControllerIsInitialised)
+    {
+        mutexUnlock(&controllerMutex);
         return;
+    }
+
+    if (controllerReconnectNextTick != 0 && now < controllerReconnectNextTick)
+    {
+        mutexUnlock(&controllerMutex);
+        return;
+    }
 
     if (!controllerBtdrvAcquire()) {
         controllerSavedAddrCount = 0;
         controllerReconnectAttempts = 0;
         controllerReconnectNextTick = 0;
+        controllerReconnectStartTick = 0;
+        mutexUnlock(&controllerMutex);
         return;
     }
+
+    if (controllerReconnectAttempts == 0)
+        controllerReconnectStartTick = now;
 
     BtdrvAddress retry[CONTROLLER_SAVED_ADDR_MAX];
     s32 retryCount = 0;
     for (s32 i = 0; i < controllerSavedAddrCount && i < CONTROLLER_SAVED_ADDR_MAX; i++) {
         Result rc = btdrvTriggerConnection(controllerSavedAddr[i], 5000);
+        if (debugResultCodes && R_FAILED(rc))
+            printf("  ctrl trigger[%d] rc=0x%08X t=%llums\n", i, rc,
+                   (unsigned long long)(armTicksToNs(armGetSystemTick() - controllerReconnectStartTick) / 1000000ULL));
         /* A controller that is already connected also reports an error. */
         if (R_FAILED(rc))
             retry[retryCount++] = controllerSavedAddr[i];
@@ -142,17 +211,25 @@ void controllerServiceReconnect(void)
         memcpy(controllerSavedAddr, retry, sizeof(BtdrvAddress) * retryCount);
     controllerSavedAddrCount = retryCount;
     controllerReconnectAttempts++;
+    if (debugResultCodes)
+        printf("ctrl reconnect: pass=%d pending=%d t=%llums\n",
+               controllerReconnectAttempts, controllerSavedAddrCount,
+               (unsigned long long)(armTicksToNs(armGetSystemTick() - controllerReconnectStartTick) / 1000000ULL));
 
     if (controllerSavedAddrCount == 0 || controllerReconnectAttempts >= CONTROLLER_RECONNECT_RETRIES) {
         controllerSavedAddrCount = 0;
         controllerReconnectAttempts = 0;
         controllerReconnectNextTick = 0;
+        controllerReconnectStartTick = 0;
         btdrvExit();
+        mutexUnlock(&controllerMutex);
         return;
     }
 
-    u64 intervalTicks = CONTROLLER_RECONNECT_INTERVAL_NS * armGetSystemTickFreq() / 1000000000ULL;
+    u64 gapNs = controllerReconnectGapNs(controllerReconnectAttempts);
+    u64 intervalTicks = gapNs * armGetSystemTickFreq() / 1000000000ULL;
     controllerReconnectNextTick = now + intervalTicks;
+    mutexUnlock(&controllerMutex);
 }
 
 //Keyboard:
@@ -319,6 +396,46 @@ static void teardownControllerLocked(void)
     controllerRealPadSampleTick = 0;
 }
 
+/* Number of pads hidsys reports for player 1, or -1 when it does not answer. */
+static s32 controllerPlayer1PadCount(void)
+{
+    if (!controllerHidsysAcquire())
+        return -1;
+
+    HidsysUniquePadId pads[8];
+    s32 total = 0;
+    memset(pads, 0, sizeof pads);
+    Result rc = hidsysGetUniquePadsFromNpad(HidNpadIdType_No1, pads, 8, &total);
+    controllerHidsysDropOnFailure(rc);
+    return R_SUCCEEDED(rc) ? total : -1;
+}
+
+#define CONTROLLER_SETTLE_MIN_NS 50000000ULL
+#define CONTROLLER_SETTLE_MAX_NS 150000000ULL
+#define CONTROLLER_SETTLE_STEP_NS 5000000ULL
+
+/* Attach settle. HOS needs a moment before a freshly attached device is routed
+ * and a state write before that loses the input, so wait until player 1 gained
+ * a pad (measured: one to two frames). Keep a 50 ms floor and the previous
+ * 150 ms ceiling for the case where HOS never routes it. */
+static void controllerWaitForAttachLocked(s32 padsBefore)
+{
+    u64 freq = armGetSystemTickFreq();
+    u64 start = armGetSystemTick();
+    u64 minTicks = CONTROLLER_SETTLE_MIN_NS * freq / 1000000000ULL;
+    u64 maxTicks = CONTROLLER_SETTLE_MAX_NS * freq / 1000000000ULL;
+
+    while (armGetSystemTick() - start < maxTicks) {
+        svcSleepThread(CONTROLLER_SETTLE_STEP_NS);
+        if (armGetSystemTick() - start < minTicks)
+            continue;
+        if (padsBefore < 0)
+            break; /* hidsys unavailable: keep the floor only */
+        if (controllerPlayer1PadCount() > padsBefore)
+            break; /* our device is routed: ready to accept state */
+    }
+}
+
 static void initControllerLocked()
 {
     if (bControllerIsInitialised) return;
@@ -357,14 +474,22 @@ static void initControllerLocked()
     rc = hiddbgAttachHdlsWorkBuffer(&sessionId, workmem, workmem_size);
     if (R_FAILED(rc) && debugResultCodes)
         printf("hiddbgAttachHdlsWorkBuffer: %d\n", rc);
+    s32 padsBefore = controllerPlayer1PadCount();
+    u64 tAttachStart = armGetSystemTick();
     rc = hiddbgAttachHdlsVirtualDevice(&controllerHandle, &controllerDevice);
     if (R_FAILED(rc) && debugResultCodes)
         printf("hiddbgAttachHdlsVirtualDevice: %d\n", rc);
+    u64 tDeviceAttached = armGetSystemTick();
     // HOS and the running game need a moment to pick up a freshly attached
-    // device. Without this settle time the first state write after a rebuild is
-    // accepted but not routed, so the first click after a topology change is
-    // silently dropped.
-    svcSleepThread(150 * 1e+6L);
+    // device; without it the first state write is accepted but not routed, so
+    // the first click after a topology change would be silently dropped.
+    controllerWaitForAttachLocked(padsBefore);
+    if (debugResultCodes) {
+        printf("ctrl attach: device=%llums settle=%llums padsBefore=%d padsNow=%d\n",
+               (unsigned long long)(armTicksToNs(tDeviceAttached - tAttachStart) / 1000000ULL),
+               (unsigned long long)(armTicksToNs(armGetSystemTick() - tDeviceAttached) / 1000000ULL),
+               padsBefore, controllerPlayer1PadCount());
+    }
     rc = hiddbgSetHdlsState(controllerHandle, &controllerState);
     if (R_FAILED(rc) && debugResultCodes)
         printf("hiddbgSetHdlsState: %d\n", rc);
@@ -386,17 +511,12 @@ static bool ensureControllerLocked(void)
     /* Fresh attach. If one of the console's own controllers holds player 1, the
      * user's policy is to take the slot over instead of fighting for it: the
      * virtual pad is a disposable input source and must win while it is used. */
-    s32 kicked = 0;
     if (controllerTakeoverMode >= 1)
-        kicked = kickControllerSlotHolders();
+        kickControllerSlotHolders();
 
     teardownControllerLocked();
     initControllerLocked();
-
-    bool attached = controllerDeviceIsAttachedLocked();
-    if (attached && kicked > 0 && controllerTakeoverMode >= 2)
-        acceptControllerOverlayLocked();
-    return attached;
+    return controllerDeviceIsAttachedLocked();
 }
 
 void detachController()
@@ -430,12 +550,17 @@ void detachController()
 static u64 controllerLastInputTick = 0;
 static u64 controllerLastRefreshTick = 0;
 
-/* Seconds of "no input command at all" after which the virtual device is
+/* Milliseconds of "no input command at all" after which the virtual device is
  * released so the console's own controllers can take the player slot back.
  * Only used while a real controller is connected: with no controller of its own
  * the console has nothing to hand the player slot to, and releasing would just
- * leave the game asking for a controller. 0 disables the release. */
-u64 controllerIdleReleaseSeconds = 1;
+ * leave the game asking for a controller.
+ *
+ * This is the whole "the player's controller is offline" delay before the reclaim
+ * starts, so it is kept in milliseconds: a burst of commands has to stay inside it
+ * (otherwise every gap costs a kick + two Bluetooth links), while a single action
+ * wants it as small as possible. 0 disables the release. */
+u64 controllerIdleReleaseMs = 1000;
 
 /* Set when a takeover disconnected one of the console's own controllers: the
  * player clearly has a controller, so the slot must be handed back after use
@@ -506,7 +631,7 @@ void controllerServiceIdle(void)
     if (!bControllerIsInitialised)
         return;
 
-    if (controllerIdleReleaseSeconds == 0)
+    if (controllerIdleReleaseMs == 0)
         return;
 
     /* Hand the player slot back only when the player has a controller that can
@@ -524,7 +649,7 @@ void controllerServiceIdle(void)
     mutexLock(&controllerMutex);
     bool idle = controllerLastInputTick == 0 ||
                 armTicksToNs(now - controllerLastInputTick) >=
-                    controllerIdleReleaseSeconds * 1000000000ULL;
+                    controllerIdleReleaseMs * 1000000ULL;
     bool neutralState = controllerState.buttons == 0 &&
                         controllerState.analog_stick_l.x == 0 && controllerState.analog_stick_l.y == 0 &&
                         controllerState.analog_stick_r.x == 0 && controllerState.analog_stick_r.y == 0;
@@ -765,12 +890,12 @@ void controllerStatusCommand(void)
         }
     }
 
-    printf("OK initialised=%d handle=%016lX session=%016lX attached=%d deviceType=0x%02X interface=%d(%s) idleRelease=%lu takeover=%lu slot=%d assignmentRc=0x%08X lastStateError=0x%08X npad0=",
+    printf("OK initialised=%d handle=%016lX session=%016lX attached=%d deviceType=0x%02X interface=%d(%s) idleRelease=%lums takeover=%lu slot=%d assignmentRc=0x%08X lastStateError=0x%08X npad0=",
            initialised, controllerHandle.handle, sessionId.id,
            initialised ? controllerDeviceIsAttachedLocked() : false,
            (u8)controllerInitializedType, (u8)CONTROLLER_INTERFACE_TYPE,
            controllerInterfaceName((u8)CONTROLLER_INTERFACE_TYPE),
-           controllerIdleReleaseSeconds, controllerTakeoverMode,
+           controllerIdleReleaseMs, controllerTakeoverMode,
            slot, assignmentRc, controllerLastStateError);
     if (!npad0Queried)
         printf("NA\n");
@@ -789,12 +914,12 @@ void controllerDumpCommand(void)
      * hid:dbg tables need our work buffer session, so they are skipped when no
      * device is attached; the hidsys view below still works. */
     bool initialised = bControllerIsInitialised;
-    printf("OK initialised=%d handle=%016lX session=%016lX attached=%d deviceType=0x%02X interface=%d(%s) idleRelease=%lu takeover=%lu topology=0x%lX lastStateError=0x%08X\n",
+    printf("OK initialised=%d handle=%016lX session=%016lX attached=%d deviceType=0x%02X interface=%d(%s) idleRelease=%lums takeover=%lu topology=0x%lX lastStateError=0x%08X\n",
            initialised, controllerHandle.handle, sessionId.id,
            initialised ? controllerDeviceIsAttachedLocked() : false,
            (u8)controllerInitializedType, (u8)CONTROLLER_INTERFACE_TYPE,
            controllerInterfaceName((u8)CONTROLLER_INTERFACE_TYPE),
-           controllerIdleReleaseSeconds, controllerTakeoverMode,
+           controllerIdleReleaseMs, controllerTakeoverMode,
            controllerTopology, controllerLastStateError);
 
     if (initialised) {
@@ -839,7 +964,11 @@ void controllerKickCommand(const char* arg)
     Result rc = hidsysGetUniquePadsFromNpad((HidNpadIdType)npadId, pads, 8, &total);
     printf("OK npad=%d pads=%d listRc=0x%08X\n", npadId, total, rc);
     for (s32 i = 0; i < total; i++) {
+        /* The remembered-address list belongs to the reconnect service, which
+         * reads it on every main-loop tick. */
+        mutexLock(&controllerMutex);
         controllerSaveAddress(pads[i]);
+        mutexUnlock(&controllerMutex);
         Result disconnectRc = hidsysDisconnectUniquePad(pads[i]);
         printf("  pad=%016lX disconnectRc=0x%08X\n", pads[i].id, disconnectRc);
     }
@@ -858,33 +987,48 @@ void controllerReconnectCommand(const char* arg, const char* addrArg)
     if (timeout == 0)
         timeout = 5000;
 
-    /* An explicit address overrides the remembered list (useful when the
-     * controller was never kicked by this boot, e.g. after a reboot). */
+    /* An explicit address is added to the remembered list, so the main loop keeps
+     * retrying it too (useful when the controller was never kicked by this boot,
+     * e.g. after a reboot). It never replaces the addresses a takeover queued. */
     bool explicitAddress = false;
+    BtdrvAddress pending[CONTROLLER_SAVED_ADDR_MAX];
+    s32 pendingCount = 0;
+    memset(pending, 0, sizeof pending);
+
+    mutexLock(&controllerMutex);
     if (addrArg != NULL && addrArg[0] != 0) {
         BtdrvAddress addr;
         memset(&addr, 0, sizeof addr);
         if (!parseBluetoothAddress(addrArg, &addr)) {
+            mutexUnlock(&controllerMutex);
             printf("ERR controllerReconnect invalidAddress=%s\n", addrArg);
             printf("END controllerReconnect\n");
             fflush(stdout);
             return;
         }
-        controllerSavedAddr[0] = addr;
-        controllerSavedAddrCount = 1;
+        controllerRememberAddressLocked(&addr);
         controllerReconnectAttempts = 0;
         controllerReconnectNextTick = 0;
+        controllerReconnectStartTick = 0;
         explicitAddress = true;
     }
 
-    printf("OK saved=%d timeout=%u\n", controllerSavedAddrCount, timeout);
-    for (s32 i = 0; i < controllerSavedAddrCount; i++) {
-        const u8* a = controllerSavedAddr[i].address;
+    /* Work on a snapshot: the triggers below may take a moment and the address
+     * list can be rewritten by a kick running on the click thread. */
+    pendingCount = controllerSavedAddrCount;
+    if (pendingCount > CONTROLLER_SAVED_ADDR_MAX)
+        pendingCount = CONTROLLER_SAVED_ADDR_MAX;
+    memcpy(pending, controllerSavedAddr, sizeof(BtdrvAddress) * pendingCount);
+    mutexUnlock(&controllerMutex);
+
+    printf("OK saved=%d timeout=%u\n", pendingCount, timeout);
+    for (s32 i = 0; i < pendingCount; i++) {
+        const u8* a = pending[i].address;
         printf("  addr[%d]=%02X:%02X:%02X:%02X:%02X:%02X\n",
                i, a[0], a[1], a[2], a[3], a[4], a[5]);
     }
 
-    if (controllerSavedAddrCount == 0) {
+    if (pendingCount == 0) {
         printf("ERR controllerReconnect noSavedAddresses (run controllerKick first, or pass an address)\n");
         printf("END controllerReconnect\n");
         fflush(stdout);
@@ -898,19 +1042,18 @@ void controllerReconnectCommand(const char* arg, const char* addrArg)
         return;
     }
 
-    for (s32 i = 0; i < controllerSavedAddrCount; i++) {
+    for (s32 i = 0; i < pendingCount; i++) {
         SetSysBluetoothDevicesSettings info;
         memset(&info, 0, sizeof info);
-        Result pairedRc = btdrvGetPairedDeviceInfo(controllerSavedAddr[i], &info);
-        Result triggerRc = btdrvTriggerConnection(controllerSavedAddr[i], timeout);
+        Result pairedRc = btdrvGetPairedDeviceInfo(pending[i], &info);
+        Result triggerRc = btdrvTriggerConnection(pending[i], timeout);
         printf("  addr[%d] pairedRc=0x%08X triggerRc=0x%08X\n", i, pairedRc, triggerRc);
         fflush(stdout);
     }
 
     if (explicitAddress) {
-        controllerSavedAddrCount = 0;
-        controllerReconnectAttempts = 0;
-        controllerReconnectNextTick = 0;
+        /* Skip the clearing below: the list must keep the explicit address (and
+         * anything a takeover queued in the meantime) so the service retries it. */
         btdrvExit();
         printf("END controllerReconnect\n");
         fflush(stdout);
@@ -1142,10 +1285,16 @@ static s32 kickControllerSlotHolders(void)
         return 0;
 
     s32 kicked = 0;
+    u64 kickStart = armGetSystemTick();
     for (s32 i = 0; i < total; i++) {
         controllerSaveAddress(pads[i]);
         if (R_SUCCEEDED(hidsysDisconnectUniquePad(pads[i])))
             kicked++;
+    }
+    if (debugResultCodes && kicked > 0) {
+        printf("ctrl kick: %llums for %d pad(s)\n",
+               (unsigned long long)(armTicksToNs(armGetSystemTick() - kickStart) / 1000000ULL),
+               kicked);
     }
     if (kicked > 0) {
         // Remember that the player has a controller: the slot has to go back
@@ -1154,19 +1303,6 @@ static s32 kickControllerSlotHolders(void)
         controllerRealPadSampleTick = 0;
     }
     return kicked;
-}
-
-/* The system shows its "press L+R, then A" controller overlay as soon as the
- * player's own controller disappears - which is exactly what kicking it causes.
- * A short A confirms that overlay so the game keeps running. Only sent right
- * after a kick, where the overlay is expected. */
-static void acceptControllerOverlayLocked(void)
-{
-    controllerState.buttons |= HidNpadButton_A;
-    hiddbgSetHdlsState(controllerHandle, &controllerState);
-    svcSleepThread(buttonClickSleepTime * 1e+6L);
-    controllerState.buttons &= ~HidNpadButton_A;
-    hiddbgSetHdlsState(controllerHandle, &controllerState);
 }
 
 /* Pushes the current virtual-controller state to HOS.
@@ -1182,14 +1318,11 @@ static void writeControllerStateLocked(void)
 
     Result rc = hiddbgSetHdlsState(controllerHandle, &controllerState);
     if (R_FAILED(rc)) {
-        s32 kicked = 0;
         if (controllerTakeoverMode >= 1)
-            kicked = kickControllerSlotHolders();
+            kickControllerSlotHolders();
         teardownControllerLocked();
         initControllerLocked();
         rc = hiddbgSetHdlsState(controllerHandle, &controllerState);
-        if (R_SUCCEEDED(rc) && kicked > 0 && controllerTakeoverMode >= 2)
-            acceptControllerOverlayLocked();
     }
 
     if (R_FAILED(rc)) {
@@ -1369,7 +1502,7 @@ void clickSequence(char* seq, u8* token)
     u64 currentWait = 0;
 
     mutexLock(&controllerMutex);
-    initControllerLocked();
+    ensureControllerLocked();
     mutexUnlock(&controllerMutex);
     controllerSequenceActive = true;
     while (command != NULL)

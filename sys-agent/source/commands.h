@@ -2,7 +2,7 @@
 
 extern bool bControllerIsInitialised;
 extern HidDeviceType controllerInitializedType;
-extern u64 controllerIdleReleaseSeconds;
+extern u64 controllerIdleReleaseMs;
 extern u64 controllerTakeoverMode;
 extern HiddbgHdlsHandle controllerHandle;
 extern HiddbgHdlsDeviceInfo controllerDevice;

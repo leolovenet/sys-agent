@@ -121,15 +121,20 @@ python3 client/sysagent.py --host switch controller kick 0
 
 `controller paired` lists the console's paired Bluetooth devices, which separates "the pairing is
 gone" from "the console is not connecting it". `controller reconnect [ms] [addr]` triggers
-`btdrvTriggerConnection` for the controllers a takeover disconnected (or for one explicit
-address); a Bluetooth controller that the console disconnected never pages back on its own - not
+`btdrvTriggerConnection` for the controllers a takeover disconnected, and an explicit address is
+added to that list rather than replacing it; a Bluetooth controller that the console
+disconnected never pages back on its own - not
 even with SYNC - so this is the only way to pull it back without re-seating it on the rail.
 `controller kick <0-7>` performs the takeover's first step manually.
 
 The virtual controller rebuilds after controller topology changes, takes player 1 over
-(`configure controllerTakeover`, default 2) when the player's own controller holds it, releases
-the slot `configure controllerIdleRelease` seconds (default 1) after use, and pulls the
-disconnected controller back automatically; with nothing to yield to it simply stays attached,
+via a takeover (`configure controllerTakeover`, default 1: disconnect the holding controller,
+rebuild and retry - no synthetic button press) when the player's own controller holds it, releases
+the slot `configure controllerIdleRelease` seconds (default 1; `controllerIdleReleaseMs` for
+sub-second values, which is the wait in front of the reconnect) after use, and pulls the
+disconnected controller back automatically (the adapter pages one link at a time, so the second
+controller of a pair is retried at the main loop rate until the first link has established, which
+measured 0.5-1.3 s); with nothing to yield to it simply stays attached,
 and a state write that stays refused is reported once as `ERR controllerState …`.
 Mechanism, evidence and the remaining system limits are in
 `docs/hdls-virtual-controller-notes.md`.
@@ -225,13 +230,20 @@ python3 client/sysagent.py --host switch utility title-id
 python3 client/sysagent.py --host switch utility is-program-running 0x01006F8002326000
 python3 client/sysagent.py --host switch utility charge
 python3 client/sysagent.py --host switch config set freezeRate 10
+python3 client/sysagent.py --host switch config get controllerIdleReleaseMs
+python3 client/sysagent.py --host switch config list
 ```
 
 Utility subcommands are `version`, `title-id`, `title-version`, `system-language`, `build-id`,
-`heap-base`, `main-nso-base`, `is-program-running`, `charge`, and `fd-count`. `config set`
-validates the known parameters
-(`mainLoopSleepTime`, `buttonClickSleepTime`, `echoCommands`, `printDebugResultCodes`,
-`keySleepTime`, `fingerDiameter`, `pollRate`, `freezeRate`, `controllerType`).
+`heap-base`, `main-nso-base`, `is-program-running`, `charge`, and `fd-count`.
+
+`config set` validates the known parameters and changes one; `config get <parameter>` and
+`config list` read the values back from the sysmodule, so there is no need to remember what a
+setting currently is. `controllerIdleRelease` is a write-only alias in seconds: reading it
+reports `controllerIdleReleaseMs`, which is the value the sysmodule stores.
+Parameters: `mainLoopSleepTime`, `buttonClickSleepTime`, `echoCommands`,
+`printDebugResultCodes`, `keySleepTime`, `fingerDiameter`, `pollRate`, `freezeRate`,
+`controllerType`, `controllerIdleRelease`, `controllerIdleReleaseMs`, `controllerTakeover`.
 
 ## Search
 

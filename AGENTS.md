@@ -34,7 +34,7 @@ docker run --rm \
 - 未知按钮 token 不发任何按钮,绝不发默认键。
 - 写命令前必须回环检查服务器错误码。
 - hex 载荷端到端 hex 解析(验证解析器,不只验证发送方)。历史教训:只有带 `0x` 前缀才按 hex 解析,导致 `50 00 00 58...` 被写成十进制乱码。
-- 虚拟手柄(`click`/`press`/`release`/`setStick`/`clickSeq`)在空闲 ≥0.5s 后按布局指纹重建设备以熬过底座/Joy-Con 拓扑变化,重建后等 150ms 再写状态,用完默认 1s 让位并按蓝牙地址主动回连(`btdrvTriggerConnection`);机制、诊断命令与验收见 `docs/hdls-virtual-controller-notes.md`。**`hiddbgApplyHdlsNpadAssignmentState` 在 22.1.0 上崩过机,命令与自动路径都已删除,不得再加回来。**
+- 虚拟手柄(`click`/`press`/`release`/`setStick`/`clickSeq`)在空闲 ≥0.5s 后按布局指纹重建设备以熬过底座/Joy-Con 拓扑变化,attach 后等到"玩家1 已登记我们的 pad"再写状态(下限 50ms/上限 150ms,实测约 50ms),用完让位(默认 1000ms,`controllerIdleRelease` 秒 / `controllerIdleReleaseMs` 毫秒;这是"真手柄下线"里唯一由我们掌握的时长)并按蓝牙地址主动回连(`btdrvTriggerConnection`):虚拟设备还占着玩家槽时**完全不触发**(占槽时的寻呼会被接受但不会注册成手柄,白耗预算),让位后适配器一次只寻呼一条链路,同一对 Joy-Con 的第二只要等第一只链路建立完,实测 0.5~1.3s 内一律返回链路忙(`0x2F4471`),所以失败地址按主循环节拍 50ms 重试、预算 40 次(≈2s),再 0.25s/0.6s 兜底;机制、时间阀、诊断命令与验收见 `docs/hdls-virtual-controller-notes.md`。**`hiddbgApplyHdlsNpadAssignmentState` 在 22.1.0 上崩过机,命令与自动路径都已删除,不得再加回来。**
 
 ## 运算与字节序纪律
 

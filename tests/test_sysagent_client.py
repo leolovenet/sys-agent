@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socketserver
 import threading
+import time
 import unittest
 
 from client.sysagent import SysAgentProtocolError, SysAgentClient, parse_response, require_ok
@@ -29,6 +30,7 @@ class FakeState:
         self.commands: list[list[str]] = []
         self.addresses = [0x80000010, 0x80000120, 0x80000230]
         self.application_running = True
+        self.late_diagnostic = False
         self.ticket_hex: str | None = None
         self.last_key_register: list[str] | None = None
         self.last_key_unregister: list[str] | None = None
@@ -144,8 +146,30 @@ class FakeHandler(socketserver.StreamRequestHandler):
             elif command[0] in {"press", "release", "click", "setStick", "clickCancel",
                                  "detachController", "touch", "touchHold", "touchDraw",
                                  "touchCancel", "key", "keyMod", "keyMulti",
-                                 "screenOff", "screenOn", "configure"}:
+                                 "screenOff", "screenOn"}:
                 response = None
+                if command[0] == "click" and state.late_diagnostic:
+                    # The sysmodule reports a refused state write only once the click
+                    # has run (its press/release sleep), i.e. after the client's short
+                    # drain window: the line lands on the connection late.
+                    time.sleep(0.05)
+                    self._write("ERR controllerState result=0x1C24CA attached=1 takeover=1")
+            elif command[0] == "configure":
+                # `configure <name> <value>` is silent; the read paths answer with
+                # `name=value` lines terminated by END, like the sysmodule does.
+                if len(command) == 3:
+                    response = None
+                elif len(command) == 2:
+                    fake = {"controllerIdleReleaseMs": 1000, "freezeRate": 3}
+                    if command[1] in fake:
+                        response = (f"OK settings=1\n{command[1]}={fake[command[1]]}\n"
+                                    "END configure")
+                    else:
+                        response = (f"ERR configure unknown={command[1]} "
+                                    "hint=controllerIdleReleaseMs\nEND configure")
+                else:
+                    response = ("OK settings=2\nfreezeRate=3\n"
+                                "controllerIdleReleaseMs=1000\nEND configure")
             elif command[0] == "clickSeq":
                 response = "done"
             elif command[0] == "game":
@@ -228,12 +252,19 @@ class FakeHandler(socketserver.StreamRequestHandler):
             if response is None:
                 continue
             # Split the response to verify that the client handles TCP fragmentation.
-            payload = (response + "\n").encode("ascii")
+            self._write(response)
+
+    def _write(self, response: str) -> None:
+        """Sends one answer, tolerating a peer that the client already closed."""
+        payload = (response + "\n").encode("ascii")
+        try:
             midpoint = len(payload) // 2
             self.wfile.write(payload[:midpoint])
             self.wfile.flush()
             self.wfile.write(payload[midpoint:])
             self.wfile.flush()
+        except OSError:
+            pass
 
 
 class FakeServer(socketserver.ThreadingTCPServer):
@@ -469,6 +500,15 @@ class ClientTests(unittest.TestCase):
             line = client.click_seq("A,W100,B")
             self.assertEqual(line, "done")
             self.assertEqual(self.server.state.last_command, ["clickSeq", "A,W100,B"])
+
+    def test_late_diagnostic_does_not_desync_next_command(self) -> None:
+        """A diagnostic printed after a silent command must not become the answer."""
+        self.server.state.late_diagnostic = True
+        with self.client() as client:
+            client.click("A")
+            status = client.controller_status()
+            self.assertEqual(status["attached"], "1")
+            self.assertEqual(self.server.state.last_command, ["controllerStatus"])
 
     def test_controller_diagnostics_and_recovery(self) -> None:
         with self.client() as client:
@@ -801,6 +841,33 @@ class ClientTests(unittest.TestCase):
         code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
                      "--timeout", "1", "config", "set", "notAParam", "1"])
         self.assertEqual(code, 2)
+
+    def test_config_get_and_list(self) -> None:
+        from client.sysagent import main
+        with self.client() as client:
+            listing = client.config_list()
+            self.assertEqual(self.server.state.last_command, ["configure"])
+            self.assertEqual(listing["freezeRate"], "3")
+            self.assertEqual(listing["controllerIdleReleaseMs"], "1000")
+
+            self.assertEqual(client.config_get("controllerIdleReleaseMs"), "1000")
+            self.assertEqual(self.server.state.last_command,
+                             ["configure", "controllerIdleReleaseMs"])
+
+            # The seconds name is a write alias: reading it reports the millisecond
+            # setting rather than a lossy division.
+            self.assertEqual(client.config_get("controllerIdleRelease"), "1000")
+            self.assertEqual(self.server.state.last_command,
+                             ["configure", "controllerIdleReleaseMs"])
+
+            with self.assertRaises(SysAgentProtocolError):
+                client.config_get("notAParam")
+
+        base = ["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                "--timeout", "1"]
+        self.assertEqual(main([*base, "config", "list"]), 0)
+        self.assertEqual(main([*base, "config", "get", "freezeRate"]), 0)
+        self.assertEqual(main([*base, "config", "get", "notAParam"]), 2)
 
     def test_begin_and_refine_cli(self) -> None:
         from client.sysagent import main

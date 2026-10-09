@@ -282,6 +282,30 @@ def parse_int(value: str) -> int:
         return int(value, 16)
 
 
+# Runtime settings the sysmodule's `configure` command accepts. Reading one back
+# uses the same names, except for the release window: it is stored in
+# milliseconds, so only `controllerIdleReleaseMs` can be reported exactly and the
+# seconds name is a write-only alias for it.
+CONFIG_PARAMETERS = frozenset({
+    "mainLoopSleepTime", "buttonClickSleepTime", "echoCommands",
+    "printDebugResultCodes", "keySleepTime", "fingerDiameter",
+    "pollRate", "freezeRate", "controllerType",
+    "controllerIdleRelease", "controllerIdleReleaseMs", "controllerTakeover",
+})
+CONFIG_READ_ALIASES = {"controllerIdleRelease": "controllerIdleReleaseMs"}
+
+
+def parse_config_block(block: str) -> dict[str, str]:
+    """Splits a `configure` answer (``name=value`` lines) into a mapping."""
+    settings: dict[str, str] = {}
+    for line in block.splitlines():
+        if line.startswith(("OK ", "END ")) or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        settings[name.strip()] = value.strip()
+    return settings
+
+
 @dataclasses.dataclass(frozen=True)
 class SearchStatus:
     session: int
@@ -375,6 +399,10 @@ class SysAgentClient:
         self.timeout = timeout
         self._socket: socket.socket | None = None
         self._buffer = bytearray()
+        # Set after a command whose response is not a single line the client reads:
+        # the sysmodule may still print a diagnostic line on that connection, and
+        # reading it as the next command's answer would desynchronise the stream.
+        self._stream_dirty = False
 
     def __enter__(self) -> "SysAgentClient":
         self.connect()
@@ -385,15 +413,22 @@ class SysAgentClient:
 
     def connect(self) -> None:
         if self._socket is not None:
-            return
+            if not self._stream_dirty:
+                return
+            # A silent command can still be printing its diagnostics; start the next
+            # command on a fresh connection instead of reading that line as if it
+            # were the answer.
+            self.close()
         self._socket = socket.create_connection((self.host, self.port), self.timeout)
         self._socket.settimeout(self.timeout)
+        self._stream_dirty = False
 
     def close(self) -> None:
         if self._socket is not None:
             self._socket.close()
             self._socket = None
         self._buffer.clear()
+        self._stream_dirty = False
 
     def command(self, command: str) -> dict[str, str]:
         if "\r" in command or "\n" in command:
@@ -431,6 +466,20 @@ class SysAgentClient:
         assert self._socket is not None
         self._socket.sendall(command_line.encode("ascii") + b"\r\n")
         if not expect_output:
+            # Legacy commands normally answer with nothing, but the sysmodule
+            # prints diagnostics (e.g. "ERR controllerState ...") when something
+            # failed. Drain what has already arrived and surface it to the user;
+            # a line that comes later is covered by the reconnect in connect().
+            self._stream_dirty = True
+            self._socket.settimeout(0.02)
+            try:
+                line = self._readline().decode("utf-8", errors="replace")
+            except (socket.timeout, OSError):
+                line = None
+            finally:
+                self._socket.settimeout(self.timeout)
+            if line:
+                print(f"warning: {line}", file=sys.stderr)
             return None
         line = self._readline().decode("utf-8", errors="replace")
         if not line:
@@ -665,6 +714,10 @@ class SysAgentClient:
             line = self._readline().decode("utf-8", errors="replace")
             lines.append(line)
             if len(lines) == 1 and line.startswith("ERR "):
+                # Not every error path prints the END token (controllerKick returns
+                # right after its ERR), so the block cannot be drained: drop the
+                # connection instead of leaving a stale line for the next command.
+                self.close()
                 raise SysAgentProtocolError(line)
             if line == end_token:
                 break
@@ -946,6 +999,21 @@ class SysAgentClient:
         if not parameter or any(char.isspace() for char in parameter):
             raise ValueError("parameter must be a single token")
         self._bare_command(f"configure {parameter} {value}", expect_output=False)
+
+    def config_list(self) -> dict[str, str]:
+        """Every runtime setting the sysmodule reports, as name -> value."""
+        return parse_config_block(self._read_block("configure", "END configure"))
+
+    def config_get(self, parameter: str) -> str:
+        """One runtime setting. The seconds alias maps onto the millisecond one."""
+        name = CONFIG_READ_ALIASES.get(parameter, parameter)
+        if not name or any(char.isspace() for char in name):
+            raise ValueError("parameter must be a single token")
+        block = self._read_block(f"configure {name}", "END configure")
+        settings = parse_config_block(block)
+        if name not in settings:
+            raise SysAgentProtocolError(f"config answer did not contain {name}: {block!r}")
+        return settings[name]
 
     def start(self, start: int, end: int, pattern: bytes) -> int:
         if start < 0 or end <= start:
@@ -1456,17 +1524,25 @@ def _cmd_is_program_running(client: SysAgentClient, args: argparse.Namespace) ->
 
 
 def _cmd_configure(client: SysAgentClient, args: argparse.Namespace) -> None:
-    known_params = {
-        "mainLoopSleepTime", "buttonClickSleepTime", "echoCommands",
-        "printDebugResultCodes", "keySleepTime", "fingerDiameter",
-        "pollRate", "freezeRate", "controllerType",
-        "controllerIdleRelease", "controllerTakeover",
-    }
-    if args.parameter not in known_params:
+    if args.parameter not in CONFIG_PARAMETERS:
         raise ValueError(
             f"unsupported configure parameter: {args.parameter} "
-            f"(known: {', '.join(sorted(known_params))})")
+            f"(known: {', '.join(sorted(CONFIG_PARAMETERS))})")
     client.configure(args.parameter, args.value)
+
+
+def _cmd_config_get(client: SysAgentClient, args: argparse.Namespace) -> None:
+    name = CONFIG_READ_ALIASES.get(args.parameter, args.parameter)
+    if name not in CONFIG_PARAMETERS:
+        raise ValueError(
+            f"unsupported configure parameter: {args.parameter} "
+            f"(known: {', '.join(sorted(CONFIG_PARAMETERS))})")
+    print(f"{name}={client.config_get(name)}")
+
+
+def _cmd_config_list(client: SysAgentClient, args: argparse.Namespace) -> None:
+    for name, value in client.config_list().items():
+        print(f"{name}={value}")
 
 
 def _cmd_begin(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -1834,10 +1910,17 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                                   "pollRate, freezeRate, controllerType, "
                                   "controllerIdleRelease (seconds before the virtual "
                                   "controller releases the player slot, 0=never), "
+                                  "controllerIdleReleaseMs (the same delay in "
+                                  "milliseconds, for sub-second tuning), "
                                   "controllerTakeover (0=off, 1=kick the blocking "
-                                  "controller and confirm the system page with A, "
-                                  "default 2)"),
+                                  "controller, rebuild and retry; default 1. "
+                                  "The old value 2 behaves like 1)"),
                  Arg("value", "new value", type=parse_int))),
+        Command("get", "Print one runtime setting", _cmd_config_get,
+                (Arg("parameter", "setting name, as accepted by `config set` "
+                                  "(controllerIdleRelease reads back as "
+                                  "controllerIdleReleaseMs)"),)),
+        Command("list", "Print every runtime setting", _cmd_config_list),
     )),
 
     CommandGroup("search", "Exact and unknown-value memory search", (

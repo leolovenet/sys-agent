@@ -25,7 +25,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.7.5"
+#define VERSION_S "2.7.6"
 
 typedef enum {
     Active = 0,
@@ -205,6 +205,105 @@ static void printSearchStartResponse(SearchStartResult result, u64 sessionId)
     case SearchStartIoError: printf("ERR code=IO_ERROR\n"); break;
     case SearchStartSessionNotReady: printf("ERR code=SESSION_NOT_READY\n"); break;
     }
+}
+
+/* Every runtime setting `configure` can write, in the order it is printed.
+ * `configure` with no argument prints the whole table, `configure <name>` prints
+ * one line - that is what the client's `config list` and `config get` send, so a
+ * caller never has to guess what the current value is. The two names that only
+ * differ in unit (`controllerIdleRelease` seconds, `controllerIdleReleaseMs`
+ * milliseconds) are stored in milliseconds, so only the millisecond name is
+ * reported; the client maps the seconds name onto it for reads. */
+static const char* const configSettingNames[] = {
+    "mainLoopSleepTime",
+    "buttonClickSleepTime",
+    "keySleepTime",
+    "fingerDiameter",
+    "pollRate",
+    "freezeRate",
+    "echoCommands",
+    "printDebugResultCodes",
+    "controllerType",
+    "controllerIdleReleaseMs",
+    "controllerTakeover",
+};
+
+static bool printConfigSetting(const char* name)
+{
+    u64 controllerType;
+    u64 idleReleaseMs;
+    u64 takeoverMode;
+
+    if (!strcmp(name, "mainLoopSleepTime"))
+        printf("mainLoopSleepTime=%lu\n", mainLoopSleepTime);
+    else if (!strcmp(name, "buttonClickSleepTime"))
+        printf("buttonClickSleepTime=%lu\n", buttonClickSleepTime);
+    else if (!strcmp(name, "keySleepTime"))
+        printf("keySleepTime=%lu\n", keyPressSleepTime);
+    else if (!strcmp(name, "fingerDiameter"))
+        printf("fingerDiameter=%lu\n", (u64)fingerDiameter);
+    else if (!strcmp(name, "pollRate"))
+        printf("pollRate=%lu\n", pollRate);
+    else if (!strcmp(name, "freezeRate"))
+        printf("freezeRate=%lu\n", freezeRate);
+    else if (!strcmp(name, "echoCommands"))
+        printf("echoCommands=%d\n", echoCommands ? 1 : 0);
+    else if (!strcmp(name, "printDebugResultCodes"))
+        printf("printDebugResultCodes=%d\n", debugResultCodes ? 1 : 0);
+    else if (!strcmp(name, "controllerIdleReleaseMs")) {
+        mutexLock(&controllerMutex);
+        idleReleaseMs = controllerIdleReleaseMs;
+        mutexUnlock(&controllerMutex);
+        printf("controllerIdleReleaseMs=%lu\n", idleReleaseMs);
+    }
+    else if (!strcmp(name, "controllerTakeover")) {
+        mutexLock(&controllerMutex);
+        takeoverMode = controllerTakeoverMode;
+        mutexUnlock(&controllerMutex);
+        printf("controllerTakeover=%lu\n", takeoverMode);
+    }
+    else if (!strcmp(name, "controllerType")) {
+        mutexLock(&controllerMutex);
+        controllerType = (u64)controllerInitializedType;
+        mutexUnlock(&controllerMutex);
+        printf("controllerType=%lu\n", controllerType);
+    }
+    else
+        return false;
+    return true;
+}
+
+static void printConfigSettings(const char* name)
+{
+    if (name != NULL) {
+        if (!printConfigSetting(name))
+            printf("ERR configure unknown=%s hint=controllerIdleReleaseMs\n", name);
+        printf("END configure\n");
+        fflush(stdout);
+        return;
+    }
+
+    printf("OK settings=%d\n",
+           (int)(sizeof(configSettingNames) / sizeof(configSettingNames[0])));
+    for (size_t i = 0; i < sizeof(configSettingNames) / sizeof(configSettingNames[0]); i++)
+        printConfigSetting(configSettingNames[i]);
+    printf("END configure\n");
+    fflush(stdout);
+}
+
+/* The names `configure <name> <value>` accepts: everything it can print, plus the
+ * seconds form of the release window (`controllerIdleReleaseMs` is the stored
+ * one, so only it is reported back). */
+static bool configNameIsWritable(const char* name)
+{
+    if (!strcmp(name, "controllerIdleRelease"))
+        return true;
+
+    for (size_t i = 0; i < sizeof(configSettingNames) / sizeof(configSettingNames[0]); i++) {
+        if (!strcmp(name, configSettingNames[i]))
+            return true;
+    }
+    return false;
 }
 
 int argmain(int argc, char** argv)
@@ -1135,10 +1234,26 @@ int argmain(int argc, char** argv)
         }
         free(buf);
     }
-    //configure <mainLoopSleepTime or buttonClickSleepTime> <time in ms>
+    //configure                     : print every runtime setting
+    //configure <name>              : print one runtime setting
+    //configure <name> <value>      : change a runtime setting
     if (!strcmp(argv[0], "configure")) {
+        if (argc == 1) {
+            printConfigSettings(NULL);
+            return 0;
+        }
+        if (argc == 2) {
+            printConfigSettings(argv[1]);
+            return 0;
+        }
         if (argc != 3)
             return 0;
+
+        if (!configNameIsWritable(argv[1])) {
+            printf("ERR configure unknown=%s hint=controllerIdleReleaseMs\n", argv[1]);
+            fflush(stdout);
+            return 0;
+        }
 
         if (!strcmp(argv[1], "mainLoopSleepTime")) {
             u64 time = parseStringToInt(argv[2]);
@@ -1191,7 +1306,16 @@ int argmain(int argc, char** argv)
         if (!strcmp(argv[1], "controllerIdleRelease")) {
             u64 seconds = parseStringToInt(argv[2]);
             mutexLock(&controllerMutex);
-            controllerIdleReleaseSeconds = seconds;
+            controllerIdleReleaseMs = seconds * 1000ULL;
+            mutexUnlock(&controllerMutex);
+        }
+
+        // Sub-second release delays: this is the whole wait before the kicked
+        // controllers are pulled back, so it is tunable in milliseconds.
+        if (!strcmp(argv[1], "controllerIdleReleaseMs")) {
+            u64 milliseconds = parseStringToInt(argv[2]);
+            mutexLock(&controllerMutex);
+            controllerIdleReleaseMs = milliseconds;
             mutexUnlock(&controllerMutex);
         }
 
@@ -1780,7 +1904,7 @@ int main()
         /* Wake up periodically: the virtual controller must be able to release
          * its player slot while no client is connected (controllerServiceIdle
          * runs below). poll returning 0 on timeout is handled like "no data". */
-        poll(pfds, fd_count, (int)mainLoopSleepTime);
+        int pollResult = poll(pfds, fd_count, (int)mainLoopSleepTime);
         mutexLock(&freezeMutex);
         for (int i = 0; i < fd_count; i++)
         {
@@ -1847,7 +1971,12 @@ int main()
         mutexUnlock(&freezeMutex);
         controllerServiceIdle();
         controllerServiceReconnect();
-        svcSleepThread(mainLoopSleepTime * 1e+6L);
+        /* When nothing happened the poll timeout above already paced the loop;
+         * only sleep again after real activity, which halves the service
+         * granularity (yield and reconnect react within ~50 ms instead of
+         * ~100 ms). Command handling keeps its original pacing. */
+        if (pollResult != 0)
+            svcSleepThread(mainLoopSleepTime * 1e+6L);
     }
 
     if (R_SUCCEEDED(rc))
