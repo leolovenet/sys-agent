@@ -7,6 +7,7 @@
 #include "commands.h"
 #include "util.h"
 #include "process_memory.h"
+#include "fnv1a.h"
 
 
 //Controller:
@@ -1215,7 +1216,7 @@ Result peekVerified(u64 offset, u64 size, u8* out, u8* scratch, u32 attempts, bo
 
 Result hashRegion(u64 address, u64 size, u32* hash)
 {
-    *hash = 0x811C9DC5u; /* FNV-1a 32-bit offset basis */
+    *hash = FNV1A32_BASIS;
     ProcessMemorySession session;
     Result rc = processMemoryOpen(&session, debugResultCodes);
     if (R_FAILED(rc))
@@ -1242,11 +1243,7 @@ Result hashRegion(u64 address, u64 size, u32* hash)
             rc = chunkResult;
             break;
         }
-        u64 i;
-        for (i = 0; i < chunk; i++) {
-            *hash ^= buffer[i];
-            *hash *= 0x01000193u; /* FNV-1a 32-bit prime */
-        }
+        *hash = fnv1a32Update(*hash, buffer, (size_t)chunk);
         done += chunk;
     }
     processMemoryClose(&session);

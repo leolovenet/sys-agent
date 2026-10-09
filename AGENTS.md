@@ -26,6 +26,7 @@ docker run --rm \
 
 - Docker socket 沙盒受限,需 escalation;固定镜像已零警告编译本地 commit `ae13548c587b75abf54f32032ad8d52f51eda05e` 与上游 v2.5 tag `45b6a6419624ed1a1f34aabc9f37336d5f130e61`。
 - 构建成功不等于部署授权:安装/测试自定义 sysmodule 需要明确请求、版本/ABI 检查与分阶段真机测试;旧备份不保留(policy 2026-08-31),回滚 = 重建重部署。
+- 发布产物是**本地产物**(`build/` 被忽略,不进仓库):发布说明写 `build/release/v<版本>-notes.md`(正文格式见 `v2.7.6-notes.md`),SD 布局放 `build/release/v<版本>/atmosphere/contents/43000000000000A6/{exefs.nsp,toolbox.json,flags/boot2.flag}`,再压成 `build/release/sys-agent-v<版本>.zip`。
 
 ## 协议约定
 
@@ -47,7 +48,7 @@ docker run --rm \
 
 - 内置低优先级 FTP 服务,端口 `6001`,匿名、默认开启;可选配置 `/config/sys-agent/ftp.ini`;端口 `6000` 上 `ftpStatus/ftpStart/ftpStop/ftpRestart/ftpReload` 控制。根只暴露 SD,不含 BIS/存档/卡带等挂载。
 - 稳定测试基线文件名是含空格的 ASCII;中文/日文名返回原生 FS Result `0x202`,其他非 ASCII 枚举不一致;不要静默重命名这类路径。
-- 已通过真机测试:FTP CRUD、中断清理、16 MiB hash 校验传输、续传、生命周期命令、6000 端口响应。**未关闭验收**:一秒启动网络自动重试构建未通过冷启动;FTP 未与活动 C-level 搜索并发测试(含 `/switch/sys-agent/search` 写保护)。验证矩阵见 `docs/ftp-server.md`。
+- 已通过真机测试:FTP CRUD、中断清理、16 MiB hash 校验传输、续传、生命周期命令、6000 端口响应、`RNTO` 覆盖已存在文件。冷启动重试现在可观测:`ftpStatus` 暴露 `listener`/`bindAttempts`/`lastBindError`,重启后实测 `bindAttempts=3` 后监听成功;曾报"6000 通、6001 不通"未复现(实测到的是整机掉线,两端口同时恢复),该项保留待复现。**未关闭验收**:FTP 未与活动 C-level 搜索并发测试(含 `/switch/sys-agent/search` 写保护)。验证矩阵见 `docs/ftp-server.md`。
 - 替换运行中的 sysmodule:FTP 上传需 ASCII 临时名 + 原子重命名,备份 `atmosphere/contents/43000000000000A6`,然后整机重启;只重启游戏不会重载 sys-agent。
 
 ## Headless 启动与 Keys
@@ -86,7 +87,6 @@ docker run --rm \
 | `docs/process-memory-backend.md` | 统一内存后端设计(direct/auto) |
 | `docs/search-a-level-design.md` | A 级精确搜索设计与部署门槛 |
 | `docs/search-c-level-design.md` | C 级未知值搜索设计 |
-| `docs/usage-feedback-improvements.md` | 使用体验反馈与改进建议 |
 | `docs/research/audio-control.md` | 系统音量控制研究(`aud:ctl`/`audctl`) |
 | `docs/research/client-roadmap-and-edizon-gap.md` | 客户端路线图与 EdiZon-SE 能力差距 |
 | `docs/research/game-lifecycle.md` | 游戏启动/关闭/暂停研究 |

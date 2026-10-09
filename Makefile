@@ -29,4 +29,6 @@ test:
 	/tmp/sys-agent-search-store-test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-agent/source tests/result_check_test.c sys-agent/source/result_check.c -o /tmp/sys-agent-result-check-test
 	/tmp/sys-agent-result-check-test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-agent/source tests/fnv1a_test.c sys-agent/source/fnv1a.c -o /tmp/sys-agent-fnv1a-test
+	/tmp/sys-agent-fnv1a-test
 	python3 -m unittest -v tests/test_sysagent_client.py

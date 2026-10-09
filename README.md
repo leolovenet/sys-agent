@@ -47,6 +47,23 @@ commands should follow this rule:
   watched address, with per-core debug registers linked through a context-IDR breakpoint.
   It auto-resolves the dmnt-owned debug-handle conflict (`dmntClosed=1`), and a manual
   `debug force-close` is available; memory commands are rejected while a watch is armed.
+- Verified memory access: `poke*Verified` writes and reads the range back, reporting
+  `WRITE_FAILED`, `READBACK_FAILED`, or `WRITE_VERIFY_FAILED` distinctly; `peek*Verified`
+  reads twice and retries until two reads agree, so zero data and a failed read are
+  distinguishable. `memoryQuery` reports the covering mapping (svcQueryMemory semantics),
+  `memoryHash` returns an FNV-1a 32 fingerprint with a per-chunk retry, and the client
+  `memory dump` streams a region to a local file in verified chunks.
+- The watchpoint gained `ring N` (keep the last N hits without auto-detaching),
+  `pc=LOW-HIGH` (keep only matching hits), `debug watch-ring <i>`, and `watch-status` flags
+  `stale` (fields left over from a finished session) and `memoryBlocked` (memory commands
+  are refused while armed). `log` lists the recent commands the console received.
+- The Python client retries read-only commands on an empty response or dropped connection
+  (writes never retry), adds `game wait` / `memory wait-value`, `--json` / `--out`, and
+  `screen capture --diff`, translates common native Result codes, and returns typed
+  `MemoryInfo` / `GameStatus` results alongside the raw dicts.
+- FTP's `RNTO` replaces an existing file, and `ftpStatus` reports `listener`,
+  `bindAttempts`, and `lastBindError` so a listener that never came up is distinguishable
+  from a network problem.
 - A transactional code-patch primitive (`debug patch-code`) pauses the target process,
   optionally verifies no thread PC is inside the patched range, verifies the original
   bytes, writes any payload up to 1 KiB, reads it back, and resumes — one command, with
@@ -96,12 +113,21 @@ trusted isolated network and restrict it with the surrounding network firewall.
     1. Absolute memory address
     2. Address relative to main nso base
     3. Address relative to heap base
+- Verified access: `poke*Verified` writes then reads the range back and reports `WRITE_FAILED`,
+  `READBACK_FAILED`, or `WRITE_VERIFY_FAILED` distinctly; `peek*Verified` reads twice and
+  retries until two reads agree, so "the value is zero" is distinguishable from a failed read.
+- `memoryQuery` reports the mapping covering an address (type/permission, svcQueryMemory
+  semantics); `memoryHash` returns an FNV-1a 32 fingerprint of a region; the client
+  `memory dump` streams a region to a local file in verified chunks.
 - Share Atmosphere dmnt's active debug handle so memory commands and searches can coexist with
   the cheat VM, with an explicit direct-debug fallback.
 - Run asynchronous exact and typed memory searches with progress, cancellation, and paged
   results.
 - Hardware write watchpoints (`debug watch` / `watch-status` / `watch-last` / `watch-stop`)
-  capture the writer's PC, registers, and instruction bytes; see `commands.md`.
+  capture the writer's PC, registers, and instruction bytes. `ring N` keeps the last N hits
+  without auto-detaching and `pc=LOW-HIGH` keeps only matching hits; `debug watch-ring <i>`
+  dumps a stored hit.
+- `log` lists the recent commands the console received, with a system tick.
 
 ### Screen Capture:
 - Capture current screen and return as JPG
