@@ -2,6 +2,23 @@
 
 #include <switch.h>
 
+#define DEBUG_WATCH_RING_MAX 8
+
+/* One hardware-write-watchpoint session. `ringSize` > 0 keeps the most recent
+ * `ringSize` hits (overwriting the oldest) and never auto-detaches on the hit
+ * count; `filterEnabled` keeps only hits whose PC is inside [filterLow,
+ * filterHigh]. */
+typedef struct {
+    u64 address;
+    u64 size;
+    u32 maxHits;
+    u64 durationSeconds;
+    u32 ringSize;
+    bool filterEnabled;
+    u64 filterLow;
+    u64 filterHigh;
+} DebugWatchConfig;
+
 /* Full CPU register snapshot of the most recent hardware-watchpoint hit. */
 typedef struct {
     u64 x[31];      /* x0..x30 */
@@ -31,6 +48,9 @@ typedef struct {
     u32 ctxSlot;    /* discovered context-IDR breakpoint slot */
     u32 wpSlot;     /* discovered data-watchpoint register (D0 = 16) */
     u64 durationSeconds;
+    u32 ringSize;      /* 0 when hits are not being ring-buffered */
+    u32 ringCount;     /* hits currently stored in the ring */
+    bool filterEnabled;
     u64 lastPc;
     u64 lastLr;
     u64 lastSp;
@@ -42,9 +62,10 @@ typedef struct {
 } DebugWatchStatus;
 
 void debugWatchInitialize(void);
-bool debugWatchStart(u64 address, u64 size, u32 maxHits, u64 durationSeconds);
+bool debugWatchStart(const DebugWatchConfig* config);
 void debugWatchStop(void);
 bool debugWatchGetStatus(DebugWatchStatus* out);
 bool debugWatchGetLastHit(DebugWatchHit* out);
+bool debugWatchGetRingHit(u32 index, DebugWatchHit* out);
 bool debugWatchIsActive(void);
 Result debugWatchResolveMainBase(u64* outMainBase);

@@ -82,7 +82,10 @@ class FakeHandler(socketserver.StreamRequestHandler):
             elif command[0] == "applicationStatus":
                 response = (f"OK command=applicationStatus "
                             f"running={1 if state.application_running else 0} "
-                            "sample=1 errors=field:0x0")
+                            "pid=0000000000001234 titleId=01006F8002326000 version=34 "
+                            "main=0000002908406000 heap=0000002C1A400000 "
+                            "buildId=FF1D1C05670DB6021C85B624A710B963 sample=1 "
+                            "errors=field:0x0")
             elif command[0] == "processList":
                 response = f"OK total=3 offset={command[1]} count=1 processes=1:2"
             elif command[0] in {"systemReboot", "systemRebootEmuMMC", "systemShutdown", "systemSleep",
@@ -148,6 +151,10 @@ class FakeHandler(socketserver.StreamRequestHandler):
                             "type=0x5 typeName=heap attr=0x0 perm=0x3 permName=rw")
             elif command[0] == "memoryHash":
                 response = "OK addr=0x100 size=4 algo=fnv1a32 hash=0x1234ABCD"
+            elif command[0] == "log":
+                response = ("log 0 tick=100 cmd=getVersion\n"
+                            "log 1 tick=200 cmd=peekAbsolute\n"
+                            "END log")
             elif command[0] in {"peekVerified", "peekAbsoluteVerified", "peekMainVerified"}:
                 if state.peek_verify_unstable:
                     response = "ERR code=READ_UNSTABLE addr=0x100 size=4 attempts=3"
@@ -452,6 +459,33 @@ class ClientTests(unittest.TestCase):
         with self.client() as client:
             self.assertEqual(client.memory_hash(0x100, 4)["algo"], "fnv1a32")
             self.assertEqual(self.server.state.last_command[0], "memoryHash")
+
+    def test_typed_memory_info(self) -> None:
+        with self.client() as client:
+            info = client.memory_info(0x2C1A400000)
+            self.assertEqual(info.type_name, "heap")
+            self.assertEqual(info.perm_name, "rw")
+            self.assertEqual(info.size, 0x1000)
+
+    def test_typed_game_status(self) -> None:
+        with self.client() as client:
+            status = client.game_status()
+            self.assertTrue(status.running)
+            self.assertEqual(status.title_id, 0x01006F8002326000)
+            self.assertEqual(status.main_base, 0x2908406000)
+            self.assertEqual(status.raw["running"], "1")
+
+    def test_operation_log(self) -> None:
+        with self.client() as client:
+            entries = client.operation_log(count=2)
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(entries[0]["cmd"], "getVersion")
+            self.assertEqual(entries[1]["cmd"], "peekAbsolute")
+
+        from client.sysagent import main
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "system", "log", "--count", "2", "--json"])
+        self.assertEqual(code, 0)
 
     def test_memory_dump_writes_file(self) -> None:
         import tempfile

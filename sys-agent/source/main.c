@@ -25,7 +25,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.10.0"
+#define VERSION_S "2.11.0"
 
 typedef enum {
     Active = 0,
@@ -306,6 +306,32 @@ static bool configNameIsWritable(const char* name)
     return false;
 }
 
+#define OP_LOG_CAPACITY 32
+#define OP_LOG_TEXT 96
+
+/* Defined with the operation-log ring below; declared here for the `log` command. */
+static void printOperationLog(u32 requested);
+
+/* Print one captured watchpoint hit (the `debug watch-last` / `watch-ring` format). */
+static void printWatchHit(const DebugWatchHit* hit)
+{
+    printf("OK pc=%016lX sp=%016lX lr=%016lX data=%016lX thread=%016lX"
+        " insnBytes=%u insn=", hit->pc, hit->sp, hit->x[30],
+        hit->dataAddress, hit->threadId, hit->insnBytes);
+    u32 i = 0;
+    for (i = 0; i < hit->insnBytes; i++)
+        printf("%02X", hit->insn[i]);
+    printf(" fpStackBytes=%u fpStack=", hit->fpStackBytes);
+    for (i = 0; i < hit->fpStackBytes; i++)
+        printf("%02X", hit->fpStack[i]);
+    printf(" spStackBytes=%u spStack=", hit->spStackBytes);
+    for (i = 0; i < hit->spStackBytes; i++)
+        printf("%02X", hit->spStack[i]);
+    for (i = 0; i < 31; i++)
+        printf(" x%u=%016lX", i, hit->x[i]);
+    printf("\n");
+}
+
 /* Print a byte range as uppercase hex (memory order, lowest address first). */
 static void printHexBytes(const u8* bytes, u64 size)
 {
@@ -465,6 +491,10 @@ int argmain(int argc, char** argv)
             u64 size = 4;
             u32 maxHits = 1;
             u64 duration = 60;
+            u32 ringSize = 0;
+            bool filterEnabled = false;
+            u64 filterLow = 0;
+            u64 filterHigh = 0;
             int index = 2;
             if (index >= argc) {
                 printf("ERR code=INVALID_ARGUMENTS\n");
@@ -518,6 +548,50 @@ int argmain(int argc, char** argv)
                     }
                     duration = parsed;
                     index += 2;
+                } else if (!strcmp(argv[index], "ring") && index + 1 < argc) {
+                    u64 parsed = 0;
+                    if (!tryParseStringToInt(argv[index + 1], &parsed)
+                        || parsed == 0 || parsed > DEBUG_WATCH_RING_MAX) {
+                        printf("ERR code=INVALID_RING\n");
+                        return 0;
+                    }
+                    ringSize = (u32)parsed;
+                    index += 2;
+                } else if (strncmp(argv[index], "pc=", 3) == 0) {
+                    /* pc=LOW-HIGH (inclusive) or pc=ADDR; hex or decimal. */
+                    const char* text = argv[index] + 3;
+                    const char* dash = strchr(text, '-');
+                    u64 low = 0;
+                    u64 high = 0;
+                    if (dash != NULL) {
+                        char lowText[32];
+                        const size_t lowLength = (size_t)(dash - text);
+                        if (lowLength == 0 || lowLength >= sizeof(lowText)) {
+                            printf("ERR code=INVALID_PC_FILTER\n");
+                            return 0;
+                        }
+                        memcpy(lowText, text, lowLength);
+                        lowText[lowLength] = 0;
+                        if (!tryParseStringToInt(lowText, &low)
+                            || !tryParseStringToInt(dash + 1, &high)) {
+                            printf("ERR code=INVALID_PC_FILTER\n");
+                            return 0;
+                        }
+                    } else {
+                        if (!tryParseStringToInt(text, &low)) {
+                            printf("ERR code=INVALID_PC_FILTER\n");
+                            return 0;
+                        }
+                        high = low;
+                    }
+                    if (high < low) {
+                        printf("ERR code=INVALID_PC_FILTER\n");
+                        return 0;
+                    }
+                    filterEnabled = true;
+                    filterLow = low;
+                    filterHigh = high;
+                    index += 1;
                 } else {
                     break;
                 }
@@ -537,7 +611,17 @@ int argmain(int argc, char** argv)
                     dmntClosed = true;
                 }
             }
-            if (!debugWatchStart(address, size, maxHits, duration)) {
+            DebugWatchConfig watchConfig;
+            memset(&watchConfig, 0, sizeof(watchConfig));
+            watchConfig.address = address;
+            watchConfig.size = size;
+            watchConfig.maxHits = maxHits;
+            watchConfig.durationSeconds = duration;
+            watchConfig.ringSize = ringSize;
+            watchConfig.filterEnabled = filterEnabled;
+            watchConfig.filterLow = filterLow;
+            watchConfig.filterHigh = filterHigh;
+            if (!debugWatchStart(&watchConfig)) {
                 DebugWatchStatus status;
                 debugWatchGetStatus(&status);
                 printf("ERR code=WATCH_BUSY lastError=0x%X\n", status.lastError);
@@ -594,13 +678,16 @@ int argmain(int argc, char** argv)
             debugWatchGetStatus(&status);
             printf("OK active=%d armed=%d stale=%d memoryBlocked=%d pid=%016lX address=%016lX size=%lu"
                 " maxHits=%u hitCount=%u ctxSlot=%u wpSlot=%u duration=%lu"
+                " ring=%u ringCount=%u filter=%d"
                 " lastPc=%016lX lastLr=%016lX lastSp=%016lX lastData=%016lX"
                 " lastThread=%016lX stage=%s lastError=0x%X hint=%s\n",
                 status.active, status.armed, status.stale, status.memoryBlocked,
                 status.processId,
                 status.watchAddress, status.watchSize, status.maxHits,
                 status.hitCount, status.ctxSlot, status.wpSlot,
-                status.durationSeconds, status.lastPc, status.lastLr,
+                status.durationSeconds, status.ringSize, status.ringCount,
+                status.filterEnabled,
+                status.lastPc, status.lastLr,
                 status.lastSp, status.lastDataAddress, status.lastThreadId,
                 status.stage, status.lastError, status.hint);
             return 0;
@@ -647,21 +734,26 @@ int argmain(int argc, char** argv)
                 printf("ERR code=NO_HIT\n");
                 return 0;
             }
-            printf("OK pc=%016lX sp=%016lX lr=%016lX data=%016lX thread=%016lX"
-                " insnBytes=%u insn=", hit.pc, hit.sp, hit.x[30],
-                hit.dataAddress, hit.threadId, hit.insnBytes);
-            u32 i = 0;
-            for (i = 0; i < hit.insnBytes; i++)
-                printf("%02X", hit.insn[i]);
-            printf(" fpStackBytes=%u fpStack=", hit.fpStackBytes);
-            for (i = 0; i < hit.fpStackBytes; i++)
-                printf("%02X", hit.fpStack[i]);
-            printf(" spStackBytes=%u spStack=", hit.spStackBytes);
-            for (i = 0; i < hit.spStackBytes; i++)
-                printf("%02X", hit.spStack[i]);
-            for (i = 0; i < 31; i++)
-                printf(" x%u=%016lX", i, hit.x[i]);
-            printf("\n");
+            printWatchHit(&hit);
+            return 0;
+        }
+        if (!strcmp(argv[1], "watch-ring"))
+        {
+            if (argc != 3) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            u64 index = 0;
+            if (!tryParseStringToInt(argv[2], &index)) {
+                printf("ERR code=INVALID_INDEX arg=%s\n", argv[2]);
+                return 0;
+            }
+            DebugWatchHit hit;
+            if (!debugWatchGetRingHit((u32)index, &hit)) {
+                printf("ERR code=NO_RING_HIT\n");
+                return 0;
+            }
+            printWatchHit(&hit);
             return 0;
         }
         if (!strcmp(argv[1], "patch-code"))
@@ -1688,6 +1780,27 @@ int argmain(int argc, char** argv)
         printf("%s\n", VERSION_S);
     }
 
+    /* log [count N]: the most recent commands and the first line of each reply,
+     * so a caller can see what the console was asked to do and how it answered. */
+    if (!strcmp(argv[0], "log"))
+    {
+        u32 requested = OP_LOG_CAPACITY;
+        if (argc == 3 && !strcmp(argv[1], "count")) {
+            u64 parsed = 0;
+            if (!tryParseStringToInt(argv[2], &parsed)
+                || parsed == 0 || parsed > OP_LOG_CAPACITY) {
+                printf("ERR code=INVALID_COUNT arg=%s\n", argv[2]);
+                return 0;
+            }
+            requested = (u32)parsed;
+        } else if (argc != 1) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+        printOperationLog(requested);
+        return 0;
+    }
+
     // follow pointers and print absolute offset (little endian, flip it yourself if required)
     // pointer <first (main) jump> <additional jumps> !!do not add the last jump in pointerexpr here, add it yourself!!
     if (!strcmp(argv[0], "pointer"))
@@ -2100,6 +2213,66 @@ void del_from_pfds(struct pollfd pfds[], int i, int* fd_count)
     (*fd_count)--;
 }
 
+/* Recent-command ring behind the `log` command: the last commands and the first
+ * line of each response, so a caller can see what the console was asked to do
+ * and how it answered without pulling the on-SD diagnostic log. Only the
+ * single command-dispatch thread touches it. */
+typedef struct {
+    u64 tick;
+    char command[OP_LOG_TEXT];
+} OperationLogEntry;
+
+static OperationLogEntry operationLog[OP_LOG_CAPACITY];
+static u32 operationLogCount;
+static u32 operationLogNext;
+
+static void copyCapped(char* destination, size_t capacity, const char* source)
+{
+    size_t i = 0;
+    if (capacity == 0)
+        return;
+    while (source[i] != 0 && i + 1 < capacity) {
+        destination[i] = source[i];
+        i++;
+    }
+    destination[i] = 0;
+}
+
+static void recordOperation(const char* command)
+{
+    OperationLogEntry* entry = &operationLog[operationLogNext];
+    entry->tick = armGetSystemTick();
+    copyCapped(entry->command, sizeof(entry->command), command);
+    operationLogNext = (operationLogNext + 1) % OP_LOG_CAPACITY;
+    if (operationLogCount < OP_LOG_CAPACITY)
+        operationLogCount++;
+}
+
+static void printOperationLog(u32 requested)
+{
+    u32 count = requested < operationLogCount ? requested : operationLogCount;
+    /* Oldest first: walk back `count` entries from the next write slot. */
+    u32 start = (operationLogNext + OP_LOG_CAPACITY - count) % OP_LOG_CAPACITY;
+    u32 i;
+    for (i = 0; i < count; i++) {
+        OperationLogEntry* entry = &operationLog[(start + i) % OP_LOG_CAPACITY];
+        printf("log %u tick=%lu cmd=%s\n", i, entry->tick, entry->command);
+    }
+    printf("END log\n");
+}
+
+/* Dispatch one command and record it for the `log` command. The response goes to
+ * the client through fd 1, which stays pointed at this connection afterwards so
+ * a worker thread's late diagnostic still reaches it. */
+static void dispatchCommand(int clientFd, char* linebuf)
+{
+    dup2(clientFd, STDOUT_FILENO);
+    parseArgs(linebuf, &argmain);
+    if (echoCommands)
+        printf("%s\n", linebuf);
+    recordOperation(linebuf);
+}
+
 int main()
 {
     /* Without the BSD socket service there is no server to run; stay resident
@@ -2218,13 +2391,7 @@ int main()
                                 linebuf[readBytesSoFar - 1] = 0;
 
                                 fflush(stdout);
-                                dup2(pfds[i].fd, STDOUT_FILENO);
-
-                                parseArgs(linebuf, &argmain);
-
-                                if (echoCommands) {
-                                    printf("%s\n", linebuf);
-                                }
+                                dispatchCommand(pfds[i].fd, linebuf);
                             }
                         }
                     }

@@ -76,12 +76,19 @@ typedef struct {
     u32 wpSlot;
     u64 durationSeconds;
     u64 startedTick;
+    u32 ringSize;
+    u32 ringCount;
+    u32 ringNext;
+    bool filterEnabled;
+    u64 filterLow;
+    u64 filterHigh;
     u64 lastPc;
     u64 lastLr;
     u64 lastSp;
     u64 lastDataAddress;
     u64 lastThreadId;
     DebugWatchHit lastHit;
+    DebugWatchHit ring[DEBUG_WATCH_RING_MAX];
     Result lastError;
     char stage[24];
     char hint[160];
@@ -355,6 +362,12 @@ static void recordHit(const DebugWatchHit* hit)
 {
     mutexLock(&watchState.mutex);
     watchState.lastHit = *hit;
+    if (watchState.ringSize > 0) {
+        watchState.ring[watchState.ringNext] = *hit;
+        watchState.ringNext = (watchState.ringNext + 1) % watchState.ringSize;
+        if (watchState.ringCount < watchState.ringSize)
+            watchState.ringCount++;
+    }
     watchState.hasHit = true;
     watchState.lastPc = hit->pc;
     watchState.lastLr = hit->x[30];
@@ -363,6 +376,16 @@ static void recordHit(const DebugWatchHit* hit)
     watchState.lastThreadId = hit->threadId;
     watchState.hitCount++;
     mutexUnlock(&watchState.mutex);
+}
+
+static bool hitPassesFilter(const DebugWatchHit* hit)
+{
+    mutexLock(&watchState.mutex);
+    bool passes = true;
+    if (watchState.filterEnabled)
+        passes = hit->pc >= watchState.filterLow && hit->pc <= watchState.filterHigh;
+    mutexUnlock(&watchState.mutex);
+    return passes;
 }
 
 static bool stopRequested(void)
@@ -388,7 +411,8 @@ static bool durationExpired(void)
 static bool hitLimitReached(void)
 {
     mutexLock(&watchState.mutex);
-    const bool done = watchState.hitCount >= watchState.maxHits;
+    /* A ring records continuously and is stopped explicitly or by duration. */
+    const bool done = watchState.ringSize == 0 && watchState.hitCount >= watchState.maxHits;
     mutexUnlock(&watchState.mutex);
     return done;
 }
@@ -577,13 +601,15 @@ static void debugWatchThreadMain(void* arg)
                     == BreakPointType_HardwareData) {
                 DebugWatchHit hit;
                 captureHit(debugHandle, &event, &hit);
-                recordHit(&hit);
-                if (hitLimitReached()) {
-                    setStage("hitsReached");
-                    rc = 0;
-                    /* eventPending stays true: cleanup resumes the pending
-                     * exception before detaching. */
-                    goto cleanup;
+                if (hitPassesFilter(&hit)) {
+                    recordHit(&hit);
+                    if (hitLimitReached()) {
+                        setStage("hitsReached");
+                        rc = 0;
+                        /* eventPending stays true: cleanup resumes the pending
+                         * exception before detaching. */
+                        goto cleanup;
+                    }
                 }
             }
         }
@@ -639,8 +665,18 @@ void debugWatchInitialize(void)
     watchState.durationSeconds = DEBUG_WATCH_DEFAULT_DURATION_SECONDS;
 }
 
-bool debugWatchStart(u64 address, u64 size, u32 maxHits, u64 durationSeconds)
+bool debugWatchStart(const DebugWatchConfig* config)
 {
+    if (config == NULL)
+        return false;
+    const u64 address = config->address;
+    const u64 size = config->size;
+    const u32 maxHits = config->maxHits;
+    const u64 durationSeconds = config->durationSeconds;
+    u32 ringSize = config->ringSize;
+    if (ringSize > DEBUG_WATCH_RING_MAX)
+        ringSize = DEBUG_WATCH_RING_MAX;
+
     mutexLock(&watchState.mutex);
     if (watchState.active) {
         mutexUnlock(&watchState.mutex);
@@ -667,6 +703,12 @@ bool debugWatchStart(u64 address, u64 size, u32 maxHits, u64 durationSeconds)
     watchState.durationSeconds = durationSeconds;
     watchState.startedTick = armGetSystemTick();
     watchState.hitCount = 0;
+    watchState.ringSize = ringSize;
+    watchState.ringCount = 0;
+    watchState.ringNext = 0;
+    watchState.filterEnabled = config->filterEnabled;
+    watchState.filterLow = config->filterLow;
+    watchState.filterHigh = config->filterHigh;
     watchState.hasHit = false;
     watchState.lastPc = 0;
     watchState.lastLr = 0;
@@ -749,6 +791,9 @@ bool debugWatchGetStatus(DebugWatchStatus* out)
     out->ctxSlot = watchState.ctxSlot;
     out->wpSlot = watchState.wpSlot;
     out->durationSeconds = watchState.durationSeconds;
+    out->ringSize = watchState.ringSize;
+    out->ringCount = watchState.ringCount;
+    out->filterEnabled = watchState.filterEnabled;
     out->lastPc = watchState.lastPc;
     out->lastLr = watchState.lastLr;
     out->lastSp = watchState.lastSp;
@@ -759,6 +804,21 @@ bool debugWatchGetStatus(DebugWatchStatus* out)
     out->stage[sizeof(out->stage) - 1] = 0;
     strncpy(out->hint, watchState.hint, sizeof(out->hint) - 1);
     out->hint[sizeof(out->hint) - 1] = 0;
+    mutexUnlock(&watchState.mutex);
+    return true;
+}
+
+bool debugWatchGetRingHit(u32 index, DebugWatchHit* out)
+{
+    mutexLock(&watchState.mutex);
+    if (index >= watchState.ringCount || watchState.ringSize == 0) {
+        mutexUnlock(&watchState.mutex);
+        return false;
+    }
+    /* Oldest first. */
+    const u32 start = (watchState.ringNext + watchState.ringSize
+        - watchState.ringCount) % watchState.ringSize;
+    *out = watchState.ring[(start + index) % watchState.ringSize];
     mutexUnlock(&watchState.mutex);
     return true;
 }

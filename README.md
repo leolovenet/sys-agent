@@ -26,6 +26,10 @@ commands should follow this rule:
   path, so clients never manage debugger state themselves.
 - Parse failures return explicit `ERR code=` lines; never silently proceed with a wrong
   value (hex payloads are hex only, odd length or non-hex characters are rejected).
+- Out-of-process by design: sys-agent reads, writes, queries mappings, and sets
+  breakpoints from outside the target, but it does not run code inside it. Calling a
+  function in the target's own address space and threads is the in-process agent's job;
+  the two are complementary, not substitutes.
 
 ## Changes in this fork
 

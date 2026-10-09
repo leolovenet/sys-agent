@@ -40,6 +40,7 @@ standalone debugger behavior and will fail if dmnt already owns the game's debug
 ```bash
 python3 client/sysagent.py --host switch system capabilities
 python3 client/sysagent.py --host switch system query info
+python3 client/sysagent.py --host switch system log --count 8
 python3 client/sysagent.py --host switch system query network
 python3 client/sysagent.py --host switch system process-list --offset 0 --count 64
 python3 client/sysagent.py --host switch system wireless enabled
@@ -360,6 +361,10 @@ accepts several simultaneous connections, but each is served serially, so a long
 connection delays another. Read-only commands transparently reconnect after an empty response
 (see the retry note above); command output is a single line of `key=value` fields unless
 `--json` is given.
+
+The Python API keeps the raw `dict[str, str]` returns and adds typed results where they help:
+`memory_info()` returns a `MemoryInfo` dataclass, `game_status()` returns a `GameStatus`
+(original fields preserved under `.raw`), and `SearchStatus`/`BackendStatus` are unchanged.
 
 ## Safety
 

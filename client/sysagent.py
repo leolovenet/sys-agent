@@ -318,6 +318,15 @@ def parse_int(value: str) -> int:
         return int(value, 16)
 
 
+def parse_log_line(line: str) -> dict[str, str]:
+    """Parse one `log <i> tick=... cmd=...` line."""
+    if not line.startswith("log "):
+        raise SysAgentProtocolError(f"invalid log line: {line!r}")
+    index_text, _, rest = line[4:].partition(" tick=")
+    tick, _, command = rest.partition(" cmd=")
+    return {"index": index_text, "tick": tick, "cmd": command}
+
+
 # Runtime settings the sysmodule's `configure` command accepts. Reading one back
 # uses the same names, except for the release window: it is stored in
 # milliseconds, so only `controllerIdleReleaseMs` can be reported exactly and the
@@ -425,6 +434,64 @@ class BackendStatus:
             process_id=int(response["pid"], 16),
             title_id=int(response["titleId"], 16),
             last_error=parse_int(response["lastError"]),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class MemoryInfo:
+    """Typed `memory query` result (svcQueryMemory semantics)."""
+
+    address: int
+    base: int
+    size: int
+    type: int
+    type_name: str
+    attr: int
+    perm: int
+    perm_name: str
+
+    @classmethod
+    def from_response(cls, response: dict[str, str]) -> "MemoryInfo":
+        require_ok(response)
+        return cls(
+            address=int(response["addr"], 16),
+            base=int(response["base"], 16),
+            size=int(response["size"], 16),
+            type=parse_int(response["type"]),
+            type_name=response.get("typeName", "unknown"),
+            attr=parse_int(response["attr"]),
+            perm=parse_int(response["perm"]),
+            perm_name=response.get("permName", ""),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class GameStatus:
+    """Typed `applicationStatus` result; `raw` keeps every original field."""
+
+    running: bool
+    pid: int
+    title_id: int
+    version: int
+    main_base: int
+    heap_base: int
+    build_id: str
+    name: str
+    raw: dict[str, str]
+
+    @classmethod
+    def from_response(cls, response: dict[str, str]) -> "GameStatus":
+        require_ok(response)
+        return cls(
+            running=response.get("running") == "1",
+            pid=int(response.get("pid", "0"), 16),
+            title_id=int(response.get("titleId", "0"), 16),
+            version=parse_int(response.get("version", "0")),
+            main_base=int(response.get("main", "0"), 16),
+            heap_base=int(response.get("heap", "0"), 16),
+            build_id=response.get("buildId", ""),
+            name=response.get("name", ""),
+            raw=response,
         )
 
 
@@ -616,6 +683,19 @@ class SysAgentClient:
             raise ValueError("unsupported system query")
         return require_ok(self.command(queries[name], retry=True))
 
+    def game_status(self) -> GameStatus:
+        """Typed `applicationStatus` (running, bases, build id, name)."""
+        return GameStatus.from_response(self.command("applicationStatus", retry=True))
+
+    def operation_log(self, count: int | None = None) -> list[dict[str, str]]:
+        """Recent commands, oldest first (see `commands.md` for the diagnostic log)."""
+        if count is not None and not 1 <= count <= 32:
+            raise ValueError("count must be in 1..32")
+        command = "log" if count is None else f"log count {count}"
+        block = self._read_block(command, "END log")
+        return [parse_log_line(line) for line in block.splitlines()
+                if line.startswith("log ")]
+
     def process_list(self, offset: int = 0, count: int = 64) -> dict[str, str]:
         if offset < 0 or count < 1 or count > 64:
             raise ValueError("offset must be non-negative and count must be in 1..64")
@@ -684,6 +764,11 @@ class SysAgentClient:
     def memory_query(self, address: int) -> dict[str, str]:
         """svcQueryMemory semantics: the mapping type/permission covering an address."""
         return require_ok(self.command(f"memoryQuery 0x{address:X}", retry=True))
+
+    def memory_info(self, address: int) -> MemoryInfo:
+        """Typed form of `memory_query`."""
+        return MemoryInfo.from_response(
+            self.command(f"memoryQuery 0x{address:X}", retry=True))
 
     def memory_hash(self, address: int, size: int) -> dict[str, str]:
         """FNV-1a 32 fingerprint of a region; compare hashes to find what changed."""
@@ -1578,6 +1663,23 @@ def _cmd_memory_hash(client: SysAgentClient, args: argparse.Namespace) -> None:
     _emit(client.memory_hash(args.address, args.size), args)
 
 
+def _cmd_system_log(client: SysAgentClient, args: argparse.Namespace) -> None:
+    entries = client.operation_log(args.count)
+    if getattr(args, "json", False):
+        payload = json.dumps(entries, indent=2)
+    else:
+        payload = "\n".join(
+            f"{entry['index']} tick={entry['tick']} cmd={entry['cmd']}"
+            for entry in entries)
+    out = getattr(args, "out", None)
+    if out:
+        with open(out, "w", encoding="utf-8") as handle:
+            handle.write(payload + "\n")
+        print(out)
+    else:
+        print(payload)
+
+
 def _cmd_memory_dump(client: SysAgentClient, args: argparse.Namespace) -> None:
     written = client.dump(args.start, args.size, args.output, args.chunk)
     print(f"{args.output} ({written} bytes)")
@@ -1984,6 +2086,11 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                               "account, or application",
                      choices=("info", "time", "power", "storage", "network",
                               "network-profile", "account", "application")),
+                 JSON_ARG, OUT_ARG)),
+        Command("log", "Show recent commands the console received (oldest first)",
+                _cmd_system_log,
+                (Arg("count", "entries to show (1..32; default all)",
+                     type=parse_int, default=32, flags=("--count",)),
                  JSON_ARG, OUT_ARG)),
         Command("process-list", "List running processes (PID:TitleID)", _cmd_process_list,
                 (Arg("offset", "result page offset", type=parse_int, default=0,
