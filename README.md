@@ -1,5 +1,7 @@
 # sys-agent
 
+<img src="assets/icon.png" alt="sys-agent icon" width="128">
+
 This fork is an independently maintained sys-agent build based on upstream v2.5. It keeps
 the original TCP protocol compatible while adding Switch-side memory search and a unified
 process-memory backend that can coexist with Atmosphère cheats.
