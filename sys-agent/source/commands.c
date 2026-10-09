@@ -1151,6 +1151,28 @@ void poke(u64 offset, u64 size, u8* val)
         printf("processMemoryWrite: %d\n", rc);
 }
 
+Result pokeVerified(u64 offset, u64 size, u8* val, u8* readback, bool* mismatch,
+    Result* readResult)
+{
+    *mismatch = false;
+    *readResult = 0;
+    ProcessMemorySession session;
+    Result writeRc = processMemoryOpen(&session, debugResultCodes);
+    if (R_FAILED(writeRc))
+        return writeRc;
+
+    writeRc = processMemoryWrite(&session, val, offset, size);
+    if (R_SUCCEEDED(writeRc)) {
+        Result readRc = processMemoryRead(&session, readback, offset, size);
+        if (R_FAILED(readRc))
+            *readResult = readRc; /* the write landed; only the read-back failed */
+        else if (memcmp(val, readback, size) != 0)
+            *mismatch = true;
+    }
+    processMemoryClose(&session);
+    return writeRc;
+}
+
 void peek(u64 offset, u64 size)
 {
     u8* out = malloc(sizeof(u8) * size);

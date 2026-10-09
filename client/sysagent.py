@@ -264,15 +264,48 @@ def parse_response(line: str) -> dict[str, str]:
 
 def require_ok(response: dict[str, str]) -> dict[str, str]:
     if response.get("ok") != "OK":
+        code = response.get("code", "UNKNOWN")
         details = ", ".join(
             f"{key}={response[key]}"
             for key in ("stage", "result", "attempts") if key in response
         )
         suffix = f" ({details})" if details else ""
-        raise SysAgentProtocolError(
-            f"sys-agent error: {response.get('code', 'UNKNOWN')}{suffix}"
-        )
+        raise SysAgentProtocolError(f"sys-agent error: {code}{suffix}{_describe_error(response)}")
     return response
+
+
+# Frequently seen native Result codes and `ERR code=` names. Each entry only adds
+# a human-readable suffix; the raw code always stays in the message so it can
+# still be looked up. Result keys are lower-case hex with the 0x prefix.
+RESULT_CODE_NOTES = {
+    "0x10801": "debug handle unavailable or already owned (dmnt:cht)",
+    "0xf401": "debug handle already owned by another debugger (dmnt:cht)",
+    "0x202": "filesystem: access denied, or the path name encoding is unsupported",
+    "0x2f4471": "bluetooth: adapter is busy paging another link",
+    "0x668ce": "screen capture: the debug unit flag is required",
+    "0xf601": "the service closed the session",
+}
+
+ERROR_CODE_NOTES = {
+    "READ_FAILED": "the target address could not be read",
+    "WRITE_FAILED": "the target address could not be written",
+    "READBACK_FAILED": "the write landed but the verification read-back failed",
+    "WRITE_VERIFY_FAILED": "the write did not read back as sent (concurrent writer?)",
+    "NO_APP": "no foreground application is running",
+    "BACKEND_UNAVAILABLE": "the process-memory backend could not be opened",
+    "MODULES_UNAVAILABLE": "the module list could not be read",
+    "INVALID_HEX_PAYLOAD": "the payload is not an even-length hex byte string",
+    "INVALID_ADDRESS": "the address argument could not be parsed",
+    "NO_HIT": "no watchpoint hit has been recorded yet",
+}
+
+
+def _describe_error(response: dict[str, str]) -> str:
+    """Return a ' - explanation' suffix for an ERR envelope, or an empty string."""
+    note = ERROR_CODE_NOTES.get(response.get("code", ""), "")
+    if not note and "result" in response:
+        note = RESULT_CODE_NOTES.get(response["result"].lower(), "")
+    return f" - {note}" if note else ""
 
 
 def parse_int(value: str) -> int:
@@ -646,6 +679,17 @@ class SysAgentClient:
 
     def poke_main(self, offset: int, data: bytes) -> None:
         self._bare_command(f"pokeMain 0x{offset:X} {data.hex().upper()}", expect_output=False)
+
+    def poke_verified(self, offset: int, data: bytes) -> dict[str, str]:
+        return require_ok(self.command(f"pokeVerified 0x{offset:X} {data.hex().upper()}"))
+
+    def poke_absolute_verified(self, address: int, data: bytes) -> dict[str, str]:
+        return require_ok(
+            self.command(f"pokeAbsoluteVerified 0x{address:X} {data.hex().upper()}")
+        )
+
+    def poke_main_verified(self, offset: int, data: bytes) -> dict[str, str]:
+        return require_ok(self.command(f"pokeMainVerified 0x{offset:X} {data.hex().upper()}"))
 
     def pointer_poke(self, data: bytes, jumps: Sequence[int], final: int) -> None:
         args = f"{data.hex().upper()} " + " ".join(f"0x{value:X}" for value in jumps) + f" 0x{final:X}"
@@ -1338,15 +1382,24 @@ def _cmd_peek_main_multi(client: SysAgentClient, args: argparse.Namespace) -> No
 
 
 def _cmd_poke(client: SysAgentClient, args: argparse.Namespace) -> None:
-    client.poke(args.offset, args.data)
+    if args.no_verify:
+        client.poke(args.offset, args.data)
+    else:
+        print_fields(client.poke_verified(args.offset, args.data))
 
 
 def _cmd_poke_absolute(client: SysAgentClient, args: argparse.Namespace) -> None:
-    client.poke_absolute(args.address, args.data)
+    if args.no_verify:
+        client.poke_absolute(args.address, args.data)
+    else:
+        print_fields(client.poke_absolute_verified(args.address, args.data))
 
 
 def _cmd_poke_main(client: SysAgentClient, args: argparse.Namespace) -> None:
-    client.poke_main(args.offset, args.data)
+    if args.no_verify:
+        client.poke_main(args.offset, args.data)
+    else:
+        print_fields(client.poke_main_verified(args.offset, args.data))
 
 
 def _cmd_pointer(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -1641,6 +1694,12 @@ def _button_help() -> str:
 BUTTON_ARG = Arg("button", "button name; the accepted names are listed below",
                  metavar="BUTTON")
 
+# Writes verify by default (write, read back, compare on the server). --no-verify
+# falls back to the legacy blind poke, which is only needed for a target that
+# rewrites its own memory fast enough to fail the read-back.
+NO_VERIFY_ARG = Arg("no_verify", "skip the server-side read-back check",
+                    action="store_true", default=False, flags=("--no-verify",))
+
 BUTTON_HELP = _button_help()
 
 CLICK_SEQ_HELP = "\n".join((
@@ -1780,13 +1839,16 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 (Arg("pairs", "address size address size ...", nargs="+", type=parse_int),)),
         Command("poke", "Write bytes relative to the heap", _cmd_poke,
                 (Arg("offset", "heap-relative address", type=parse_int),
-                 Arg("data", "hex bytes", type=parse_pattern))),
+                 Arg("data", "hex bytes", type=parse_pattern),
+                 NO_VERIFY_ARG)),
         Command("poke-absolute", "Write bytes at an absolute address", _cmd_poke_absolute,
                 (Arg("address", "absolute address", type=parse_int),
-                 Arg("data", "hex bytes", type=parse_pattern))),
+                 Arg("data", "hex bytes", type=parse_pattern),
+                 NO_VERIFY_ARG)),
         Command("poke-main", "Write bytes relative to the main NSO base", _cmd_poke_main,
                 (Arg("offset", "main-relative address", type=parse_int),
-                 Arg("data", "hex bytes", type=parse_pattern))),
+                 Arg("data", "hex bytes", type=parse_pattern),
+                 NO_VERIFY_ARG)),
         Command("pointer", "Resolve a pointer chain to an absolute address", _cmd_pointer,
                 (Arg("jumps", "main-relative first jump followed by offsets", nargs="+",
                      type=parse_int),)),

@@ -733,6 +733,14 @@ bool debugWatchGetStatus(DebugWatchStatus* out)
     mutexLock(&watchState.mutex);
     out->active = watchState.active;
     out->armed = watchState.armed;
+    /* A finished session keeps its last address/hit values so `watch-last`
+     * stays useful, which makes "active=0 address=... hitCount=4" easy to
+     * misread as a live breakpoint. Flag those values as stale instead of
+     * clearing them. Memory commands are refused for as long as the session is
+     * attached, so advertise that too, rather than let callers hit the error. */
+    out->stale = !watchState.active
+        && (watchState.watchAddress != 0 || watchState.hitCount != 0 || watchState.hasHit);
+    out->memoryBlocked = watchState.active;
     out->processId = watchState.processId;
     out->watchAddress = watchState.watchAddress;
     out->watchSize = watchState.watchSize;

@@ -34,8 +34,8 @@ The system-management protocol is additive and uses single-line `OK key=value` o
 |gameLaunchHeadless|Experimental: headless-launches a game by Title ID: starts the process without bringing it to the screen (16 hex digits, non-zero; optional storage name forces that storage)|titleId [storage]|`gameLaunchHeadless 01006F8002326000`|
 
 Arbitrary strings are returned as uppercase hexadecimal bytes with an adjacent `*Len` field.
-All byte-payload arguments (the data of `poke`/`pokeAbsolute`/`pokeMain`/`pointerPoke`,
-the value of `freeze`, and the expected/new bytes of `debug patch-code`) are **hex byte
+All byte-payload arguments (the data of `poke`/`pokeAbsolute`/`pokeMain`/`pointerPoke` and
+their `*Verified` variants, the value of `freeze`, and the expected/new bytes of `debug patch-code`) are **hex byte
 pairs**; an optional `0x` prefix is accepted but never required. They are parsed as
 hexadecimal only — decimal input is not interpreted and will silently produce wrong bytes,
 so always send e.g. `DEADBEEF` / `0xDEADBEEF`, never a decimal number.
@@ -262,7 +262,7 @@ Requirements and conflict rules:
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
 |debug watch|Arms a hardware write watchpoint and returns immediately; the thread detaches automatically after `hits` hits or `duration` seconds|1. absolute address or `main+offset`<br>2. optional size 1-8 (default 4)<br>3. optional `hits N` (default 1)<br>4. optional `duration N` seconds (default 60, 0 = unlimited)|`debug watch main+0x123456 4 hits 100`<br>`debug watch 0x2E1000 2 hits 20 duration 300`|
-|debug watch-status|Reports arming state, process, address, hit count, discovered breakpoint slots (ctx/wp), and the latest hit's PC/LR/SP/data/thread|none|`debug watch-status`|
+|debug watch-status|Reports arming state (`active`), process, address, hit count, discovered breakpoint slots (ctx/wp), and the latest hit's PC/LR/SP/data/thread. `stale=1` marks address/hit fields left over from a finished session (so `active=0` with a non-zero address is not a live breakpoint), and `memoryBlocked=1` says memory commands are refused while a session is attached|none|`debug watch-status`|
 |debug watch-last|Dumps the full register snapshot (x0-x30, sp, pc), the instruction window at pc-8..pc+3, and the stack windows captured at hit time: `fpStack` (0x200 bytes at x29, caller frame chain) and `spStack` (0x100 bytes at sp, current frame locals)|none|`debug watch-last`|
 |debug patch-code|Generic transactional code patch (any process, any size up to 1 KiB): pause, optionally verify no thread PC is inside the patched range, optionally verify the original bytes, write, read back, resume; resume is guaranteed on every error path. Target cache maintenance is handled by the kernel debug-write path — never add explicit cache ops on a target address from this sysmodule|1. absolute address (0x-hex or decimal)<br>2. expected bytes as hex pairs of the same length as the patch, or `-` to skip verification<br>3. new bytes as hex pairs (0x optional; length 1..1024 bytes)<br>optional: `pid=<hex>` target process (default: foreground application), `no-pc-check` (only for provably cold code)|`debug patch-code 0x2B5D9CF4C8 FD7BBAA9FC6F01A9FD030091FA6702A9 5000005800021FD6...`<br>`debug patch-code 0x2B5D9CF4C8 - 5000005800021FD6...`<br>`debug patch-code 0x2B5D9CF4C8 FD7B... 5000... pid=0x2B5D900000`|
 |debug watch-stop|Requests the watch thread to detach and waits for it|none|`debug watch-stop`|
@@ -398,6 +398,7 @@ search; wait for the terminal status before retrying or closing the session.
 |poke  |Writes bytes to given address relative to heap  |1. heap-relative offset (0x-hex or decimal)<br>2. data as hex byte pairs (0x optional, never decimal) |poke 0x45075880 DEADBEEF   |
 |pokeAbsolute  |Writes bytes to given absolute address  |1. absolute address (0x-hex or decimal)<br>2. data as hex byte pairs (0x optional, never decimal) |pokeAbsolute 0x45075880 DEADBEEF   |
 |pokeMain  |Writes bytes to given address relative to NSOMain  |1. NSOMain-relative offset (0x-hex or decimal)<br>2. data as hex byte pairs (0x optional, never decimal) |pokeMain 0x45075880 DEADBEEF   |
+|pokeVerified / pokeAbsoluteVerified / pokeMainVerified|Same addressing as `poke`/`pokeAbsolute`/`pokeMain`, but the server writes, reads the range back, and compares before answering. `OK addr=... size=... verified=1` on success; `ERR code=WRITE_FAILED` when the write itself failed, `ERR code=READBACK_FAILED` when the bytes were written but the verification read failed, and `ERR code=WRITE_VERIFY_FAILED` (with expected/actual bytes) when the read-back differed. Does not pause the target, so a concurrent writer can legitimately show up as a mismatch|same as the corresponding `poke` command|`pokeAbsoluteVerified 0x45075880 DEADBEEF`|
 
 ### Pointer Write
 |Command|Description|Parameters|Usage|

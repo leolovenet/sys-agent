@@ -186,6 +186,15 @@ Memory subcommands are `peek`, `peek-absolute`, `peek-main`, `peek-multi`,
 `pointer-all`, `pointer-relative`, `pointer-peek`, `pointer-peek-multi`, and `pointer-poke`.
 Addresses and sizes accept decimal or `0x`; data is hex.
 
+`memory poke`, `memory poke-absolute`, and `memory poke-main` verify by default: the
+sysmodule writes, reads the range back, and compares before answering, so a silent write
+failure is reported as `WRITE_FAILED`, a write that landed but whose verification read
+failed as `READBACK_FAILED`, and a write whose bytes did not read back as sent as
+`WRITE_VERIFY_FAILED`, instead of passing unnoticed. Pass `--no-verify` to fall back to the
+legacy blind `poke*` command, which is only useful for a target that rewrites its own memory
+fast enough to make the read-back mismatch. The client also translates common native Result
+codes and `ERR code=` names into a readable suffix while keeping the raw code.
+
 ## Freeze
 
 ```bash

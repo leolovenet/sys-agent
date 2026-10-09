@@ -35,6 +35,7 @@ class FakeState:
         self.last_key_register: list[str] | None = None
         self.last_key_unregister: list[str] | None = None
         self.key_ops: list[str] = []
+        self.poke_verify_fails = False
 
 
 class FakeHandler(socketserver.StreamRequestHandler):
@@ -130,6 +131,12 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 response = "DEADBEEF00C0FFEE"
             elif command[0] in {"poke", "pokeAbsolute", "pokeMain", "pointerPoke"}:
                 response = None
+            elif command[0] in {"pokeVerified", "pokeAbsoluteVerified", "pokeMainVerified"}:
+                if state.poke_verify_fails:
+                    response = (f"ERR code=WRITE_VERIFY_FAILED addr={command[1]} size=2 "
+                                "expected=AABB actual=0000")
+                else:
+                    response = f"OK addr={command[1]} size=2 verified=1"
             elif command[0] == "pointer":
                 response = "0000000080001000"
             elif command[0] in {"pointerAll", "pointerRelative"}:
@@ -368,6 +375,48 @@ class ClientTests(unittest.TestCase):
         code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
                      "--timeout", "1", "audio", "mute", "enabled"])
         self.assertEqual(code, 0)
+
+    def test_poke_verified_is_default(self) -> None:
+        with self.client() as client:
+            result = client.poke_absolute_verified(0x100, b"\xAA\xBB")
+            self.assertEqual(result["verified"], "1")
+            self.assertEqual(self.server.state.last_command[0], "pokeAbsoluteVerified")
+
+        from client.sysagent import main
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "memory", "poke-absolute", "0x100", "AABB"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.server.state.last_command[0], "pokeAbsoluteVerified")
+
+    def test_poke_verified_heap_and_main_variants(self) -> None:
+        with self.client() as client:
+            self.assertEqual(client.poke_verified(0x20, b"\xAA\xBB")["verified"], "1")
+            self.assertEqual(self.server.state.last_command[0], "pokeVerified")
+            self.assertEqual(client.poke_main_verified(0x20, b"\xAA\xBB")["verified"], "1")
+            self.assertEqual(self.server.state.last_command[0], "pokeMainVerified")
+
+    def test_poke_no_verify_uses_legacy_command(self) -> None:
+        from client.sysagent import main
+        code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                     "--timeout", "1", "memory", "poke-absolute", "0x100", "AABB", "--no-verify"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.server.state.last_command[0], "pokeAbsolute")
+
+    def test_poke_verify_failure_is_reported(self) -> None:
+        self.server.state.poke_verify_fails = True
+        with self.client() as client:
+            with self.assertRaisesRegex(SysAgentProtocolError, "WRITE_VERIFY_FAILED"):
+                client.poke_absolute_verified(0x100, b"\xAA\xBB")
+
+    def test_error_code_translation(self) -> None:
+        with self.assertRaisesRegex(SysAgentProtocolError, "could not be read"):
+            require_ok(parse_response("ERR code=READ_FAILED result=0x10801"))
+        with self.assertRaisesRegex(SysAgentProtocolError, "verification read-back failed"):
+            require_ok(parse_response("ERR code=READBACK_FAILED result=0x10801"))
+        with self.assertRaisesRegex(SysAgentProtocolError, "debug handle unavailable"):
+            require_ok(parse_response("ERR code=WEIRD result=0x10801"))
+        with self.assertRaisesRegex(SysAgentProtocolError, "bluetooth"):
+            require_ok(parse_response("ERR code=WEIRD result=0x2F4471"))
 
     def test_unknown_search_commands_and_status_fields(self) -> None:
         with self.client() as client:

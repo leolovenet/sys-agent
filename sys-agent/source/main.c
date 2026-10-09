@@ -25,7 +25,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.7.6"
+#define VERSION_S "2.8.0"
 
 typedef enum {
     Active = 0,
@@ -306,6 +306,14 @@ static bool configNameIsWritable(const char* name)
     return false;
 }
 
+/* Print a byte range as uppercase hex (memory order, lowest address first). */
+static void printHexBytes(const u8* bytes, u64 size)
+{
+    u64 i;
+    for (i = 0; i < size; i++)
+        printf("%02X", bytes[i]);
+}
+
 int argmain(int argc, char** argv)
 {
     if (argc == 0)
@@ -549,11 +557,12 @@ int argmain(int argc, char** argv)
             }
             DebugWatchStatus status;
             debugWatchGetStatus(&status);
-            printf("OK active=%d armed=%d pid=%016lX address=%016lX size=%lu"
+            printf("OK active=%d armed=%d stale=%d memoryBlocked=%d pid=%016lX address=%016lX size=%lu"
                 " maxHits=%u hitCount=%u ctxSlot=%u wpSlot=%u duration=%lu"
                 " lastPc=%016lX lastLr=%016lX lastSp=%016lX lastData=%016lX"
                 " lastThread=%016lX stage=%s lastError=0x%X hint=%s\n",
-                status.active, status.armed, status.processId,
+                status.active, status.armed, status.stale, status.memoryBlocked,
+                status.processId,
                 status.watchAddress, status.watchSize, status.maxHits,
                 status.hitCount, status.ctxSlot, status.wpSlot,
                 status.durationSeconds, status.lastPc, status.lastLr,
@@ -1079,6 +1088,77 @@ int argmain(int argc, char** argv)
         }
         poke(meta.main_nso_base + offset, size, data);
         free(data);
+    }
+
+    /* poke*Verified: same addressing as poke/pokeAbsolute/pokeMain, but the
+     * server writes, reads the range back, and compares before answering. This
+     * is the non-pausing counterpart to debug patch-code: it never stops the
+     * target, so a concurrent writer can legitimately show up as a mismatch. */
+    if (!strcmp(argv[0], "pokeVerified") || !strcmp(argv[0], "pokeAbsoluteVerified")
+        || !strcmp(argv[0], "pokeMainVerified"))
+    {
+        if (argc != 3)
+        {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return 0;
+        }
+
+        u64 target = 0;
+        if (strcmp(argv[0], "pokeAbsoluteVerified") != 0)
+        {
+            MetaData meta = getMetaData();
+            target = !strcmp(argv[0], "pokeMainVerified") ? meta.main_nso_base : meta.heap_base;
+            if (target == 0)
+            {
+                printf("ERR code=NO_APP\n");
+                return 0;
+            }
+        }
+
+        u64 offset = 0;
+        if (!tryParseStringToInt(argv[1], &offset)) {
+            printf("ERR code=INVALID_ADDRESS arg=%s\n", argv[1]);
+            return 0;
+        }
+        u64 size = 0;
+        u8* data = parseStringToByteBuffer(argv[2], &size);
+        if (data == NULL || size == 0) {
+            free(data);
+            printf("ERR code=INVALID_HEX_PAYLOAD arg=%s\n", argv[2]);
+            return 0;
+        }
+        u64 address = target + offset;
+
+        u8* readback = malloc(size);
+        if (readback == NULL) {
+            free(data);
+            printf("ERR code=OUT_OF_MEMORY\n");
+            return 0;
+        }
+        bool mismatch = false;
+        Result readbackRc = 0;
+        Result rc = pokeVerified(address, size, data, readback, &mismatch, &readbackRc);
+        if (R_FAILED(rc)) {
+            printf("ERR code=WRITE_FAILED addr=0x%lX size=%lu result=0x%X\n",
+                address, size, rc);
+        } else if (R_FAILED(readbackRc)) {
+            /* The bytes were written; only the verification read failed. Say so
+             * instead of reporting a write failure that would invite a re-write. */
+            printf("ERR code=READBACK_FAILED addr=0x%lX size=%lu result=0x%X\n",
+                address, size, readbackRc);
+        } else if (mismatch) {
+            printf("ERR code=WRITE_VERIFY_FAILED addr=0x%lX size=%lu expected=",
+                address, size);
+            printHexBytes(data, size);
+            printf(" actual=");
+            printHexBytes(readback, size);
+            printf("\n");
+        } else {
+            printf("OK addr=0x%lX size=%lu verified=1\n", address, size);
+        }
+        free(readback);
+        free(data);
+        return 0;
     }
 
     //click <buttontype>

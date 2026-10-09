@@ -56,6 +56,14 @@ MetaData getMetaData(void);
 bool getIsProgramOpen(u64 id);
 
 void poke(u64 offset, u64 size, u8* val);
+/* Write, then read the range back and compare. Returns the write Result (0 when
+ * the bytes were written). *readResult then holds the read-back Result and
+ * *mismatch says whether a successful read-back differed from `val`, so a write
+ * that landed but whose verification read failed is never reported as a write
+ * failure. `readback` must hold at least `size` bytes; *readResult and *mismatch
+ * are always written. */
+Result pokeVerified(u64 offset, u64 size, u8* val, u8* readback, bool* mismatch,
+    Result* readResult);
 void peek(u64 offset, u64 size);
 void peekInfinite(u64 offset, u64 size);
 void peekMulti(u64* offset, u64* size, u64 count);
