@@ -2,6 +2,8 @@
 
 extern bool bControllerIsInitialised;
 extern HidDeviceType controllerInitializedType;
+extern u64 controllerIdleReleaseSeconds;
+extern u64 controllerTakeoverMode;
 extern HiddbgHdlsHandle controllerHandle;
 extern HiddbgHdlsDeviceInfo controllerDevice;
 extern HiddbgHdlsState controllerState;
@@ -38,6 +40,14 @@ typedef struct {
 #define JOYSTICK_RIGHT 1
 
 void detachController();
+void controllerRefreshIfIdle(void);
+void controllerServiceIdle(void);
+void controllerServiceReconnect(void);
+void controllerStatusCommand(void);
+void controllerDumpCommand(void);
+void controllerKickCommand(const char* arg);
+void controllerReconnectCommand(const char* arg, const char* addrArg);
+void controllerPairedDevicesCommand(void);
 u64 getTitleId(u64 pid);
 u64 GetTitleVersion(u64 pid);
 u64 getoutsize(NsApplicationControlData* buf);

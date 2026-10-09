@@ -652,6 +652,46 @@ class SysAgentClient:
     def detach_controller(self) -> None:
         self._bare_command("detachController", expect_output=False)
 
+    def controller_status(self) -> dict[str, str]:
+        return require_ok(self.command("controllerStatus"))
+
+    def _read_block(self, command: str, end_token: str) -> str:
+        """Send a command whose answer is a multi-line block ending in end_token."""
+        self.connect()
+        assert self._socket is not None
+        self._socket.sendall(command.encode("ascii") + b"\r\n")
+        lines: list[str] = []
+        while True:
+            line = self._readline().decode("utf-8", errors="replace")
+            lines.append(line)
+            if len(lines) == 1 and line.startswith("ERR "):
+                raise SysAgentProtocolError(line)
+            if line == end_token:
+                break
+        return "\n".join(lines)
+
+    def controller_dump(self) -> str:
+        """Full virtual-controller dump (player slots, HDLS devices, hidsys owners)."""
+        return self._read_block("controllerDump", "END controllerDump")
+
+    def controller_kick(self, npad_id: int) -> str:
+        if not 0 <= npad_id <= 7:
+            raise ValueError("npad id must be 0..7")
+        return self._read_block(f"controllerKick {npad_id}", "END controllerKick")
+
+    def controller_reconnect(self, timeout_ms: int = 5000, address: str | None = None) -> str:
+        """Pull back a controller: saved kick addresses, or one explicit address."""
+        if timeout_ms <= 0:
+            raise ValueError("timeout must be positive")
+        command = f"controllerReconnect {timeout_ms}"
+        if address:
+            command += f" {address}"
+        return self._read_block(command, "END controllerReconnect")
+
+    def controller_paired_devices(self) -> str:
+        """List the console's paired Bluetooth devices (addresses and names)."""
+        return self._read_block("controllerPairedDevices", "END controllerPairedDevices")
+
     def touch(self, points: Sequence[tuple[int, int]]) -> None:
         args = " ".join(f"{x} {y}" for x, y in points)
         self._bare_command(f"touch {args}", expect_output=False)
@@ -1307,6 +1347,26 @@ def _cmd_touch(client: SysAgentClient, args: argparse.Namespace) -> None:
     client.touch(pair_values(args.points))
 
 
+def _cmd_controller_status(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.controller_status())
+
+
+def _cmd_controller_dump(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.controller_dump())
+
+
+def _cmd_controller_kick(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.controller_kick(args.npad))
+
+
+def _cmd_controller_reconnect(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.controller_reconnect(args.timeout_ms, args.address))
+
+
+def _cmd_controller_paired(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.controller_paired_devices())
+
+
 def _cmd_touch_hold(client: SysAgentClient, args: argparse.Namespace) -> None:
     client.touch_hold(args.x, args.y, args.milliseconds)
 
@@ -1400,6 +1460,7 @@ def _cmd_configure(client: SysAgentClient, args: argparse.Namespace) -> None:
         "mainLoopSleepTime", "buttonClickSleepTime", "echoCommands",
         "printDebugResultCodes", "keySleepTime", "fingerDiameter",
         "pollRate", "freezeRate", "controllerType",
+        "controllerIdleRelease", "controllerTakeover",
     }
     if args.parameter not in known_params:
         raise ValueError(
@@ -1518,6 +1579,29 @@ CLICK_SEQ_HELP = "\n".join((
     BUTTON_HELP,
 ))
 
+CONTROLLER_STATUS_HELP = "\n".join((
+    "One line of virtual-controller state:",
+    "  initialised/handle/session    current device (0 = none attached)",
+    "  attached                      HOS still has that device attached?",
+    "  deviceType / interface        what the pad presents itself as",
+    "  idleRelease / takeover        the two behaviour settings",
+    "  slot                          row held in the assignment table",
+    "  assignmentRc/lastStateError   last dump / state write result",
+    "  npad0                         hidsys owner of player 1 (free = none)",
+    "",
+    "Read-only: initialised=0 is reported instead of creating a device,",
+    "so the command is safe to run at any time.",
+    "attached=0 with a non-zero lastStateError means the console is not",
+    "routing the virtual pad; see docs/hdls-virtual-controller-notes.md.",
+))
+
+CONTROLLER_DUMP_HELP = "\n".join((
+    "Multi-line diagnostic dump:",
+    "  npadAssignment  HDLS handle -> npad slot table (internal rows hidden)",
+    "  hdlsStates      every controller hid:dbg knows about",
+    "  hidsysNpads     layout signature, pad count, per-slot owners",
+    "                  (npad 0-7, Other, Handheld) with interface + number",
+))
 
 # ---- command registry -------------------------------------------------------
 
@@ -1698,6 +1782,24 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 (Arg("keys", "HidKeyboardKey values", nargs="+", type=parse_int),)),
     )),
 
+    CommandGroup("controller", "Inspect and recover the virtual controller", (
+        Command("status", "One-line virtual-controller status", _cmd_controller_status,
+                (), CONTROLLER_STATUS_HELP),
+        Command("dump", "Full dump: player slots, HDLS devices, hidsys owners",
+                _cmd_controller_dump, (), CONTROLLER_DUMP_HELP),
+        Command("kick", "Disconnect the real controller that holds a player slot",
+                _cmd_controller_kick,
+                (Arg("npad", "player slot 0-7", type=parse_int),)),
+        Command("reconnect", "Pull back the controllers a kick disconnected (btdrv trigger)",
+                _cmd_controller_reconnect,
+                (Arg("timeout_ms", "host trigger timeout in ms", type=parse_int,
+                     nargs="?", default=5000),
+                 Arg("address", "explicit Bluetooth address AA:BB:CC:DD:EE:FF",
+                     nargs="?", default=None))),
+        Command("paired", "List the console's paired Bluetooth devices",
+                _cmd_controller_paired, ()),
+    )),
+
     CommandGroup("screen", "Capture or control the screen", (
         Command("capture", "Capture the current screen as a JPEG", _cmd_screenshot,
                 (Arg("output", "write the JPEG to this path "
@@ -1729,7 +1831,12 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
         Command("set", "Change a timing or settings value", _cmd_configure,
                 (Arg("parameter", "mainLoopSleepTime, buttonClickSleepTime, echoCommands, "
                                   "printDebugResultCodes, keySleepTime, fingerDiameter, "
-                                  "pollRate, freezeRate, or controllerType"),
+                                  "pollRate, freezeRate, controllerType, "
+                                  "controllerIdleRelease (seconds before the virtual "
+                                  "controller releases the player slot, 0=never), "
+                                  "controllerTakeover (0=off, 1=kick the blocking "
+                                  "controller and confirm the system page with A, "
+                                  "default 2)"),
                  Arg("value", "new value", type=parse_int))),
     )),
 

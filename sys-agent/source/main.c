@@ -25,7 +25,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.7.4"
+#define VERSION_S "2.7.5"
 
 typedef enum {
     Active = 0,
@@ -987,6 +987,7 @@ int argmain(int argc, char** argv)
     {
         if (argc != 2)
             return 0;
+        controllerRefreshIfIdle();
         HidNpadButton key = parseStringToButton(argv[1]);
         click(key);
     }
@@ -998,6 +999,7 @@ int argmain(int argc, char** argv)
         if (argc != 2)
             return 0;
 
+        controllerRefreshIfIdle();
         u64 sizeArg = strlen(argv[1]) + 1;
         char* seqNew = malloc(sizeArg);
         if (seqNew == NULL) {
@@ -1016,6 +1018,7 @@ int argmain(int argc, char** argv)
     {
         if (argc != 2)
             return 0;
+        controllerRefreshIfIdle();
         HidNpadButton key = parseStringToButton(argv[1]);
         press(key);
     }
@@ -1025,6 +1028,7 @@ int argmain(int argc, char** argv)
     {
         if (argc != 2)
             return 0;
+        controllerRefreshIfIdle();
         HidNpadButton key = parseStringToButton(argv[1]);
         release(key);
     }
@@ -1053,6 +1057,7 @@ int argmain(int argc, char** argv)
         if (dyVal > JOYSTICK_MAX) dyVal = JOYSTICK_MAX;
         if (dyVal < JOYSTICK_MIN) dyVal = JOYSTICK_MIN;
 
+        controllerRefreshIfIdle();
         setStickState(side, dxVal, dyVal);
     }
 
@@ -1060,6 +1065,29 @@ int argmain(int argc, char** argv)
     if (!strcmp(argv[0], "detachController"))
     {
         detachController();
+    }
+    if (!strcmp(argv[0], "controllerStatus"))
+    {
+        controllerStatusCommand();
+    }
+    if (!strcmp(argv[0], "controllerDump"))
+    {
+        controllerDumpCommand();
+    }
+    if (!strcmp(argv[0], "controllerKick"))
+    {
+        if (argc >= 2)
+            controllerKickCommand(argv[1]);
+        else
+            printf("ERR controllerKick args=1 (npadId 0-7)\n");
+    }
+    if (!strcmp(argv[0], "controllerReconnect"))
+    {
+        controllerReconnectCommand(argc >= 2 ? argv[1] : NULL, argc >= 3 ? argv[2] : NULL);
+    }
+    if (!strcmp(argv[0], "controllerPairedDevices"))
+    {
+        controllerPairedDevicesCommand();
     }
     if (!strcmp(argv[0], "game"))
     {
@@ -1159,6 +1187,21 @@ int argmain(int argc, char** argv)
             controllerInitializedType = fControllerType;
             mutexUnlock(&controllerMutex);
         }
+
+        if (!strcmp(argv[1], "controllerIdleRelease")) {
+            u64 seconds = parseStringToInt(argv[2]);
+            mutexLock(&controllerMutex);
+            controllerIdleReleaseSeconds = seconds;
+            mutexUnlock(&controllerMutex);
+        }
+
+        if (!strcmp(argv[1], "controllerTakeover")) {
+            u64 mode = parseStringToInt(argv[2]);
+            mutexLock(&controllerMutex);
+            controllerTakeoverMode = mode;
+            mutexUnlock(&controllerMutex);
+        }
+
     }
 
     if (!strcmp(argv[0], "getTitleID")) {
@@ -1734,7 +1777,10 @@ int main()
 
     while (true)
     {
-        poll(pfds, fd_count, -1);
+        /* Wake up periodically: the virtual controller must be able to release
+         * its player slot while no client is connected (controllerServiceIdle
+         * runs below). poll returning 0 on timeout is handled like "no data". */
+        poll(pfds, fd_count, (int)mainLoopSleepTime);
         mutexLock(&freezeMutex);
         for (int i = 0; i < fd_count; i++)
         {
@@ -1799,6 +1845,8 @@ int main()
         if (fr_count == 0)
             freeze_thr_state = Idle;
         mutexUnlock(&freezeMutex);
+        controllerServiceIdle();
+        controllerServiceReconnect();
         svcSleepThread(mainLoopSleepTime * 1e+6L);
     }
 

@@ -34,6 +34,7 @@ docker run --rm \
 - 未知按钮 token 不发任何按钮,绝不发默认键。
 - 写命令前必须回环检查服务器错误码。
 - hex 载荷端到端 hex 解析(验证解析器,不只验证发送方)。历史教训:只有带 `0x` 前缀才按 hex 解析,导致 `50 00 00 58...` 被写成十进制乱码。
+- 虚拟手柄(`click`/`press`/`release`/`setStick`/`clickSeq`)在空闲 ≥0.5s 后按布局指纹重建设备以熬过底座/Joy-Con 拓扑变化,重建后等 150ms 再写状态,用完默认 1s 让位并按蓝牙地址主动回连(`btdrvTriggerConnection`);机制、诊断命令与验收见 `docs/hdls-virtual-controller-notes.md`。**`hiddbgApplyHdlsNpadAssignmentState` 在 22.1.0 上崩过机,命令与自动路径都已删除,不得再加回来。**
 
 ## 运算与字节序纪律
 
@@ -80,7 +81,7 @@ docker run --rm \
 | `client/README.md` | sys-agent client 说明 |
 | `third_party/README.md` | 第三方源码清单 |
 | `docs/ftp-server.md` | FTP 服务与验证矩阵(改 FTP 前) |
-| `docs/hdls-virtual-controller-notes.md` | HDLS 虚拟手柄在底座+分离手柄下失效机制 |
+| `docs/hdls-virtual-controller-notes.md` | HDLS 虚拟手柄失效机制、自动重建/自愈、诊断命令与系统限制(改输入或手柄代码前必读) |
 | `docs/headless-launch-rights-key-notes.md` | headless 启动与 external key 机制(改 launch/keys 前必读) |
 | `docs/process-memory-backend.md` | 统一内存后端设计(direct/auto) |
 | `docs/search-a-level-design.md` | A 级精确搜索设计与部署门槛 |

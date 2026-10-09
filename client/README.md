@@ -95,6 +95,45 @@ decryption), then a plain launch (`externalKey=none`). Only the title-key block/
 the titlekey travels to the console; `prod.keys` never leaves the host. See
 `docs/headless-launch-rights-key-notes.md` for the full mechanism.
 
+## Controller
+
+```bash
+python3 client/sysagent.py --host switch controller status
+python3 client/sysagent.py --host switch controller dump
+```
+
+`controller status` prints one line of virtual-controller state: `initialised`, HDLS
+handle/session, the `attached` flag, device type, npad interface, `idleRelease`, `takeover`, the
+slot currently held in the hid:dbg assignment table, the last `hiddbgSetHdlsState` error, and the
+hidsys owner of player 1 (read-only: it reports `initialised=0` instead of creating a device).
+`controller dump` prints the full diagnostic (every controller hid:dbg knows about, the raw
+`HdlsNpadAssignment` table, and the hidsys player-slot owners plus the controller layout
+signature, pad count, interface and controller number) as a multi-line block terminated by
+`END controllerDump`.
+
+Recovery aids for input problems:
+
+```bash
+python3 client/sysagent.py --host switch controller paired
+python3 client/sysagent.py --host switch controller reconnect 5000 98:41:5C:65:A6:FD
+python3 client/sysagent.py --host switch controller kick 0
+```
+
+`controller paired` lists the console's paired Bluetooth devices, which separates "the pairing is
+gone" from "the console is not connecting it". `controller reconnect [ms] [addr]` triggers
+`btdrvTriggerConnection` for the controllers a takeover disconnected (or for one explicit
+address); a Bluetooth controller that the console disconnected never pages back on its own - not
+even with SYNC - so this is the only way to pull it back without re-seating it on the rail.
+`controller kick <0-7>` performs the takeover's first step manually.
+
+The virtual controller rebuilds after controller topology changes, takes player 1 over
+(`configure controllerTakeover`, default 2) when the player's own controller holds it, releases
+the slot `configure controllerIdleRelease` seconds (default 1) after use, and pulls the
+disconnected controller back automatically; with nothing to yield to it simply stays attached,
+and a state write that stays refused is reported once as `ERR controllerState …`.
+Mechanism, evidence and the remaining system limits are in
+`docs/hdls-virtual-controller-notes.md`.
+
 ## Audio
 
 ```bash

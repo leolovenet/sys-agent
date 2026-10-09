@@ -427,6 +427,40 @@ See https://github.com/olliz0r/sys-botbase/blob/master/sys-botbase/source/util.c
 |clickSeq|Sends several button inputs and wait commands in sequence|1. single string (no spaces) with comma-separated commands out of the following<br><br>**buttonType** for click<br>**+buttonType** for press<br>**-buttonType** for release<br>**Wnumber** to sleep number ms<br>**%X,Y** move left stick to position X Y<br>**&X,Y** move right stick to position X Y| clickSeq A,W1000,B,W200,DUP,W500,DD,W350,%5000,1500,W2650,%0,0
 |clickCancel|Interrupts click sequence|none|clickCancel|
 |detachController|Forces the virtual controller to detach, useful in cases where it bugs out|none|detachController|
+|controllerStatus|One-line state of the virtual controller: `initialised`, HDLS handle/session, `attached`, device type, npad interface, `idleRelease`, `takeover`, the row held in the hid:dbg assignment table (`slot`), the last `hiddbgSetHdlsState` error, and the hidsys owner of player 1 (`npad0=`)<br>Read-only: reports `initialised=0` instead of creating a device|none|controllerStatus|
+|controllerDump|Multi-line diagnostic dump: hid:dbg HDLS->npad assignment table, every controller hid:dbg knows about, and the hidsys owner of each player slot plus the controller layout signature, pad count, interface and controller number|none|controllerDump|
+|controllerKick|Disconnects the real controller(s) currently assigned to the given player slot; their Bluetooth addresses are remembered so they can be pulled back later (the same path the automatic takeover uses)<br>The disconnected controller never pages back on its own - use `controllerReconnect` or re-seat it on the rail|1. player slot `0`-`7`|controllerKick 0|
+|controllerReconnect|Pulls back the controllers a kick disconnected, or one explicit address, using `btdrvTriggerConnection`; prints paired info, trigger results and the pad list afterwards|1. optional trigger timeout in ms, default 5000<br>2. optional Bluetooth address `AA:BB:CC:DD:EE:FF`|controllerReconnect 5000 98:41:5C:65:A6:FD|
+|controllerPairedDevices|Lists the console's paired Bluetooth devices (address, link key presence, name), which separates "pairing lost" from "the console is not connecting it"|none|controllerPairedDevices|
+
+The virtual controller rebuilds itself when the console reconfigures its controllers
+(docking/undocking, connecting or detaching Joy-Cons, starting a game): the first
+`click`/`press`/`release`/`setStick`/`clickSeq` after more than 0.5 s of idle time
+re-attaches the device (when the controller layout changed) and waits 150 ms before
+sending the state, so a topology change cannot leave the input silently dead.
+
+In docked mode a game binds a resident player to one controller at a time: while the
+virtual controller holds player 1 the console's own controller cannot reliably drive the
+character (coexistence was measured both ways, so do not rely on it), and releasing the
+virtual device makes the game ask for a controller again.
+The virtual controller behaves like a supplementary input device: while the console has no
+non-handheld controller (only rail Joy-Cons) it is the only external controller and stays
+attached after use - the game always has a controller, so it never prompts out of nowhere.
+As soon as a Bluetooth controller exists (detached Joy-Cons, a third-party pad) the virtual
+one takes player 1 over when used and releases it again `controllerIdleRelease` seconds
+(default 1) after the input finished (neutral state, no running clickSeq); the main loop then
+triggers `btdrvTriggerConnection` for every controller the takeover disconnected, so it
+reconnects by itself and the player can carry on. Rail Joy-Cons in docked mode are the
+handheld pad and cannot drive the game, so they do not count as a controller to yield to.
+
+When the player's own controller holds player 1, a virtual state write is refused
+(`ERR controllerState …`, reported once per error). `controllerTakeover` decides what happens
+then: `0` only reports it, `1` disconnects that controller and retries, `2` (default) also
+confirms the system's controller overlay with a short A. A disconnected Bluetooth controller
+stays paired but never pages back on its own (pressing buttons, even SYNC, does nothing) - the
+takeover's automatic `btdrvTriggerConnection` is what brings it back without re-seating it.
+Mechanism, arbitration, evidence and the remaining system limits are documented in
+`docs/hdls-virtual-controller-notes.md`.
 
 ### Touchscreen Input
 |Command|Description|Parameters|Usage|
@@ -479,5 +513,7 @@ The configure command allows setting of some timing values in sys-agent:
 |fingerDiameter|Controls the diameter of the virtual touch finger<br>default 50|1. new diameter for touch events|configure fingerDiameter 100|
 |pollRate|How long a touch event shall be held down<br>default 17<br>polling is linked to screen refresh rate (system UI) or game framerate. Most cases this is 1/60 or 1/30|1. New poll rate|configure pollRate 34|
 |freezeRate|How often frozen values shall be rewritten to RAM<br>default 3ms|1. new freezerate in ms|configure freezeRate 10|
-|controllerType|controllerType to use for controller input commands<br>default 3|See HidDeviceType on https://switchbrew.github.io/libnx/hid_8h.html|configure controllerType 12|
+|controllerType|controllerType to use for controller input commands<br>default 3 (Pro Controller / FullKey3)|See HidDeviceType on https://switchbrew.github.io/libnx/hid_8h.html|configure controllerType 3|
+|controllerIdleRelease|Seconds without any input command after which the virtual controller is detached so the console's own controller can take player 1 back. Only applies when a non-handheld controller exists (or a takeover kicked one); with nothing to yield to the virtual controller stays attached<br>default 1, `0` = never release|1. seconds|configure controllerIdleRelease 5|
+|controllerTakeover|What to do when player 1 is held by the console's own controller<br>`0` = do not touch it, just report a refused state write, `1` = disconnect that controller and retry, `2` (default) = also confirm the system's controller overlay with a short A<br>The takeover remembers the disconnected controller's Bluetooth address and the main loop triggers the connection again after the virtual controller yields, so the controller comes back without being re-seated|1. mode `0`-`2`|configure controllerTakeover 0|
  

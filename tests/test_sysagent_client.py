@@ -215,6 +215,14 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 response = "00000005370606000"
             elif command[0] == "isProgramRunning":
                 response = "1"
+            elif command[0] == "controllerStatus":
+                response = ("OK handle=0000000000000001 session=0000000000000002 attached=1 "
+                            "deviceType=0x03 interface=1(bluetooth) bindNpad=-1 slot=0 "
+                            "assignmentRc=0x0 lastStateError=0x0")
+            elif command[0] in {"controllerDump", "controllerKick", "controllerReconnect",
+                               "controllerPairedDevices"}:
+                end_token = f"END {command[0]}"
+                response = f"OK command={command[0]}\n  detail=1\n{end_token}"
             else:
                 response = "ERR code=UNKNOWN_COMMAND"
             if response is None:
@@ -461,6 +469,39 @@ class ClientTests(unittest.TestCase):
             line = client.click_seq("A,W100,B")
             self.assertEqual(line, "done")
             self.assertEqual(self.server.state.last_command, ["clickSeq", "A,W100,B"])
+
+    def test_controller_diagnostics_and_recovery(self) -> None:
+        with self.client() as client:
+            status = client.controller_status()
+            self.assertEqual(status["attached"], "1")
+            self.assertEqual(status["slot"], "0")
+            self.assertEqual(status["lastStateError"], "0x0")
+
+            dump = client.controller_dump()
+            self.assertTrue(dump.startswith("OK "))
+            self.assertTrue(dump.endswith("END controllerDump"))
+            self.assertEqual(self.server.state.last_command, ["controllerDump"])
+
+            kicked = client.controller_kick(2)
+            self.assertTrue(kicked.endswith("END controllerKick"))
+            self.assertEqual(self.server.state.last_command, ["controllerKick", "2"])
+
+            pulled = client.controller_reconnect()
+            self.assertTrue(pulled.endswith("END controllerReconnect"))
+            self.assertEqual(self.server.state.last_command, ["controllerReconnect", "5000"])
+
+            pulled_addr = client.controller_reconnect(3000, "98:41:5C:65:A6:FD")
+            self.assertTrue(pulled_addr.endswith("END controllerReconnect"))
+            self.assertEqual(self.server.state.last_command,
+                             ["controllerReconnect", "3000", "98:41:5C:65:A6:FD"])
+
+            paired = client.controller_paired_devices()
+            self.assertTrue(paired.endswith("END controllerPairedDevices"))
+
+            with self.assertRaises(ValueError):
+                client.controller_kick(9)
+            with self.assertRaises(ValueError):
+                client.controller_reconnect(0)
 
     def test_utility_commands(self) -> None:
         with self.client() as client:
