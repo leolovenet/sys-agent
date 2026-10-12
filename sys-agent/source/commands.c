@@ -8,6 +8,7 @@
 #include "util.h"
 #include "process_memory.h"
 #include "fnv1a.h"
+#include "sequence_token.h"
 
 
 //Controller:
@@ -1590,13 +1591,13 @@ void key(HiddbgKeyboardAutoPilotState* states, u64 sequentialCount)
 
 void clickSequence(char* seq, u8* token)
 {
-    const char delim = ','; // used for chars and sticks
     const char startWait = 'W';
     const char startPress = '+';
     const char startRelease = '-';
     const char startLStick = '%';
     const char startRStick = '&';
-    char* command = strtok(seq, &delim);
+    char* cursor = seq;
+    char* command = sequenceTokenNext(&cursor);
     HidNpadButton currKey = { 0 };
     u64 currentWait = 0;
 
@@ -1616,7 +1617,7 @@ void clickSequence(char* seq, u8* token)
             if (x > JOYSTICK_MAX) x = JOYSTICK_MAX;
             if (x < JOYSTICK_MIN) x = JOYSTICK_MIN;
             s64 y = 0;
-            command = strtok(NULL, &delim);
+            command = sequenceTokenNext(&cursor);
             if (command != NULL)
                 y = parseStringToSignedLong(command);
             if (y > JOYSTICK_MAX) y = JOYSTICK_MAX;
@@ -1630,7 +1631,7 @@ void clickSequence(char* seq, u8* token)
             if (x > JOYSTICK_MAX) x = JOYSTICK_MAX;
             if (x < JOYSTICK_MIN) x = JOYSTICK_MIN;
             s64 y = 0;
-            command = strtok(NULL, &delim);
+            command = sequenceTokenNext(&cursor);
             if (command != NULL)
                 y = parseStringToSignedLong(command);
             if (y > JOYSTICK_MAX) y = JOYSTICK_MAX;
@@ -1670,7 +1671,7 @@ void clickSequence(char* seq, u8* token)
         controllerLastInputTick = armGetSystemTick();
         mutexUnlock(&controllerMutex);
 
-        command = strtok(NULL, &delim);
+        command = sequenceTokenNext(&cursor);
     }
     controllerSequenceActive = false;
 }

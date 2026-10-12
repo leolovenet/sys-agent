@@ -33,6 +33,11 @@ docker run --rm \
 - 字节载荷只接受 hex 字节对(可选 `0x` 前缀;奇数长度或非 hex 字符拒绝,错误码 `INVALID_HEX_PAYLOAD`)。
 - 普通数字是 `0x`/`0X` hex 或十进制;非法字符串解析为 0,而不是静默部分值(`12AB` 不是 hex — 写 `0x12AB`)。
 - 未知按钮 token 不发任何按钮,绝不发默认键。
+- `clickSeq` 序列由 `source/sequence_token.c` 按单个 `,` 切分(主机回归测试
+  `tests/sequence_token_test.c`),切分器不持有静态状态:序列跑在 click 线程上,主线程
+  同时在解析下一条命令行。**绝不把单字节变量的地址当 `strtok` 的分隔符串**——2.11.0 及
+  更早的 `strtok(seq, &delim)` 会读到栈上未初始化字节(真机实测为 `HO_`),把 `HOME` 变成
+  未知 token `ME`、`DRIGHT` 变成 `DRIG`+`T`:整条序列一个按键都不发,却照常回 `done`。
 - 写命令前必须回环检查服务器错误码。
 - hex 载荷端到端 hex 解析(验证解析器,不只验证发送方)。历史教训:只有带 `0x` 前缀才按 hex 解析,导致 `50 00 00 58...` 被写成十进制乱码。
 - 虚拟手柄(`click`/`press`/`release`/`setStick`/`clickSeq`)在空闲 ≥0.5s 后按布局指纹重建设备以熬过底座/Joy-Con 拓扑变化,attach 后等到"玩家1 已登记我们的 pad"再写状态(下限 50ms/上限 150ms,实测约 50ms),用完让位(默认 1000ms,`controllerIdleRelease` 秒 / `controllerIdleReleaseMs` 毫秒;这是"真手柄下线"里唯一由我们掌握的时长)并按蓝牙地址主动回连(`btdrvTriggerConnection`):虚拟设备还占着玩家槽时**完全不触发**(占槽时的寻呼会被接受但不会注册成手柄,白耗预算),让位后适配器一次只寻呼一条链路,同一对 Joy-Con 的第二只要等第一只链路建立完,实测 0.5~1.3s 内一律返回链路忙(`0x2F4471`),所以失败地址按主循环节拍 50ms 重试、预算 40 次(≈2s),再 0.25s/0.6s 兜底;机制、时间阀、诊断命令与验收见 `docs/hdls-virtual-controller-notes.md`。**`hiddbgApplyHdlsNpadAssignmentState` 在 22.1.0 上崩过机,命令与自动路径都已删除,不得再加回来。**

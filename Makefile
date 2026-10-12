@@ -31,4 +31,6 @@ test:
 	/tmp/sys-agent-result-check-test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-agent/source tests/fnv1a_test.c sys-agent/source/fnv1a.c -o /tmp/sys-agent-fnv1a-test
 	/tmp/sys-agent-fnv1a-test
+	$(HOSTCC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Isys-agent/source tests/sequence_token_test.c sys-agent/source/sequence_token.c -o /tmp/sys-agent-sequence-token-test
+	/tmp/sys-agent-sequence-token-test
 	python3 -m unittest -v tests/test_sysagent_client.py
