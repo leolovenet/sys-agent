@@ -27,6 +27,7 @@ docker run --rm \
 - Docker socket 沙盒受限,需 escalation;固定镜像已零警告编译本地 commit `ae13548c587b75abf54f32032ad8d52f51eda05e` 与上游 v2.5 tag `45b6a6419624ed1a1f34aabc9f37336d5f130e61`。
 - 构建成功不等于部署授权:安装/测试自定义 sysmodule 需要明确请求、版本/ABI 检查与分阶段真机测试;旧备份不保留(policy 2026-08-31),回滚 = 重建重部署。
 - 发布产物是**本地产物**(`build/` 被忽略,不进仓库):发布说明写 `build/release/v<版本>-notes.md`(正文格式见 `v2.7.6-notes.md`),SD 布局放 `build/release/v<版本>/atmosphere/contents/43000000000000A6/{exefs.nsp,toolbox.json,flags/boot2.flag}`,再压成 `build/release/sys-agent-v<版本>.zip`。
+- **两条独立的版本线**:sysmodule 的 `VERSION_S`(`sys-agent/source/main.c`)与客户端的 `CLIENT_VERSION`(`client/sysagent.py`)各自升降——客户端没改就不动它的号,sysmodule 改了也一样,不要求两者相等。各自的查询入口:客户端自己的用 `python3 client/sysagent.py --version`(单行、不需要主机),主机上跑的用 `utility version`,并排看用顶层 `version`(两行都带标签;主机连不上时客户端那行照打、错误走 stderr、退出码 2)。改动客户端命令或文档时要一并升 `CLIENT_VERSION`(Patch 级即可),sysmodule 仍按工作区规则升。
 
 ## 协议约定
 

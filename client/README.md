@@ -7,6 +7,7 @@ non-FTP sys-agent command behind grouped subcommands; FTP is intentionally not b
 ## Commands
 
 ```
+version   Show the client version and the version the host reports
 backend   Inspect or configure the process-memory backend
 system    Query or control system state
 audio     Query or control system audio
@@ -23,6 +24,30 @@ raw       Send any single-line command and print the raw response
 
 Run `python3 client/sysagent.py --help` for the full list; every leaf command has its own
 `--help` with argument descriptions.
+
+## Version
+
+The client is versioned on its own: `CLIENT_VERSION` in `client/sysagent.py` moves when that file
+changes, and the sysmodule on the console keeps its own version, which only `getVersion` (and the
+commands that wrap it) can report. The two are deliberately independent -- the console can gain a
+build without the client changing, and the other way round -- so `version` prints both, labelled,
+instead of picking one meaning for the word:
+
+```bash
+python3 client/sysagent.py --version                       # the client alone, one line, no host
+python3 client/sysagent.py --host switch version           # both, labelled
+python3 client/sysagent.py --host switch utility version   # the console's version alone
+```
+
+```text
+client    1.0.0
+sys-agent 2.13.2  (switch:6000)
+```
+
+The `client` line needs no network and is printed first; if the console cannot be reached the
+`sys-agent` line is replaced by an error on stderr and the exit status is 2, so `version` doubles
+as a reachability check. `utility version` is unchanged, which keeps scripts that already read the
+console's version working.
 
 ## Backend
 
@@ -298,7 +323,8 @@ python3 client/sysagent.py --host switch config list
 ```
 
 Utility subcommands are `version`, `title-id`, `title-version`, `system-language`, `build-id`,
-`heap-base`, `main-nso-base`, `is-program-running`, `charge`, and `fd-count`.
+`heap-base`, `main-nso-base`, `is-program-running`, `charge`, and `fd-count`. `utility version` is
+the console's version on its own; the top-level `version` above prints it next to the client's.
 
 `config set` validates the known parameters and changes one; `config get <parameter>` and
 `config list` read the values back from the sysmodule, so there is no need to remember what a
@@ -377,10 +403,12 @@ all parse (`0x10` is sixteen); hex byte payloads are always even-length byte pai
 optional `0x` prefix, never decimal. The parser rejects an odd length or a non-hex character
 instead of guessing.
 
-The client keeps one TCP connection to port 6000 and sends one command at a time; the sysmodule
-accepts several simultaneous connections, but each is served serially, so a long command on one
-connection delays another. Read-only commands transparently reconnect after an empty response
-(see the retry note above); command output is a single line of `key=value` fields unless
+The client keeps one TCP connection to port 6000 and sends one command at a time; the connection
+opens with the first command, not when the client object is created, so a command that can answer
+without the console still does (`version` prints its client line even with the host down). The
+sysmodule accepts several simultaneous connections, but each is served serially, so a long command
+on one connection delays another. Read-only commands transparently reconnect after an empty
+response (see the retry note above); command output is a single line of `key=value` fields unless
 `--json` is given.
 
 The Python API keeps the raw `dict[str, str]` returns and adds typed results where they help:

@@ -528,6 +528,11 @@ See https://switchbrew.github.io/libnx/hid_8h.html HidKeyboardKey and HidKeyboar
 |log|Prints the last commands (oldest first) with a system tick, then `END log`. The ring holds 32 entries. It records the commands, not their replies; service-level failures are appended to the diagnostic log on the SD card (`/switch/sys-agent/sys-agent.log`)|optional: `count N` (1..32)|`log count 8`|
 |charge|Returns charge status of the battery|none|charge|
 
+The client reports the console's version on its own with `utility version`, and next to its own
+version with the top-level `version` (`--version` prints the client alone); the client and the
+sysmodule are versioned independently, so both numbers are worth seeing. Details in
+`client/README.md`.
+
 ## Configure
 The configure command reads and writes sys-agent's runtime settings. `configure` with no argument
 prints every setting, `configure <name>` prints one, and `configure <name> <value>` sets one; the

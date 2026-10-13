@@ -201,6 +201,7 @@ This project was created for the purpose of development for bot automation. The 
 5. Verify the service over TCP, for example:
 
    ```bash
+   python3 client/sysagent.py --host switch version   # client version + what the console reports
    printf 'getVersion\r\n' | nc -w 3 switch 6000
    printf 'memoryBackendProbe\r\n' | nc -w 3 switch 6000
    printf 'searchCapabilities\r\n' | nc -w 3 switch 6000

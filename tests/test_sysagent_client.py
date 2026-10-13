@@ -805,6 +805,48 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(client.game("version"), "1.6.0")
             self.assertEqual(client.game("icon"), (b"\xFF\xD8" + b"ICON").hex().upper())
 
+    def test_version_prints_client_and_host(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import CLIENT_VERSION, main
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                         "--timeout", "1", "version"])
+        self.assertEqual(code, 0)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[0], f"client    {CLIENT_VERSION}")
+        self.assertEqual(
+            lines[1],
+            f"sys-agent 2.7.0  (127.0.0.1:{self.server.server_address[1]})")
+
+    def test_version_flag_prints_the_client_only(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import CLIENT_VERSION, main
+
+        output = io.StringIO()
+        with self.assertRaises(SystemExit) as exit_code:
+            with contextlib.redirect_stdout(output):
+                main(["--version"])
+        self.assertEqual(exit_code.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), f"sysagent.py {CLIENT_VERSION}")
+
+    def test_version_reports_an_unreachable_host(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import CLIENT_VERSION, main
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = main(["--host", "127.0.0.1", "--port", "1", "--timeout", "1",
+                         "--retries", "0", "version"])
+        self.assertEqual(code, 2)
+        self.assertEqual(output.getvalue().splitlines(), [f"client    {CLIENT_VERSION}"])
+        self.assertTrue(errors.getvalue().startswith("error: "), errors.getvalue())
+
     def test_game_icon_cli_writes_file(self) -> None:
         import os
         import tempfile

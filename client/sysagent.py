@@ -17,6 +17,11 @@ from collections.abc import Iterator, Sequence
 
 TERMINAL_STATES = {"done", "cancelled", "error"}
 
+# The client is versioned on its own: this number moves when this file changes, while the
+# sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
+# prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
+CLIENT_VERSION = "1.0.0"
+
 # Ordinary command responses are small, but the screenCapture (legacy
 # "pixelPeek") command returns the captured JPEG as a single hex line. The
 # sys-agent capture buffer is 0x7D000 bytes, so the worst-case hex line is
@@ -528,7 +533,10 @@ class SysAgentClient:
         self._sequence_capabilities: dict[str, str] | None = None
 
     def __enter__(self) -> "SysAgentClient":
-        self.connect()
+        # Deliberately no connection here: the first command opens one (`_command_once` calls
+        # `connect`), so a command that can answer before it needs the console still does.  That
+        # is what lets `version` print the client line before it asks the host for the other one,
+        # the way `docker version` prints its client section with the daemon down.
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -1623,6 +1631,16 @@ def _silent(method_name: str) -> Callable[[SysAgentClient, argparse.Namespace], 
     return handler
 
 
+def _cmd_version(client: SysAgentClient, args: argparse.Namespace) -> None:
+    """Print this client's version and the version the console reports, both labelled.
+
+    The client line comes first and needs no network; if the host cannot be reached the error
+    goes to stderr and the exit status is 2, so this doubles as a reachability check.
+    """
+    print(f"client    {CLIENT_VERSION}")
+    print(f"sys-agent {client.get_version()}  ({client.host}:{client.port})")
+
+
 def _cmd_capabilities(client: SysAgentClient, args: argparse.Namespace) -> None:
     print_fields(client.capabilities())
 
@@ -2166,6 +2184,9 @@ CONTROLLER_DUMP_HELP = "\n".join((
 
 
 COMMANDS: tuple[Command | CommandGroup, ...] = (
+    Command("version", "Show the client version and the version the host reports",
+            _cmd_version),
+
     CommandGroup("backend", "Inspect or configure the process-memory backend", (
         Command("status", "Show the backend policy and state", _cmd_backend_status),
         Command("set", "Set the backend policy", _cmd_backend_set,
@@ -2563,6 +2584,8 @@ class _BlockHelpFormatter(argparse.RawDescriptionHelpFormatter):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = _HelpfulParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=f"sysagent.py {CLIENT_VERSION}",
+                        help="show the client version and exit")
     parser.add_argument("--host", default="switch", help="sys-agent host (default: switch)")
     parser.add_argument("--port", type=int, default=6000,
                         help="sys-agent TCP port (default: 6000)")
