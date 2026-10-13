@@ -26,7 +26,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.13.0"
+#define VERSION_S "2.13.1"
 
 typedef enum {
     Active = 0,
@@ -391,11 +391,13 @@ int argmain(int argc, char** argv)
         ftpServerGetStatus(&status);
         printf("OK state=%s listener=%s enabled=%d port=%u anonymous=%d use_localtime=%d"
             " bindAttempts=%u lastBindError=%d transfers=%u bytesSent=%lu bytesReceived=%lu"
-            " config=%s lastError=%d lastFsResult=0x%X\n",
+            " loopErrors=%u listenerDrops=%u lastLoopError=%d config=%s lastError=%d"
+            " lastFsResult=0x%X\n",
             ftpServerStateName(status.state), status.listenerUp ? "up" : "down",
             status.config.enabled, status.config.port, status.config.anonymous,
             status.config.use_localtime, status.bindAttempts, status.lastBindError,
             status.activeTransfers, status.bytesSent, status.bytesReceived,
+            status.loopErrors, status.listenerDrops, status.lastLoopError,
             ftpConfigResultName(status.configResult), status.lastError, status.lastFsResult);
         return 0;
     }

@@ -17,14 +17,21 @@ release-quality claim.
 
 Cold-boot startup is observable and retried: the worker keeps `desiredRunning` set and calls
 `ftpsrv_init` again one second after a failed bind, so a boot window where the network stack
-is not ready yet heals on its own. `ftpStatus` now reports `listener=up/down`,
-`bindAttempts`, and `lastBindError`, and a post-reboot check showed `bindAttempts=3` with
-`listener=up` -- the retry loop engaging before the listener came up. An earlier report of
-"port 6000 answers but 6001 times out" was not reproduced; the post-reboot outage observed
-during validation was the whole console dropping off Wi-Fi (both ports unreachable, both
-recovering together two minutes later), which is a network-level condition rather than a
-listener-level one. The listener-level report therefore stays open for a dedicated
-reproduction.
+is not ready yet heals on its own. `ftpStatus` reports `listener=up/down`, `bindAttempts`, and
+`lastBindError`, and a post-reboot check showed `bindAttempts=3` with `listener=up` -- the retry
+loop engaging before the listener came up.
+
+**A single loop error no longer costs the listener.** `ftpsrv_loop` answers an error when its
+poll fails or when the listening socket itself reports an error, and the worker used to treat
+either as fatal: it called `ftpsrv_exit()` and re-bound one second later. That drops every session
+and every transfer in flight and leaves the port unanswered until the bind is back -- which is what
+"the console stutters while a transfer runs, and the transfer dies" looked like from the
+client side. The worker now retries the loop and escalates only after
+`FTP_LOOP_ERROR_LIMIT` (3) consecutive errors, which is still quick for a listener that is really
+gone (its poll answers the error immediately). `ftpStatus` counts both sides apart:
+`loopErrors` (polls that answered an error) and `listenerDrops` (times a run of them made the
+listener be re-bound), with `lastLoopError` holding the errno. `loopErrors` climbing while
+`listenerDrops` stays flat is the healthy case: the error was survived.
 
 ## Architecture
 
@@ -143,10 +150,24 @@ raises or lowers the plain-file ceiling for a test build (the top-level `Makefil
 ceiling is the code ordinary uploads take, so the override changes only *when* the conversion
 happens -- which is how the conversion above was measured without waiting for 4 GiB.
 
-Note for that kind of run: this console's Wi-Fi dropped repeatedly during the session (transfers
-dying mid-flight, `ftpStatus` unreachable, `bindAttempts` climbing as the listener re-bound after
-each drop), so a stalled transfer is not by itself evidence of a defect in this path -- re-check
-reachability and retry before drawing a conclusion.
+A transfer is the one thing that makes this console work hard, so the way to tell "the console is
+busy" from "the server dropped the listener" is to read the counters while data moves. Measured on
+2.13.1: idle, 11/11 `getVersion` answers between 55 ms and 279 ms (avg 130 ms); during a 64 MiB
+upload, 28/28 answers between 13 ms and 251 ms (avg 100 ms) and the upload finished in 14.6 s;
+across eight rounds of a harder pattern (a 64 MiB upload and a download at the same time, a third
+session killed mid-transfer, the command port sampled throughout) 110 of 110 answers came back in
+72-210 ms and every upload finished; and across five minutes of two uploads throttled to
+250 KB/s -- the cheapest way to keep the worker polling -- `bindAttempts` stayed at 1 with
+`transfers=2`, `loopErrors=0` and `listenerDrops=0` until both finished. So the port staying up
+while data moves is the normal case.
+
+What the older sessions showed instead was `bindAttempts` climbing into the twenties within
+minutes. Outside of an explicit `ftpRestart`/`ftpReload`, the only path that re-binds is the
+loop-error one, and every re-bind aborts the transfers in flight and leaves the port unanswered
+until the bind returns -- which is what "the transfer died and the port went away" was. That build
+treated one error as fatal, which is why the same event cost everything in flight; the retry rule
+above is the response, and with it no drop could be reproduced under any of the loads listed here.
+The counters are what turn this class of problem into a number instead of a guess.
 
 ## Configuration and control
 

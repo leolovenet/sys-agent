@@ -9,6 +9,11 @@
 #define FTP_THREAD_STACK_SIZE 0x18000
 #define FTP_THREAD_PRIORITY 0x2D
 #define FTP_LOOP_TIMEOUT_MS 100
+/* How many consecutive loop errors mean "the listener is gone" rather than "this poll failed".
+   A single bad poll used to drop the listener, which aborts every transfer in flight and leaves
+   the port unanswered while the server re-binds; the loop is retried instead, and only a run of
+   failures escalates. */
+#define FTP_LOOP_ERROR_LIMIT 3
 
 typedef struct {
     Mutex mutex;
@@ -66,6 +71,7 @@ static void populateLibraryConfig(struct FtpSrvConfig* output, const FtpConfig* 
 static void ftpWorker(void* argument)
 {
     (void)argument;
+    int consecutiveLoopErrors = 0;
     while (true) {
         mutexLock(&manager.mutex);
         bool shutdown = manager.shutdown;
@@ -146,19 +152,33 @@ static void ftpWorker(void* argument)
         }
 
         if (initialized) {
-            int result = ftpsrv_loop(FTP_LOOP_TIMEOUT_MS);
-            if (result != FTP_API_LOOP_ERROR_OK) {
-                int error = errno ? errno : EIO;
-                ftpsrv_exit();
+            const int result = ftpsrv_loop(FTP_LOOP_TIMEOUT_MS);
+            if (result == FTP_API_LOOP_ERROR_OK) {
+                consecutiveLoopErrors = 0;
+            } else {
+                const int error = errno ? errno : EIO;
+                consecutiveLoopErrors++;
                 mutexLock(&manager.mutex);
-                manager.serverInitialized = false;
-                manager.status.state = FtpServerError;
-                manager.status.lastError = error;
-                manager.status.lastBindError = error;
-                manager.status.listenerUp = false;
-                manager.status.activeTransfers = 0;
+                manager.status.loopErrors++;
+                manager.status.lastLoopError = error;
                 mutexUnlock(&manager.mutex);
-                svcSleepThread(1000 * 1000 * 1000L);
+                /* Retry the loop first: dropping the listener here would abort every transfer in
+                   flight and leave the port unanswered while the server re-binds.  Only a run of
+                   errors means the listener itself is gone. */
+                if (consecutiveLoopErrors >= FTP_LOOP_ERROR_LIMIT) {
+                    consecutiveLoopErrors = 0;
+                    ftpsrv_exit();
+                    mutexLock(&manager.mutex);
+                    manager.serverInitialized = false;
+                    manager.status.state = FtpServerError;
+                    manager.status.lastError = error;
+                    manager.status.lastBindError = error;
+                    manager.status.listenerUp = false;
+                    manager.status.activeTransfers = 0;
+                    manager.status.listenerDrops++;
+                    mutexUnlock(&manager.mutex);
+                    svcSleepThread(1000 * 1000 * 1000L);
+                }
             }
         } else {
             svcSleepThread(20 * 1000 * 1000L);

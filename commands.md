@@ -172,7 +172,7 @@ large transfers are interleaved and share network and SD-card throughput.
 
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
-|ftpStatus|Reports lifecycle state, whether the listener is bound (`listener=up/down`), the `ftpsrv_init` attempt count (`bindAttempts`) and the last bind error (`lastBindError`), effective configuration, active file transfers, byte counters, lifecycle error, and the latest native FS Result. Use it to tell "the listener never came up" apart from a network problem|none|`ftpStatus`|
+|ftpStatus|Reports lifecycle state, whether the listener is bound (`listener=up/down`), the `ftpsrv_init` attempt count (`bindAttempts`) and the last bind error (`lastBindError`), the loop-error counters (`loopErrors`, `listenerDrops`, `lastLoopError`), effective configuration, active file transfers, byte counters, lifecycle error, and the latest native FS Result. Use it to tell "the listener never came up" apart from a network problem, and `loopErrors` growing without `listenerDrops` to see that ftpsrv's poll answered an error that the server survived instead of re-binding over|none|`ftpStatus`|
 |ftpStart|Asynchronously starts the server using the loaded configuration|none|`ftpStart`|
 |ftpStop|Asynchronously closes the listener, clients, transfers, and open FTP files|none|`ftpStop`|
 |ftpRestart|Restarts the server without rereading the configuration file|none|`ftpRestart`|

@@ -23,6 +23,9 @@ typedef struct {
     bool listenerUp;      /* the FTP listener is bound and listening on the data port */
     uint32_t bindAttempts; /* ftpsrv_init calls (bind/listen attempts) so far */
     int lastBindError;     /* errno of the last failed bind, or 0 */
+    uint32_t loopErrors;   /* ftpsrv_loop calls that answered an error */
+    uint32_t listenerDrops; /* times a run of loop errors made the listener be re-bound */
+    int lastLoopError;     /* errno of the last loop error, or 0 */
     uint32_t lastFsResult;
     uint32_t activeTransfers;
     uint64_t bytesSent;
