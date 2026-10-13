@@ -16,6 +16,7 @@
 #include "process_memory.h"
 #include "debug_watch.h"
 #include "patch_code.h"
+#include "sequence_repeat.h"
 #include "dmnt_client.h"
 #include "ftp_server.h"
 #include "system_commands.h"
@@ -25,7 +26,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.11.1"
+#define VERSION_S "2.12.0"
 
 typedef enum {
     Active = 0,
@@ -1449,22 +1450,57 @@ int argmain(int argc, char** argv)
         click(key);
     }
 
-    //clickSeq <sequence> eg clickSeq A,W1000,B,W200,DUP,W500,DD,W350,%5000,1500,W2650,%0,0 (some params don't parse correctly, such as DDOWN so use the alt)
-    //syntax: <button>=click, 'W<number>'=wait/sleep thread, '+<button>'=press button, '-<button>'=release button, '%<x axis>,<y axis>'=move L stick <x axis, y axis>, '&<x axis>,<y axis>'=move R stick <x axis, y axis> 
+    //clickSeq <sequence> eg clickSeq A,W1000,B,W200,DUP,W500,DD,W350,%5000,1500,W2650,%0,0
+    //syntax: <button>=click, 'W<number>'=wait/sleep thread, '+<button>'=press button, '-<button>'=release button, '%<x axis>,<y axis>'=move L stick <x axis, y axis>, '&<x axis>,<y axis>'=move R stick <x axis, y axis>, '<item>*<count>'=repeat an item or a '(' group ')' (see sequence_repeat.h for the limits)
     if (!strcmp(argv[0], "clickSeq"))
     {
-        if (argc != 2)
-            return 0;
-
-        controllerRefreshIfIdle();
-        u64 sizeArg = strlen(argv[1]) + 1;
-        char* seqNew = malloc(sizeArg);
-        if (seqNew == NULL) {
-            printf("\n");
+        /* The repeat syntax is expanded here, on the command thread, so a
+         * sequence that cannot be expanded is answered with an error instead of
+         * being queued as a pile of unknown tokens that silently send nothing. */
+        if (argc != 2) {
+            printf("ERR code=BAD_SEQUENCE index=0 detail=argument-count\n");
+            fflush(stdout);
             return 0;
         }
-        strcpy(seqNew, argv[1]);
+
+        controllerRefreshIfIdle();
+        char* seqNew = malloc(SEQUENCE_EXPAND_CAPACITY);
+        if (seqNew == NULL) {
+            printf("ERR code=BAD_SEQUENCE index=0 detail=no-memory\n");
+            fflush(stdout);
+            return 0;
+        }
+
+        SequenceExpandInfo expandInfo;
+        SequenceExpandResult expandResult = sequenceExpand(
+            argv[1], seqNew, SEQUENCE_EXPAND_CAPACITY, buttonClickSleepTime, &expandInfo);
+        if (expandResult != SequenceExpandOk) {
+            printf("ERR code=BAD_SEQUENCE index=%lu detail=%s\n",
+                (unsigned long)expandInfo.errorIndex,
+                sequenceExpandResultName(expandResult));
+            fflush(stdout);
+            free(seqNew);
+            return 0;
+        }
+
+        /* Answer before the sequence runs: the token count shows that a repeat
+         * was expanded, and estMs lets a caller size its wait (a long repeat
+         * easily outlives a default socket timeout). The sequence thread still
+         * answers "done" once the sequence has finished. */
+        printf("OK tokens=%lu estMs=%lu\n",
+            (unsigned long)expandInfo.tokenCount, (unsigned long)expandInfo.estimatedMs);
+        fflush(stdout);
         makeClickSeq(seqNew);
+    }
+
+    /* What the compile-time repeat limits are, so a client can report "this
+     * build is too old for '(A,B)*N'" instead of sending it anyway. */
+    if (!strcmp(argv[0], "clickSeqCapabilities"))
+    {
+        printf("OK version=1 syntax=click,press,release,wait,stick repeat=paren-star maxCount=%u maxDepth=%u maxTokens=%u maxBytes=%u\n",
+            SEQUENCE_REPEAT_MAX_COUNT, SEQUENCE_REPEAT_MAX_DEPTH,
+            SEQUENCE_REPEAT_MAX_TOKENS, SEQUENCE_EXPAND_CAPACITY);
+        fflush(stdout);
     }
 
     if (!strcmp(argv[0], "clickCancel"))

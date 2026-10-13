@@ -246,6 +246,8 @@ python3 client/sysagent.py --host switch input press A
 python3 client/sysagent.py --host switch input set-stick LEFT 0x7FFF 0
 python3 client/sysagent.py --host switch input click-seq A,W1000,B
 python3 client/sysagent.py --host switch input click-seq A,W1000,B --no-wait
+python3 client/sysagent.py --host switch input click-seq "PLUS,W500,(DDOWN,W100)*10,A,W200"
+python3 client/sysagent.py --host switch input capabilities
 python3 client/sysagent.py --host switch input touch 200 500 200 800
 python3 client/sysagent.py --host switch input touch-hold 200 500 1000
 python3 client/sysagent.py --host switch input touch-draw 100 200 100 500 200 500
@@ -253,14 +255,33 @@ python3 client/sysagent.py --host switch input key 11 8 15 15 18
 python3 client/sysagent.py --host switch input key-mod 4 1
 ```
 
-Input subcommands are `press`, `release`, `click`, `set-stick`, `click-seq`, `click-cancel`,
-`detach-controller`, `touch`, `touch-hold`, `touch-draw`, `touch-cancel`, `key`, `key-mod`, and
-`key-multi`. `click-seq` blocks until the server reports `done` unless `--no-wait` is given;
-`touch`, `touch-hold`, and `touch-draw` expect `x y` coordinate pairs.
+Input subcommands are `press`, `release`, `click`, `set-stick`, `click-seq`, `capabilities`
+(the click-seq syntax the console supports), `click-cancel`, `detach-controller`, `touch`,
+`touch-hold`, `touch-draw`, `touch-cancel`, `key`, `key-mod`, and `key-multi`. `click-seq` blocks
+until the server reports `done` unless `--no-wait` is given, and prints what the console expanded
+(`done tokens=25 estMs=1400`); `touch`, `touch-hold`, and `touch-draw` expect `x y` coordinate
+pairs.
 `input press|release|click|click-seq -h` prints the full table of accepted button names
 (`A`, `B`, `X`, `Y`, `L`, `R`, `ZL`, `ZR`, `PLUS`, `MINUS`, `DUP`/`DU`, `DDOWN`/`DD`,
 `DLEFT`/`DL`, `DRIGHT`/`DR`, `LSTICK`, `RSTICK`, `HOME`, `CAPTURE`, `PALMA`, `UNUSED`);
 names are case-sensitive, and an unknown name sends no button rather than a default key.
+
+Sequences repeat with `item*N` (`DDOWN*3`) or `(items)*N` (`(DDOWN,W100)*10`): the count has to
+be 1-1000, groups nest up to 4 deep and one sequence may expand to 1024 tokens (64 KiB of text).
+A `W` wait inside a group repeats with it, so `(DDOWN,W100)*10` is ten presses with 100 ms between
+them. The console expands the sequence before it runs anything and reports a sequence it cannot
+expand as `ERR code=BAD_SEQUENCE index=<offset> detail=<reason>`; the client raises that as a
+`SysAgentProtocolError` instead of letting a mangled sequence answer `done` while sending no
+input. Repeats need the expander (sys-agent 2.12.0 or newer) and a sequence must not contain
+whitespace - the client refuses that up front, and it checks the console's `clickSeqCapabilities`
+before sending repeat syntax to an older build. The client also extends its own read timeout to
+the sequence's `estMs`, so a long repeat does not look like a socket timeout.
+
+A `click-seq` that is still running answers on the connection the console used last, so a
+sequence that another command interrupts (for example `input click-cancel` from a second
+connection) may not deliver `done` to the caller waiting on it; that caller then reports a
+timeout while the console has stopped as asked. Start sequences that are meant to be interrupted
+with `--no-wait`, so nothing is left waiting.
 
 ## Utility and config
 

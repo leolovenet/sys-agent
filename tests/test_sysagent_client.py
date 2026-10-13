@@ -39,6 +39,8 @@ class FakeState:
         self.poke_verify_fails = False
         self.peek_verify_unstable = False
         self.flaky_peek_remaining = 0
+        self.repeat_support = True
+        self.sequence_error = False
 
 
 class FakeHandler(socketserver.StreamRequestHandler):
@@ -200,8 +202,16 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 else:
                     response = ("OK settings=2\nfreezeRate=3\n"
                                 "controllerIdleReleaseMs=1000\nEND configure")
+            elif command[0] == "clickSeqCapabilities":
+                repeat = "repeat=paren-star" if state.repeat_support else "repeat=absent"
+                response = ("OK version=1 syntax=click,press,release,wait,stick "
+                            f"{repeat} maxCount=1000 maxDepth=4 maxTokens=1024 maxBytes=65536")
             elif command[0] == "clickSeq":
-                response = "done"
+                if state.sequence_error:
+                    response = "ERR code=BAD_SEQUENCE index=3 detail=bad-syntax"
+                else:
+                    tokens = len([token for token in command[1].split(",") if token])
+                    response = f"OK tokens={tokens} estMs={tokens * 50}\ndone"
             elif command[0] == "game":
                 if command[1] == "icon":
                     response = (b"\xFF\xD8" + b"ICON").hex().upper()
@@ -695,9 +705,45 @@ class ClientTests(unittest.TestCase):
 
     def test_click_seq_done(self) -> None:
         with self.client() as client:
-            line = client.click_seq("A,W100,B")
-            self.assertEqual(line, "done")
+            result = client.click_seq("A,W100,B")
+            self.assertEqual(result.done, True)
+            self.assertEqual(result.tokens, 3)
+            self.assertEqual(result.estimated_ms, 150)
             self.assertEqual(self.server.state.last_command, ["clickSeq", "A,W100,B"])
+
+    def test_click_seq_repeat_syntax(self) -> None:
+        """The repeat syntax goes over the wire verbatim, and the console's own
+        token count tells the caller how much it expanded."""
+        with self.client() as client:
+            result = client.click_seq("(DDOWN,W100)*3")
+            self.assertEqual(self.server.state.last_command, ["clickSeq", "(DDOWN,W100)*3"])
+            self.assertEqual(result.tokens, 2)  # the fake counts written tokens
+            capabilities = client.sequence_capabilities()
+            self.assertEqual(capabilities["repeat"], "paren-star")
+            self.assertEqual(capabilities["maxTokens"], "1024")
+
+    def test_click_seq_repeat_needs_console_support(self) -> None:
+        """A sysmodule without the expander must be reported, not fed a sequence
+        it would read as unknown tokens (which send nothing and still answer done)."""
+        self.server.state.repeat_support = False
+        with self.client() as client:
+            with self.assertRaises(SysAgentProtocolError):
+                client.click_seq("(DDOWN,W100)*3")
+            self.assertEqual(self.server.state.last_command, ["clickSeqCapabilities"])
+
+    def test_click_seq_rejects_whitespace(self) -> None:
+        """The sysmodule splits the command line on spaces: a sequence with one
+        would arrive as several arguments and be dropped."""
+        with self.client() as client:
+            with self.assertRaises(ValueError):
+                client.click_seq("(DDOWN, W100)*3")
+
+    def test_click_seq_syntax_error_is_raised(self) -> None:
+        self.server.state.sequence_error = True
+        with self.client() as client:
+            with self.assertRaises(SysAgentProtocolError) as raised:
+                client.click_seq("(A*2")
+            self.assertIn("BAD_SEQUENCE", str(raised.exception))
 
     def test_late_diagnostic_does_not_desync_next_command(self) -> None:
         """A diagnostic printed after a silent command must not become the answer."""

@@ -33,6 +33,13 @@ docker run --rm \
 - 字节载荷只接受 hex 字节对(可选 `0x` 前缀;奇数长度或非 hex 字符拒绝,错误码 `INVALID_HEX_PAYLOAD`)。
 - 普通数字是 `0x`/`0X` hex 或十进制;非法字符串解析为 0,而不是静默部分值(`12AB` 不是 hex — 写 `0x12AB`)。
 - 未知按钮 token 不发任何按钮,绝不发默认键。
+- `clickSeq` 支持重复语法 `ITEM*N` 与 `(ITEMS)*N`:在**命令线程**先展开成普通序列再入队
+  (`source/sequence_repeat.c`,主机测试 `tests/sequence_repeat_test.c`),上限 `N≤1000`、
+  嵌套 ≤4 层、展开后 ≤1024 token 与 64 KiB;展开失败一律回
+  `ERR code=BAD_SEQUENCE index=<偏移> detail=<原因>` 且**不发任何按键**(不再有"静默无效"
+  这种形态)。展开成功先回 `OK tokens=<n> estMs=<ms>` 再跑,跑完回 `done`;`estMs` 是时长
+  估计(W 等待 + 每次 click 的 `buttonClickSleepTime`),供客户端调整等待超时。
+  `clickSeqCapabilities` 报告本构建支持的能力,客户端据此在给老构建发重复语法前报错。
 - `clickSeq` 序列由 `source/sequence_token.c` 按单个 `,` 切分(主机回归测试
   `tests/sequence_token_test.c`),切分器不持有静态状态:序列跑在 click 线程上,主线程
   同时在解析下一条命令行。**绝不把单字节变量的地址当 `strtok` 的分隔符串**——2.11.0 及

@@ -495,6 +495,19 @@ class GameStatus:
         )
 
 
+# The value `clickSeqCapabilities` reports for a build that expands `(A,B)*N`.
+SEQUENCE_REPEAT_SYNTAX = "paren-star"
+
+
+@dataclasses.dataclass(frozen=True)
+class ClickSequence:
+    """Reply of `clickSeq`: what the console expanded and whether it finished."""
+
+    tokens: int
+    estimated_ms: int
+    done: bool
+
+
 class SysAgentClient:
     def __init__(self, host: str = "switch", port: int = 6000, timeout: float = 10.0,
                  retries: int = 2):
@@ -511,6 +524,8 @@ class SysAgentClient:
         # the sysmodule may still print a diagnostic line on that connection, and
         # reading it as the next command's answer would desynchronise the stream.
         self._stream_dirty = False
+        # Cached `clickSeqCapabilities`; a client instance talks to one sysmodule.
+        self._sequence_capabilities: dict[str, str] | None = None
 
     def __enter__(self) -> "SysAgentClient":
         self.connect()
@@ -925,11 +940,77 @@ class SysAgentClient:
             raise ValueError("stick coordinates must be in -0x8000..0x7FFF")
         self._bare_command(f"setStick {side} {x} {y}", expect_output=False)
 
-    def click_seq(self, sequence: str, wait_done: bool = True) -> str | None:
-        line = self._bare_command(f"clickSeq {sequence}", expect_output=wait_done)
-        if wait_done and line != "done":
+    def sequence_capabilities(self) -> dict[str, str]:
+        """Click-seq syntax the connected sysmodule accepts."""
+        return require_ok(self.command("clickSeqCapabilities", retry=True))
+
+    def _require_sequence_syntax(self, sequence: str) -> None:
+        """Reject what the console would refuse or silently mis-read.
+
+        Whitespace can never be part of a sequence: the sysmodule splits the
+        command line on spaces, so `(A, B)*2` arrives as three arguments and is
+        dropped.  Repeat syntax needs a build that expands it - an older
+        sysmodule reads `(A` and `B)*2` as unknown tokens, sends no input at all
+        and still answers `done`.
+        """
+        if any(character.isspace() for character in sequence):
+            raise ValueError("sequence must not contain whitespace: the console splits "
+                             "the command line on spaces")
+        if not any(character in sequence for character in "()*"):
+            return
+        if self._sequence_capabilities is None:
+            self._sequence_capabilities = self.sequence_capabilities()
+        if self._sequence_capabilities.get("repeat") != SEQUENCE_REPEAT_SYNTAX:
+            raise SysAgentProtocolError(
+                "this sys-agent build does not expand click-seq repeats "
+                f"('(A,B)*N'): capabilities={self._sequence_capabilities}")
+
+    def click_seq(self, sequence: str, wait_done: bool = True) -> ClickSequence:
+        """Run a sequence; see `input click-seq -h` for the syntax.
+
+        The console answers `OK tokens=… estMs=…` before it runs the sequence and
+        `done` when it has finished.  The wait for `done` is extended to the
+        sequence's own estimate, so a long repeat does not surface as a socket
+        timeout while the console is still clicking.
+        """
+        self._require_sequence_syntax(sequence)
+        self.connect()
+        assert self._socket is not None
+        self._socket.sendall(f"clickSeq {sequence}".encode("ascii") + b"\r\n")
+
+        if not wait_done:
+            # Same shape as the other silent commands: whatever the console prints
+            # is drained by the next command's `warning:` line.
+            self._stream_dirty = True
+            self._socket.settimeout(0.02)
+            try:
+                line = self._readline().decode("utf-8", errors="replace")
+            except (socket.timeout, OSError):
+                line = None
+            finally:
+                self._socket.settimeout(self.timeout)
+            if line:
+                print(f"warning: {line}", file=sys.stderr)
+            return ClickSequence(tokens=0, estimated_ms=0, done=False)
+
+        line = self._readline().decode("utf-8", errors="replace")
+        if line.startswith("ERR "):
+            raise SysAgentProtocolError(line)
+
+        tokens = 0
+        estimated_ms = 0
+        if line.startswith("OK "):
+            fields = dict(part.split("=", 1) for part in line.split()[1:] if "=" in part)
+            tokens = parse_int(fields.get("tokens", "0"))
+            estimated_ms = parse_int(fields.get("estMs", "0"))
+            self._socket.settimeout(max(self.timeout, estimated_ms / 1000.0 + 5.0))
+            try:
+                line = self._readline().decode("utf-8", errors="replace")
+            finally:
+                self._socket.settimeout(self.timeout)
+        if line != "done":
             raise SysAgentProtocolError(f"expected 'done' from clickSeq, got {line!r}")
-        return line
+        return ClickSequence(tokens=tokens, estimated_ms=estimated_ms, done=True)
 
     def click_cancel(self) -> None:
         self._bare_command("clickCancel", expect_output=False)
@@ -1770,9 +1851,15 @@ def _cmd_set_stick(client: SysAgentClient, args: argparse.Namespace) -> None:
 
 
 def _cmd_click_seq(client: SysAgentClient, args: argparse.Namespace) -> None:
-    line = client.click_seq(args.sequence, wait_done=not args.no_wait)
-    if line is not None:
-        print(line)
+    result = client.click_seq(args.sequence, wait_done=not args.no_wait)
+    if result.done:
+        # Keep the word scripts already grep for, and add what the console
+        # expanded: `tokens` shows a repeat took effect, `estMs` is its estimate.
+        print(f"done tokens={result.tokens} estMs={result.estimated_ms}")
+
+
+def _cmd_input_capabilities(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.sequence_capabilities())
 
 
 def _cmd_touch(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -2040,6 +2127,14 @@ CLICK_SEQ_HELP = "\n".join((
     "  %LX,LY      move the left stick, e.g. %5000,1500",
     "  &RX,RY      move the right stick, e.g. &0,0",
     "",
+    "Repeat tokens (needs a sysmodule advertising repeat=paren-star, see",
+    "`input capabilities`):",
+    "  ITEM*N      run ITEM N times, e.g. DDOWN*3",
+    "  (ITEMS)*N   run the group N times, e.g. (DDOWN,W100)*10",
+    "  N is 1..1000, groups nest up to 4 deep, at most 1024 tokens overall; a",
+    "  wait inside a group repeats with it. A sequence the console cannot expand",
+    "  is refused with ERR code=BAD_SEQUENCE before any input is sent.",
+    "",
     BUTTON_HELP,
 ))
 
@@ -2265,10 +2360,12 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                  Arg("x", "X coordinate in -0x8000..0x7FFF", type=parse_int),
                  Arg("y", "Y coordinate in -0x8000..0x7FFF", type=parse_int))),
         Command("click-seq", "Run a comma-separated input sequence", _cmd_click_seq,
-                (Arg("sequence", "e.g. A,W1000,B,+X,-X,%%5000,1500"),
+                (Arg("sequence", "e.g. A,W1000,B,+X,-X,%%5000,1500,(DUP,W200)*5"),
                  Arg("no_wait", "send without waiting for 'done'", action="store_true",
                      default=False, flags=("--no-wait",))),
                 CLICK_SEQ_HELP),
+        Command("capabilities", "Show the click-seq syntax this console supports",
+                _cmd_input_capabilities),
         Command("click-cancel", "Interrupt the current click sequence",
                 _silent("click_cancel")),
         Command("detach-controller", "Force-detach the virtual controller",
