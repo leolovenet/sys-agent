@@ -33,6 +33,13 @@ gone (its poll answers the error immediately). `ftpStatus` counts both sides apa
 listener be re-bound), with `lastLoopError` holding the errno. `loopErrors` climbing while
 `listenerDrops` stays flat is the healthy case: the error was survived.
 
+First readings from those counters, taken on 2.13.2 minutes after a reboot whose only traffic was a
+64 KiB upload and a `getVersion` poll: `loopErrors=6`, `listenerDrops=2`, `lastLoopError=5` (EIO) --
+two runs of three consecutive errors, each run re-binding the listener. The errors therefore
+cluster around the bind window rather than around data movement, which is the likely origin of the
+`bindAttempts` counts the older sessions showed; the retry rule keeps a lone error from costing
+anything, and a listener whose poll keeps answering an error is still re-bound after three.
+
 ## Architecture
 
 The implementation is deliberately isolated from the original port-6000 command server:
@@ -110,15 +117,28 @@ Behaviour worth knowing:
   reason is read rather than guessed. Partial files stay on the card for a later restart.
 
 **A conversion that loses power leaves `<name>.bigfiletmp` behind**, and the console's rename
-refuses an existing destination, so that name then fails at step 1 with `EFBIG` until the temp file
-is gone -- deleting it with any FTP client (`DELE <name>.bigfiletmp`) makes the name usable again.
-A retry built into that branch (delete the leftover, rename again) was measured on hardware and is
-deliberately *not* in this build: with the leftover present the transfer died on a broken data
-connection and the FTP service stopped answering for a while. Measured the same session: the same
-4 MiB upload converted and verified byte-identical when no leftover was present, and a run whose
-leftover sat under an unrelated name failed as well -- so the console's FTP service was fragile in
-that window beyond anything this branch does, and an error the client can see is the better
-trade.
+refuses an existing destination -- so the next upload of that name would stop at step 1 with
+`EFBIG`. Step 1 handles it: when the rename is refused, it deletes a temp file sitting at exactly
+that name -- it holds whatever the interrupted upload had stored, which the client is re-sending
+anyway -- and renames once more. A normal upload never reaches that branch, so nothing about the
+ordinary path changes. If even the delete fails, the file is put back as a plain file, the client
+sees `EFBIG` with the failing call in `ftpStatus`'s `lastFsResult`, and the leftover can be removed
+by hand (`DELE <name>.bigfiletmp` from any FTP client).
+
+`<name>.bigfiletmp` is this adapter's own temp name, and the cleanup deletes exactly that one: a
+file a user parks at that exact name goes with it, while a *directory* at that name cannot be
+removed by the call used here (measured: `fsFsDeleteFile` refuses a directory, its contents stay),
+so it survives and the conversion reports the failure instead.
+
+Measured on hardware with a 1 MiB ceiling so the conversion runs on a 4 MiB upload: with a
+31,744-byte leftover planted at `<name>.bigfiletmp` the upload converted, finished, read back
+byte-identical and left no leftover, and the control run without one behaved the same
+(`loopErrors=0`, `listenerDrops=0`, `bindAttempts=1` in both).
+
+This cleanup was written once before and withdrawn: the transfer died with it in place. That turned
+out to be the listener teardown fixed in 2.13.1 -- a control run with the leftover under an
+unrelated name, which never reaches this branch, failed the same way -- so the branch was not what
+broke, and it is back now that the real cause is gone.
 
 **The conversion must never happen twice.**  An upload that resumes into a file which is already a
 concatenation file used to be a trap: a `STOR` open truncates the target, the truncation takes the
@@ -139,10 +159,29 @@ Measured on hardware (19.x, Atmosphère, applet mode, `ftp://switch:6001`):
 | 4 MiB upload under the ceiling | Stayed a plain file, byte-identical |
 | Conversion exercised with a 1 MiB ceiling (`-DFTP_VFS_PLAIN_FILE_MAX=0x000FFFFF`) | 64 KiB and 4 MiB uploads both converted and read back byte-identical |
 | `REST` + `STOR` (resumed upload) | Refused with `550 ... Not supported`, file left untouched |
+| Conversion with a 31,744-byte `<name>.bigfiletmp` already present (1 MiB ceiling) | Converted, finished, read back byte-identical, leftover cleared |
+| A file inside a directory named `<name>.bigfiletmp`, then `DELE` on that directory | Refused (`550`), directory and its file untouched |
 | Delete of a converted file | `fsFsDeleteFile` on the entry, parts and all (measured earlier with the same VFS) |
 
-Still owed: a multi-part upload of at least 9 GB (three parts), the two boundary sizes
-`0xFFFFFFFF` and `0x100000000`, and free-space accounting across the delete of a converted file.
+Still owed: the exact boundary sizes `0xFFFFFFFF` and `0x100000000`, and free-space accounting
+across the delete of a converted file. A three-part (9 GB) upload is deliberately not on the list:
+the conversion is one metadata move and the filesystem rolls the parts on its own, so the two-part
+case above is the acceptance case and a third part would add transfer time, not coverage.
+
+**What a full check costs, and what to do instead.**  Throughput here is far below the network: 16
+MiB measured 4.0 MB/s up and 10.0 MB/s down, and reading the 6,694,728,444-byte file end to end
+through FTP took about 35 minutes (roughly 3 MB/s once a slow client makes the worker re-read blocks
+it could not send).  A regression on this path therefore does not need a whole-file hash: `SIZE`,
+the part sizes (`<name>/00`, `<name>/01`, ...) and a few 64 KiB windows read either side of the part
+boundary plus the head and the tail catch every failure seen here -- a file that never converted, a
+short file, a lost part, a wrong part size -- in seconds instead of half an hour.  Keep the
+whole-file hash for a change to the code that creates the parts.
+
+**Why the conversion does not commit the filesystem.**  The console's own content tools call
+`fsFsCommit` after creating content, and this path deliberately does not: the call sits on the code
+a working 6,694,728,444-byte upload already exercised, nothing observed needs it, and adding it
+would mean re-measuring that path.  It stays out until a build that makes the call can be measured
+against this one.
 
 **Exercising the conversion without moving 4 GiB.** `make DEFINES=-DFTP_VFS_PLAIN_FILE_MAX=<n>`
 raises or lowers the plain-file ceiling for a test build (the top-level `Makefile` forwards

@@ -163,9 +163,9 @@ metadata only, into the split form the console and the PC-side "split for FAT32"
 -- one entry that every program reads as one file, with parts `00`, `01`, ... inside it. A
 resumed upload (`REST` followed by `STOR`) is refused with `550` rather than served, because this
 FTP core's `STOR` truncates: the client restarts the file from the beginning instead of uploading
-on top of a file whose head would be silently lost. Downloads resume normally. See
-[the FTP server notes](docs/ftp-server.md) for the measurements and the recovery step if a
-conversion is interrupted.
+on top of a file whose head would be silently lost. Downloads resume normally, and a conversion
+interrupted by a power cut cleans up after itself on the next upload of that name. See
+[the FTP server notes](docs/ftp-server.md) for the measurements.
 
 ASCII filenames, including spaces, are the supported stable baseline. On the tested Horizon
 SD filesystem, Chinese and Japanese names return native FS `0x202`, while some other non-ASCII

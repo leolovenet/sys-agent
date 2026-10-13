@@ -41,10 +41,11 @@
 
        1. close the handle, rename the file aside      <name>            -> <name>.bigfiletmp
                                                        (the console's rename refuses an existing
-                                                       destination, so a temp file left by a
-                                                       conversion that lost power makes this step
-                                                       fail with EFBIG until that file is deleted
-                                                       by hand -- see the note below)
+                                                       destination: a temp file a conversion that
+                                                       lost power left behind is deleted and the
+                                                       rename retried once, so one power cut does
+                                                       not cost this name its place above the
+                                                       ceiling)
        2. create the directory it has to become        <name>
        3. move the file in as its first part           <name>.bigfiletmp -> <name>/00
        4. set the archive bit on that directory        fsFsSetConcatenationFileAttribute
@@ -241,14 +242,25 @@ static int ftpVfsConvertToConcatenationFile(struct FtpVfsFile* file, struct FtpV
     file->open = false;
 
     Result result = fsFsRenameFile(fileSystem, path, temp);
+    if (R_FAILED(result)) {
+        /* The usual reason for a refused rename is the temp file of a conversion that lost power,
+           which this name then cannot get past again.  It holds what the interrupted upload had
+           stored, which the client is re-sending, so clearing it costs nothing and the rename gets
+           one more try -- the name keeps working without anyone having to know about it.  This is
+           the adapter's own temp name; a file a user parked at exactly `<name>.bigfiletmp` goes
+           with it, and a directory at that name cannot be removed by this call (measured), so it
+           survives and the failure below is reported instead. */
+        const Result removed = fsFsDeleteFile(fileSystem, temp);
+        ftpServerRecordFsResult(removed);
+        if (R_SUCCEEDED(removed))
+            result = fsFsRenameFile(fileSystem, path, temp);
+    }
     ftpServerRecordFsResult(result);
     if (R_FAILED(result)) {
-        /* The console's rename refuses an existing destination, and the only thing that can sit at
-           this name is a temp file left by a conversion that lost power -- in that case the rename
-           fails here, the file is put back as a plain file, and the client sees EFBIG.  Deleting
-           `<name>.bigfiletmp` (any FTP client can) makes the name usable again; a retry built into
-           this branch was measured on hardware and made the transfer fail with the service
-           unresponsive instead, so it is deliberately not here. */
+        /* Even the cleanup could not free the name (or the rename failed for another reason): the
+           file goes back to being a plain file and the client sees EFBIG with the failing call in
+           `ftpStatus`'s `lastFsResult`.  A leftover that survives this is removed by hand --
+           `DELE <name>.bigfiletmp` from any FTP client -- and the name works again. */
         errno = EFBIG;
         goto reopen;
     }
