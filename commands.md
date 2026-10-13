@@ -188,6 +188,12 @@ FTP grants complete SD read/write/create/rename/delete access. During a queued o
 C-level search, mutations within `/switch/sys-agent/search` return an FTP error; reads and
 all unrelated paths remain available.
 
+Uploads larger than 4 GiB are converted, as metadata, into the FAT32 split form (a directory whose
+parts `00`, `01`, ... every program reads as one file). A resumed upload (`REST` then `STOR`) is
+refused with `550` instead of served, so a client restarts the file from the beginning; downloads
+resume normally. `ftpStatus`'s `lastFsResult` holds the native result of the last filesystem step,
+which is how a failed conversion says which call refused what.
+
 The tested stable filename set is ASCII, including spaces. Horizon's SD filesystem returned
 native Result `0x202` for Chinese and Japanese filenames and enumerated other non-ASCII names
 inconsistently. sys-agent reports the latest native error as `lastFsResult` and does not

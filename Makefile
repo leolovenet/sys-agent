@@ -3,7 +3,7 @@
 HOSTCC ?= cc
 
 all:
-	@$(MAKE) -C sys-agent/
+	@$(MAKE) -C sys-agent/ DEFINES="$(DEFINES)"
 
 clean:
 	@$(MAKE) clean -C sys-agent/

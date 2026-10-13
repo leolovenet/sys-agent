@@ -60,7 +60,8 @@ docker run --rm \
 
 - 内置低优先级 FTP 服务,端口 `6001`,匿名、默认开启;可选配置 `/config/sys-agent/ftp.ini`;端口 `6000` 上 `ftpStatus/ftpStart/ftpStop/ftpRestart/ftpReload` 控制。根只暴露 SD,不含 BIS/存档/卡带等挂载。
 - 稳定测试基线文件名是含空格的 ASCII;中文/日文名返回原生 FS Result `0x202`,其他非 ASCII 枚举不一致;不要静默重命名这类路径。
-- 已通过真机测试:FTP CRUD、中断清理、16 MiB hash 校验传输、续传、生命周期命令、6000 端口响应、`RNTO` 覆盖已存在文件。冷启动重试现在可观测:`ftpStatus` 暴露 `listener`/`bindAttempts`/`lastBindError`,重启后实测 `bindAttempts=3` 后监听成功;曾报"6000 通、6001 不通"未复现(实测到的是整机掉线,两端口同时恢复),该项保留待复现。**未关闭验收**:FTP 未与活动 C-level 搜索并发测试(含 `/switch/sys-agent/search` 写保护)。验证矩阵见 `docs/ftp-server.md`。
+- **> 4 GiB 的文件**(2.13.0 起):普通文件在 FAT32 上写不过 4 GiB(真机实测:顺序写停在正好 4 GiB,`fsFileSetSize(4.5 GB)` 被拒),所以上传一律先建普通文件、越过 `0xFFFF0000` 时**按元数据转成拼接文件**(改名 → 建目录 → 文件当 `00` → `fsFsSetConcatenationFileAttribute` → 重读父目录 → 重开继续写;依据与实测见 `docs/ftp-server.md`)。4 GiB 以下的路径与改动前逐字一致;转换失败则还原文件并报 `EFBIG`,`lastFsResult` 留下失败的那一步。**已真机验证**:6,694,728,444 字节上传落成 `00`=4,294,901,760 + `01`=2,399,826,684,`SIZE` 报合并大小,整文件 SHA-256 与源一致;另用 1 MiB 阈值构建单独验证了转换本身。**上传续传(`REST` 后 `STOR`)明确拒绝**(550):本 FTP 核心的 `STOR` 是"创建并截断",顺着做会静默丢掉 marker 之前的全部内容;下载续传与 `APPE` 不受影响。转换被断电打断会留下 `<名字>.bigfiletmp`,该名字在那之后必须先手工删掉这个临时文件才能再次转换(自动重试在真机上表现为传输中断 + 服务长时间无响应,已撤掉)。仍待验证:≥9 GB 三分片、`0xFFFFFFFF`/`0x100000000` 两个边界值、删除拼接文件后的空间回收。
+- 已通过真机测试:FTP CRUD、中断清理、16 MiB hash 校验传输、`REST`/`RETR` 下载续传、生命周期命令、6000 端口响应、`RNTO` 覆盖已存在文件、> 4 GiB 上传(见上一条)。冷启动重试可观测:`ftpStatus` 暴露 `listener`/`bindAttempts`/`lastBindError`,重启后实测 `bindAttempts=3` 后监听成功;报"6000 通、6001 不通"的那次未复现,但**同一现象换了个形态又出现**:这台机器的 Wi-Fi 会成片掉线(传输中途死掉、两个端口同时不可达、`bindAttempts` 随监听重建累加,几十秒后自行恢复),所以传输卡住不能直接归因于服务端——先重试并看端口是否可达。**未关闭验收**:FTP 未与活动 C-level 搜索并发测试(含 `/switch/sys-agent/search` 写保护)。验证矩阵见 `docs/ftp-server.md`。
 - 替换运行中的 sysmodule:FTP 上传需 ASCII 临时名 + 原子重命名,备份 `atmosphere/contents/43000000000000A6`,然后整机重启;只重启游戏不会重载 sys-agent。
 
 ## Headless 启动与 Keys

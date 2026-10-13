@@ -158,6 +158,15 @@ intended for a trusted development network. For account access, copy
 run `ftpReload`. Invalid credentials or ports leave FTP in an error state without stopping
 the controller or memory service.
 
+Uploads above 4 GiB work: FAT32 cannot hold one file that large, so the upload is converted, as
+metadata only, into the split form the console and the PC-side "split for FAT32" tools both use
+-- one entry that every program reads as one file, with parts `00`, `01`, ... inside it. A
+resumed upload (`REST` followed by `STOR`) is refused with `550` rather than served, because this
+FTP core's `STOR` truncates: the client restarts the file from the beginning instead of uploading
+on top of a file whose head would be silently lost. Downloads resume normally. See
+[the FTP server notes](docs/ftp-server.md) for the measurements and the recovery step if a
+conversion is interrupted.
+
 ASCII filenames, including spaces, are the supported stable baseline. On the tested Horizon
 SD filesystem, Chinese and Japanese names return native FS `0x202`, while some other non-ASCII
 names can be opened but are not returned reliably by directory enumeration. The server does
