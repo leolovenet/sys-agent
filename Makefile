@@ -13,6 +13,10 @@ test:
 	/tmp/sys-agent-hekate-config-test
 	$(HOSTCC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Isys-agent/source tests/ftp_config_test.c sys-agent/source/ftp_config.c -o /tmp/sys-agent-ftp-config-test
 	/tmp/sys-agent-ftp-config-test
+	$(HOSTCC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -Isys-agent/source tests/boot_unlock_config_test.c sys-agent/source/boot_unlock_config.c -o /tmp/sys-agent-boot-unlock-config-test
+	/tmp/sys-agent-boot-unlock-config-test
+	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-agent/source tests/screen_classify_test.c sys-agent/source/jpeg_dc.c sys-agent/source/screen_classify.c -o /tmp/sys-agent-screen-classify-test -lm
+	/tmp/sys-agent-screen-classify-test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-agent/source tests/ftp_path_test.c sys-agent/source/ftp_path.c -o /tmp/sys-agent-ftp-path-test
 	/tmp/sys-agent-ftp-path-test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-agent/source tests/search_match_test.c sys-agent/source/search_match.c -o /tmp/sys-agent-search-match-test

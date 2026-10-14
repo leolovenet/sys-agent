@@ -23,13 +23,17 @@ The system-management protocol is additive and uses single-line `OK key=value` o
 |accountStatus|Reports the last-opened account UID and nickname|none|`accountStatus`|
 |applicationStatus|Reports the current application identity, version, memory bases, Build ID, and name|none|`applicationStatus`|
 |processList|Returns a PID/Title-ID page; count is 1 through 64|offset, count|`processList 0 64`|
-|systemReboot|Requests a normal Atmosphere/Horizon reboot|none|`systemReboot`|
-|systemRebootEmuMMC|One-shot reboot directly to the Hekate entry with `id=Atm-Emu`; does not change global autoboot|none|`systemRebootEmuMMC`|
+|systemReboot|Requests a normal Atmosphere/Horizon reboot. Arms the boot unlock before rebooting, so the console comes back unlocked; `noUnlock` skips that|`noUnlock` (optional)|`systemReboot` / `systemReboot noUnlock`|
+|systemRebootEmuMMC|One-shot reboot directly to the Hekate entry with `id=Atm-Emu`; does not change global autoboot. Arms the boot unlock the same way|`noUnlock` (optional)|`systemRebootEmuMMC` / `systemRebootEmuMMC noUnlock`|
 |systemShutdown|Requests an orderly shutdown|none|`systemShutdown`|
 |systemSleep|Invokes the experimental system-sleep SVC|none|`systemSleep`|
 |networkSet|Enables or disables wireless communication|`enabled` or `disabled`|`networkSet disabled`|
 |lockScreenStatus|Reports Horizon's persistent sleep-mode lock-screen flag|none|`lockScreenStatus`|
 |lockScreenSet|Enables or disables Horizon's persistent sleep-mode lock-screen flag|`enabled` or `disabled`|`lockScreenSet disabled`|
+|bootUnlock|Reports the boot-unlock schedule and what this boot did with it (`mode`, `source`, `reason`, `schedule`, `armed`, `phase`, `homePresses`/`aPresses`/`aSent`, the `screen` frame timeline; `*Ms` are milliseconds since boot, the same clock `systemInfo` reports as `uptimeMs`)|none|`bootUnlock`|
+|bootUnlock arm|Parks the one-shot arm file so the next boot runs the unlock|none|`bootUnlock arm`|
+|bootUnlock disarm|Drops the arm file|none|`bootUnlock disarm`|
+|bootUnlock run|Runs the schedule right now instead of waiting for a boot (calibration; on the HOME menu a stray `A` starts the selected game)|none|`bootUnlock run`|
 |applicationTerminate|Experimental: terminates only the current foreground application (system-level final termination; the forced fallback after the HOME-menu graceful-close timeout; a hard kill that makes the Switch show the standard software-error dialog and return to the game-selection screen)|none|`applicationTerminate`|
 |gameLaunchHeadless|Experimental: headless-launches a game by Title ID: starts the process without bringing it to the screen (16 hex digits, non-zero; optional storage name forces that storage)|titleId [storage]|`gameLaunchHeadless 01006F8002326000`|
 
@@ -71,6 +75,89 @@ writes the corresponding one-shot RTC autoboot reason before requesting reboot. 
 rewrites `hekate_ipl.ini` and never falls back to a guessed entry.
 The Mariko path passed real-device acceptance on the current `model=3` console and booted the
 `Atm-Emu` entry directly. The Erista payload-copy branch remains experimental.
+
+### Boot unlock (press HOME until the lock screen is gone)
+
+After a reboot this console sits on Horizon's lock screen ("A 开始" / "A 继续"). It waits there
+for a button press and drops back into sleep - which takes the network stack, and with it every
+sys-agent session - when none arrives. The boot unlock answers it with the same virtual
+controller `input click` uses. It does not need a precise moment: the console stays awake and
+locked for a couple of minutes, the worker runs from `main()` (after the settle sleep, with
+every service up) and decides what to do from the picture on the screen.
+
+**HOME is the button**, and one rule drives everything: HOME is inert on both lock screens and
+on the HOME menu, and it is what brings a darkened display back - so a stray press cannot start
+a game, while a press that lands on the three-press lock screen still counts towards its
+sequence. Measured on the development console:
+
+|State|Observation|
+|--|--|
+|lock screen appears|~20 s after boot|
+|display darkens|~13 s later, and a virtual press while it is dark only lights the display again (a physical press still unlocks)|
+|console sleeps|a couple of minutes later, taking the network with it|
+|waking the display|HOME may need one to three presses; four attempts that do not light it up mean it is not going to|
+|plain lock screen|one HOME dismisses it|
+|"press the same button three times" (Screen Lock on)|appears after the plain lock screen has been dismissed; its presses have to follow each other inside about a second, or the counter starts over|
+
+The worker loops: capture the screen, classify it, act, look again - with a round limit and a
+deadline. It only ever presses HOME:
+
+|Verdict|Action|
+|--|--|
+|`dark` (capture failed, or a black frame)|press HOME to light the display, up to `wakeAttempts`, then look again|
+|`lock-one`|press HOME once, then look again (with Screen Lock on this reveals the three-press screen)|
+|`lock-three`|press HOME `burstPresses` times `pressGapMs` apart - one tight burst with no capture in between, because a capture takes longer than that window - then look again|
+|`other`|stop without pressing anything: either the console was never locked, or it just opened (`reason=unlocked` / `not-locked`)|
+|`unknown` (not a baseline JPEG)|stop: never press on a screen that could not be judged|
+
+An Application running also stops the run (`reason=application-running`) - it means the console
+is not sitting at a lock screen, and nothing should be pressed into a game.
+
+What it does and when it does it live in two files on the SD card:
+
+|Path|Meaning|
+|--|--|
+|`sdmc:/config/sys-agent/boot-unlock.ini`|`[boot-unlock]` section: `mode` (`off`, `armed`, `everyBoot`; default `armed`), `firstDelayMs` (default 2000), `wakeAttempts` (default 4), `wakeDelayMs` (default 600), `verifyDelayMs` (default 1500), `pressGapMs` (default 250), `burstPresses` (default 3), `maxRounds` (default 8), `deadlineMs` (default 90000). A missing file keeps the defaults. A name this build does not know is ignored, but a value out of range - or a `pressGapMs` of 1 s or more, which would break the three-press window - makes the whole file invalid, and the boot then falls back to the defaults and reports `reason=config-invalid` / `config-io-error`.|
+|`sdmc:/config/sys-agent/boot-unlock.armed`|Its presence is the one-shot request. With the default `mode=armed` that file is the only thing that makes a boot run the sequence, and the boot that ran it consumes it.|
+
+- **Both reboot actions arm the unlock by themselves** (`systemReboot`,
+  `systemRebootEmuMMC`): they write the request file just before asking for the reboot, so a
+  reboot unlocks unless the caller passes `noUnlock` (the client's
+  `system action reboot --no-unlock`). The request is one-shot - the boot that runs it
+  consumes it - so the only way it survives is a reboot that never happened, in which case the
+  next boot does what the request asked for anyway. `mode=armed` is what makes that file
+  meaningful; an installed sysmodule that is never rebooted through these commands and never
+  armed presses nothing.
+- The request is honoured under `mode=armed` (file present) or `mode=everyBoot` (always), and
+  dropped - not executed - under `mode=off`, so a parked request cannot fire later out of
+  context. Whatever the outcome, the boot that ran the worker deletes the file: a failed
+  unlock (`display-stays-dark`, `unknown-screen`, `deadline`) is reported and logged, but is
+  not retried by itself on the following boot - arm it again to try once more.
+- Recognising the lock screen is picture analysis, not a system flag: the screenshots are
+  baseline JPEGs, so `jpeg_dc.c` decodes only the DC coefficient of each 8x8 block (the block's
+  mean brightness) and `screen_classify.c` measures the right and left thirds of that little
+  image. A large flat patch on the right means "lock screen"; whether the left third is flat
+  too tells the two variants apart. No IDCT, no colour transform, no OCR. The rule, the
+  measured separations and the test fixtures are in
+  [the lock-screen notes](docs/lock-screen-notes.md).
+- `bootUnlock` reports the whole decision trail: `reason`, `rounds`, `wakePresses`,
+  `homePresses`/`homeSent`, `applicationRuns`, `lastClass`/`lastMetrics` (right flat ratio,
+  its colour spread, left flat ratio) and the `screens` verdict timeline - every `*Ms` as
+  milliseconds since boot, the same clock `systemInfo` reports as `uptimeMs`. The same summary
+  is appended to `sdmc:/config/sys-agent/boot-unlock.log`, so a boot that never came back on
+  the network can still be understood by reading the SD card.
+- `bootUnlock run` repeats the whole thing on demand, which is how the thresholds get
+  calibrated; it is safe to call on a console that is not locked, because "not a lock screen"
+  means "press nothing".
+- **The classifier is tied to Horizon's current lock screen.** It recognises that screen by
+  its shape - a large flat area on the right, and a flat left third for the three-press
+  variant - not by any documented interface. If Nintendo redesigns it (different layout,
+  animation, a solid colour failover, a moved glyph) the verdicts will come out `other` or
+  `unknown`, and the unlock will simply not press anything: a failed unlock is the designed
+  failure mode, never a wrong press. Recovering is a calibration job, not a redesign:
+  `bootUnlock run` prints what each frame measured, `sdmc:/config/sys-agent/boot-unlock.log`
+  keeps the trail, and the fixtures in `tests/fixtures/` plus the note in
+  [docs/lock-screen-notes.md](docs/lock-screen-notes.md) say which numbers to move.
 
 ## Audio control
 

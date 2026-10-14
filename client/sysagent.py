@@ -20,7 +20,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.0.0"
+CLIENT_VERSION = "1.0.1"
 
 # Ordinary command responses are small, but the screenCapture (legacy
 # "pixelPeek") command returns the captured JPEG as a single hex line. The
@@ -724,7 +724,7 @@ class SysAgentClient:
             raise ValueError("offset must be non-negative and count must be in 1..64")
         return require_ok(self.command(f"processList {offset} {count}", retry=True))
 
-    def system_action(self, action: str) -> dict[str, str]:
+    def system_action(self, action: str, unlock: bool = True) -> dict[str, str]:
         commands = {
             "reboot": "systemReboot",
             "reboot-emummc": "systemRebootEmuMMC",
@@ -734,7 +734,14 @@ class SysAgentClient:
         }
         if action not in commands:
             raise ValueError("unsupported system action")
-        return require_ok(self.command(commands[action]))
+        command = commands[action]
+        # Both reboot actions unlock the console by default (the sysmodule writes
+        # its one-shot request file before rebooting); `noUnlock` opts out.
+        if not unlock:
+            if action not in {"reboot", "reboot-emummc"}:
+                raise ValueError("--no-unlock only applies to reboot and reboot-emummc")
+            command += " noUnlock"
+        return require_ok(self.command(command))
 
     def set_wireless(self, enabled: bool) -> dict[str, str]:
         state = "enabled" if enabled else "disabled"
@@ -1670,7 +1677,7 @@ def _cmd_process_list(client: SysAgentClient, args: argparse.Namespace) -> None:
 
 
 def _cmd_system_action(client: SysAgentClient, args: argparse.Namespace) -> None:
-    print_fields(client.system_action(args.command))
+    print_fields(client.system_action(args.command, unlock=not args.no_unlock))
 
 
 def _cmd_wireless(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -2180,6 +2187,56 @@ CONTROLLER_DUMP_HELP = "\n".join((
     "                  (npad 0-7, Other, Handheld) with interface + number",
 ))
 
+SYSTEM_ACTION_HELP = "\n".join((
+    "Actions:",
+    "  reboot                  normal Atmosphere/Horizon reboot",
+    "  reboot-emummc           one-shot reboot to the Hekate entry with id=Atm-Emu",
+    "  shutdown                orderly shutdown",
+    "  sleep                   experimental system-sleep SVC",
+    "  terminate-application   terminate the foreground application",
+    "",
+    "Boot unlock:",
+    "  reboot and reboot-emummc ask the sysmodule to arm the boot unlock before",
+    "  rebooting, so the console comes back past Horizon's lock screen instead of",
+    "  timing out into sleep (which cuts every sys-agent session off). The request",
+    "  is one-shot: the boot that runs it consumes it.",
+    "  --no-unlock skips that arming for this reboot; it means nothing for the",
+    "  other actions, and the client rejects it there.",
+    "  See `bootUnlock` in commands.md and docs/lock-screen-notes.md.",
+))
+
+SYSTEM_QUERY_HELP = "\n".join((
+    "Queries:",
+    "  info             firmware, model, region, language, nickname, serial",
+    "  time             Unix time, timezone and uptime (uptimeMs = the boot clock)",
+    "  power            battery, charger, voltage, health, temperature",
+    "  storage          SD mount state and total/free/used bytes",
+    "  network          link state, signal strength, IPv4 configuration",
+    "  network-profile  current profile, SSID, Wi-Fi passphrase, IPv4/DNS, MTU",
+    "  account          last-opened account UID and nickname",
+    "  application      running application identity, version, memory bases, name",
+    "",
+    "--json prints the same fields as a JSON object; --out writes them to a file.",
+))
+
+CONFIG_SET_HELP = "\n".join((
+    "Settings (`config get <name>` reads one back, `config list` prints them all):",
+    "  mainLoopSleepTime        main-loop poll timeout in ms (default 50)",
+    "  buttonClickSleepTime     how long `input click` holds a button (50 ms)",
+    "  keySleepTime             gap between keyboard keys (default 25 ms)",
+    "  fingerDiameter           touch radius in pixels (default 50)",
+    "  pollRate                 touch/autopilot poll rate in ms (default 17)",
+    "  freezeRate               freeze write interval in ms (default 3)",
+    "  echoCommands             1 prints every received command (default 0)",
+    "  printDebugResultCodes    1 prints diagnostic Result codes (default 0)",
+    "  controllerType            virtual pad device type (default 3 = full key)",
+    "  controllerIdleRelease     seconds before the virtual pad gives player 1 back",
+    "                            (0 = never; ms twin: controllerIdleReleaseMs)",
+    "  controllerIdleReleaseMs   the same delay in ms (default 1000)",
+    "  controllerTakeover        0 = leave a real controller alone, 1 = take over",
+    "                            when HOS refuses our state write (default 1)",
+))
+
 # ---- command registry -------------------------------------------------------
 
 
@@ -2198,11 +2255,12 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
         Command("capabilities", "Show system-management capabilities",
                 _cmd_system_capabilities),
         Command("query", "Query grouped system state", _cmd_system_query,
-                (Arg("query", "info, time, power, storage, network, network-profile, "
-                              "account, or application",
+                (Arg("query", "query group to read; see the table below",
                      choices=("info", "time", "power", "storage", "network",
-                              "network-profile", "account", "application")),
-                 JSON_ARG, OUT_ARG)),
+                              "network-profile", "account", "application"),
+                     metavar="QUERY"),
+                 JSON_ARG, OUT_ARG),
+                SYSTEM_QUERY_HELP),
         Command("log", "Show recent commands the console received (oldest first)",
                 _cmd_system_log,
                 (Arg("count", "entries to show (1..32; default all)",
@@ -2214,10 +2272,15 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                  Arg("count", "page size, 1..64", type=parse_int, default=64,
                      flags=("--count",)))),
         Command("action", "Run a system action", _cmd_system_action,
-                (Arg("command", "reboot, shutdown, sleep, reboot-emummc, or "
-                                "terminate-application",
+                (Arg("command", "action to run; see the table below",
                      choices=("reboot", "shutdown", "sleep", "reboot-emummc",
-                              "terminate-application")),)),
+                              "terminate-application"),
+                     metavar="ACTION"),
+                 Arg("no_unlock", "do not arm the boot unlock for this reboot "
+                                  "(reboot and reboot-emummc unlock by default)",
+                     action="store_true", default=False,
+                     flags=("--no-unlock",))),
+                SYSTEM_ACTION_HELP),
         Command("wireless", "Enable or disable wireless communication", _cmd_wireless,
                 (Arg("state", "enabled or disabled", choices=("enabled", "disabled")),)),
         Command("lock-screen", "Show or change the lock-screen flag", _cmd_lock_screen,
@@ -2245,9 +2308,9 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                                    "on screen (headless; foreground launch is not possible "
                                    "from a sysmodule)", _cmd_game_launch_headless,
                 (Arg("title_id", "Title ID (hex or decimal)", type=parse_int),
-                 Arg("storage", "Storage to force (auto-detected when omitted)",
+                 Arg("storage", "storage to force (auto-detected when omitted); see below",
                      nargs="?", choices=("SdCard", "BuiltInUser", "GameCard", "None"),
-                     default=None),
+                     default=None, metavar="STORAGE"),
                  Arg("keys", "prod.keys path; read the update ticket on the console, decrypt "
                              "the titlekey on this host, and register it before launching",
                      flags=("--keys",), default=None),
@@ -2256,7 +2319,18 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                                   "rightsId = title_key_block keygen for "
                                   "per-boot spl:es AccessKey computation); "
                                   "auto-registers before launching",
-                     flags=("--titlekeys",), default=None),)),
+                     flags=("--titlekeys",), default=None),),
+                "\n".join((
+                    "STORAGE",
+                    "  SdCard         SD card only (the usual choice for installed games)",
+                    "  BuiltInUser    console memory",
+                    "  GameCard       game card",
+                    "  None           let the loader pick (default when omitted)",
+                    "",
+                    "The update ticket is what needs a key: without --titlekeys the launch",
+                    "only works when the title's key was registered before (e.g. by playing",
+                    "it once), because the AccessKey differs every boot.",
+                ))),
         Command("terminate", "Experimental: force-close the foreground game (system-level "
                              "final termination; hard kill: the Switch shows the "
                              "software-error dialog, then returns to the game-selection "
@@ -2457,21 +2531,13 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
 
     CommandGroup("config", "Change sys-agent runtime settings", (
         Command("set", "Change a timing or settings value", _cmd_configure,
-                (Arg("parameter", "mainLoopSleepTime, buttonClickSleepTime, echoCommands, "
-                                  "printDebugResultCodes, keySleepTime, fingerDiameter, "
-                                  "pollRate, freezeRate, controllerType, "
-                                  "controllerIdleRelease (seconds before the virtual "
-                                  "controller releases the player slot, 0=never), "
-                                  "controllerIdleReleaseMs (the same delay in "
-                                  "milliseconds, for sub-second tuning), "
-                                  "controllerTakeover (0=off, 1=kick the blocking "
-                                  "controller, rebuild and retry; default 1. "
-                                  "The old value 2 behaves like 1)"),
-                 Arg("value", "new value", type=parse_int))),
+                (Arg("parameter", "setting name; see the table below",
+                     metavar="NAME"),
+                 Arg("value", "new value", type=parse_int)),
+                CONFIG_SET_HELP),
         Command("get", "Print one runtime setting", _cmd_config_get,
-                (Arg("parameter", "setting name, as accepted by `config set` "
-                                  "(controllerIdleRelease reads back as "
-                                  "controllerIdleReleaseMs)"),)),
+                (Arg("parameter", "setting name; `config set --help` lists every name",
+                     metavar="NAME"),)),
         Command("list", "Print every runtime setting", _cmd_config_list),
     )),
 

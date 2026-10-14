@@ -371,7 +371,16 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(client.set_lock_screen(True)["lockScreen"], "1")
             self.assertEqual(client.system_action("reboot")["action"], "systemReboot")
             self.assertEqual(self.server.state.last_command, ["systemReboot"])
+            # Lock/unlock is server-side by default; the flag opts out.
+            client.system_action("reboot", unlock=False)
+            self.assertEqual(self.server.state.last_command, ["systemReboot", "noUnlock"])
             self.assertEqual(client.system_action("reboot-emummc")["action"], "systemRebootEmuMMC")
+            client.system_action("reboot-emummc", unlock=False)
+            self.assertEqual(self.server.state.last_command,
+                             ["systemRebootEmuMMC", "noUnlock"])
+            # --no-unlock means nothing for the other actions.
+            with self.assertRaises(ValueError):
+                client.system_action("sleep", unlock=False)
             with self.assertRaises(ValueError):
                 client.process_list(0, 65)
             with self.assertRaises(ValueError):

@@ -80,6 +80,10 @@ void peek(u64 offset, u64 size);
 void peekInfinite(u64 offset, u64 size);
 void peekMulti(u64* offset, u64* size, u64 count);
 void click(HidNpadButton btn);
+/* Number of virtual-controller state writes HOS accepted since boot (presses and
+ * releases both count). Lets a caller tell a press that went out from one that
+ * had no attached device to land on. */
+u64 controllerStateWriteSuccesses(void);
 void press(HidNpadButton btn);
 void release(HidNpadButton btn);
 void setStickState(int side, int dxVal, int dyVal);

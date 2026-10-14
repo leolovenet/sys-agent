@@ -86,6 +86,7 @@ docker run --rm \
 ## 系统管理命令
 
 - 端口 `6000` 暴露未认证系统管理命令。Mariko `systemRebootEmuMMC` 经 Hekate `id=Atm-Emu` 验证;Erista 路径与 `systemSleep` 仍实验性。`networkProfile` 会暴露当前 Wi-Fi 口令。
+- **boot unlock**(`bootUnlock`):重启后 Horizon 停在锁屏界面("A 开始"/"A 继续"),不按键就最终休眠并掉网络。worker 在 `main()` 里、所有服务就绪之后启动(**故意不抢在 settle sleep 之前**:锁屏要停留数分钟,不需要抢时间),循环"抓屏 → 分类 → 动作 → 再看",按键一律用 **HOME**:两种锁屏与主菜单上它都无副作用,还能点亮熄灭的屏幕;A 在主菜单会直接启动当前选中的游戏,所以不用。判断只靠画面:capssc 给的是 baseline JPEG,`jpeg_dc.c` 只解每 8×8 块的 DC 系数得到 160×90 亮度图,`screen_classify.c` 按"右区大面积单色=锁屏 / 左区也单色=需连按 3 次那一型"判定,细节与阈值见 `docs/lock-screen-notes.md`;连按那一型必须一次连发(抓屏+分析超过它的 ~1 秒窗口),发现 Application 在跑立即收手。默认 `mode=armed`:不落 arm 文件就什么都不按;计划表 `sdmc:/config/sys-agent/boot-unlock.ini`,一次性请求文件 `sdmc:/config/sys-agent/boot-unlock.armed`;报告与 `sdmc:/config/sys-agent/boot-unlock.log` 记录 `reason`、轮数、按键数与逐次判定,时间字段是"开机以来毫秒"(与 `systemInfo` 的 `uptimeMs` 同一时钟)。
 
 ## 文档导航
 
@@ -97,6 +98,7 @@ docker run --rm \
 | `third_party/README.md` | 第三方源码清单 |
 | `docs/ftp-server.md` | FTP 服务与验证矩阵(改 FTP 前) |
 | `docs/hdls-virtual-controller-notes.md` | HDLS 虚拟手柄失效机制、自动重建/自愈、诊断命令与系统限制(改输入或手柄代码前必读) |
+| `docs/lock-screen-notes.md` | 锁屏识别规则与阈值、四种界面实测数据、fixture 与主机回归(改 `boot unlock`/屏幕分类前必读) |
 | `docs/headless-launch-rights-key-notes.md` | headless 启动与 external key 机制(改 launch/keys 前必读) |
 | `docs/process-memory-backend.md` | 统一内存后端设计(direct/auto) |
 | `docs/search-a-level-design.md` | A 级精确搜索设计与部署门槛 |

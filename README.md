@@ -86,6 +86,14 @@ commands should follow this rule:
 - Grouped system-management commands report system, power, storage, network, account,
   application, and process state. Additive actions cover normal reboot/shutdown, wireless and
   lock-screen settings, foreground-application termination, and one-shot Hekate emuMMC reboot.
+- The system-management group also carries the boot unlock: an armed sysmodule looks at the
+  screen after a reboot and presses HOME until Horizon's lock screen ("A 开始" / "A 继续") is
+  gone, so it cannot time out into sleep and cut the console off. The judgement is picture
+  analysis on a DC-only JPEG decode (a flat patch on the right is a lock screen, a flat left
+  third means it wants the same button three times), and HOME is the button because it is
+  inert on every screen involved - `A` would start a game on the HOME menu. It is off unless
+  asked for (`bootUnlock arm`), the schedule and the arming live on the SD card, and
+  `bootUnlock` (plus a log on the SD card) reports what it saw and did.
 - The original controller, screen-capture, and memory commands remain available. New commands
   are additive so existing clients can continue to ignore capabilities they do not use.
 

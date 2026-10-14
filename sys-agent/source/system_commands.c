@@ -5,6 +5,7 @@
 #include <switch/runtime/devices/fs_dev.h>
 
 #include "commands.h"
+#include "boot_unlock.h"
 #include "hekate_config.h"
 #include "hekate_reboot.h"
 #include "process_memory.h"
@@ -371,8 +372,17 @@ static void processList(u64 offset, u64 count)
     printf("\n");
 }
 
-static void powerAction(bool reboot)
+/* Every reboot arms the boot unlock unless the caller asked it not to: the console
+ * comes back at Horizon's lock screen, and without a press there it sleeps and
+ * takes the network with it. A failed write is reported but never blocks the
+ * reboot - the reboot is what the caller asked for. */
+static void powerAction(bool reboot, bool noUnlock)
 {
+    /* Arm first: the reset can follow the request within a moment, and the request
+     * file has to be on the SD card before that. */
+    bool armed = false;
+    if (reboot && !noUnlock)
+        armed = bootUnlockRequest();
     Result rc = bpcInitialize();
     if (R_FAILED(rc)) {
         printServiceError("bpc", rc);
@@ -384,12 +394,18 @@ static void powerAction(bool reboot)
         printCommandError(reboot ? "reboot" : "shutdown", rc);
         return;
     }
-    printf("OK action=%s\n", reboot ? "rebooting" : "shuttingDown");
+    printf("OK action=%s", reboot ? "rebooting" : "shuttingDown");
+    if (reboot)
+        printf(" unlock=%s", noUnlock ? "skipped" : (armed ? "requested" : "error"));
+    printf("\n");
     fflush(stdout);
 }
 
-static void rebootEmuMmc(void)
+static void rebootEmuMmc(bool noUnlock)
 {
+    /* Same order as powerAction(): the request file is on the SD card before the
+     * one-shot reboot to the Hekate entry is requested. */
+    bool armed = !noUnlock && bootUnlockRequest();
     static const char* id = "Atm-Emu";
     unsigned entryIndex = 0;
     HekateConfigResult config = hekateFindMainConfigId(
@@ -405,7 +421,9 @@ static void rebootEmuMmc(void)
         printf("ERR code=COMMAND_FAILED stage=%s result=0x%X\n", stage, rc);
         return;
     }
-    printf("OK action=rebooting target=emuMMC id=%s entry=%u\n", id, entryIndex);
+    printf("OK action=rebooting target=emuMMC id=%s entry=%u", id, entryIndex);
+    printf(" unlock=%s", noUnlock ? "skipped" : (armed ? "requested" : "error"));
+    printf("\n");
     fflush(stdout);
 }
 
@@ -1724,6 +1742,7 @@ bool systemCommandsDispatch(int argc, char** argv)
         || !strcmp(command, "systemShutdown")
         || !strcmp(command, "systemSleep") || !strcmp(command, "networkSet")
         || !strcmp(command, "lockScreenStatus") || !strcmp(command, "lockScreenSet")
+        || !strcmp(command, "bootUnlock")
         || !strcmp(command, "applicationTerminate")
         || !strcmp(command, "audioVolume") || !strcmp(command, "audioMute")
         || !strcmp(command, "gameLaunchHeadless")
@@ -1875,6 +1894,36 @@ bool systemCommandsDispatch(int argc, char** argv)
         lockScreenSet(!strcmp(argv[1], "enabled"));
         return true;
     }
+    if (!strcmp(command, "bootUnlock")) {
+        if (argc == 1) {
+            bootUnlockStatusCommand();
+            return true;
+        }
+        if (argc != 2 || (strcmp(argv[1], "arm") && strcmp(argv[1], "disarm")
+                          && strcmp(argv[1], "run"))) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        if (!strcmp(argv[1], "run"))
+            bootUnlockRunCommand();
+        else
+            bootUnlockArmCommand(!strcmp(argv[1], "arm"));
+        return true;
+    }
+    if (!strcmp(command, "systemReboot") || !strcmp(command, "systemRebootEmuMMC")) {
+        bool noUnlock = false;
+        if (argc == 2 && !strcmp(argv[1], "noUnlock"))
+            noUnlock = true;
+        else if (argc != 1) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        if (!strcmp(command, "systemReboot"))
+            powerAction(true, noUnlock);
+        else
+            rebootEmuMmc(noUnlock);
+        return true;
+    }
     if (!strcmp(command, "audioVolume")) {
         u64 volume = 0;
         bool set = false;
@@ -1910,7 +1959,7 @@ bool systemCommandsDispatch(int argc, char** argv)
     }
 
     if (!strcmp(command, "systemCapabilities"))
-        printf("OK version=1 queries=systemInfo,systemTime,powerStatus,storageStatus,networkStatus,networkProfile,accountStatus,applicationStatus,processList,lockScreenStatus actions=systemReboot,systemRebootEmuMMC,systemShutdown,systemSleep,networkSet,lockScreenSet,applicationTerminate game=launchHeadless processPageMax=%d audio=volume,mute sensitiveData=serial,account,wifiPassphrase authentication=none sleep=experimental rebootEmuMMCMariko=validated rebootEmuMMCErista=experimental\n", PROCESS_PAGE_MAX);
+        printf("OK version=1 queries=systemInfo,systemTime,powerStatus,storageStatus,networkStatus,networkProfile,accountStatus,applicationStatus,processList,lockScreenStatus actions=systemReboot,systemRebootEmuMMC,systemShutdown,systemSleep,networkSet,lockScreenSet,applicationTerminate bootUnlock=status,arm,disarm,run unlockOnReboot=default,skipWithNoUnlock game=launchHeadless processPageMax=%d audio=volume,mute sensitiveData=serial,account,wifiPassphrase authentication=none sleep=experimental rebootEmuMMCMariko=validated rebootEmuMMCErista=experimental\n", PROCESS_PAGE_MAX);
     else if (!strcmp(command, "systemInfo")) systemInfo();
     else if (!strcmp(command, "systemTime")) systemTimeCommand();
     else if (!strcmp(command, "powerStatus")) powerStatus();
@@ -1920,9 +1969,7 @@ bool systemCommandsDispatch(int argc, char** argv)
     else if (!strcmp(command, "lockScreenStatus")) lockScreenStatus();
     else if (!strcmp(command, "accountStatus")) accountStatus();
     else if (!strcmp(command, "applicationStatus")) applicationStatus();
-    else if (!strcmp(command, "systemReboot")) powerAction(true);
-    else if (!strcmp(command, "systemRebootEmuMMC")) rebootEmuMmc();
-    else if (!strcmp(command, "systemShutdown")) powerAction(false);
+    else if (!strcmp(command, "systemShutdown")) powerAction(false, false);
     else if (!strcmp(command, "systemSleep")) {
         printf("OK action=sleeping\n");
         fflush(stdout);

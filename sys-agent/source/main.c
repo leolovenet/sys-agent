@@ -20,13 +20,14 @@
 #include "dmnt_client.h"
 #include "ftp_server.h"
 #include "system_commands.h"
+#include "boot_unlock.h"
 #include <poll.h>
 #include <switch/runtime/devices/fs_dev.h>
 
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.13.2"
+#define VERSION_S "2.14.0"
 
 typedef enum {
     Active = 0,
@@ -2375,6 +2376,14 @@ int main()
         rc = threadStart(&clickThread);
 
     flashLed();
+
+    /* Boot unlock: if this boot was asked for one (the reboot path writes a request
+     * file on the SD card), the worker looks at the screen and presses HOME until
+     * the lock screen is gone. It runs here rather than earlier on purpose - the
+     * console stays awake with its lock screen for a couple of minutes after boot,
+     * so the unlock does not have to beat the settle sleep above, and this way the
+     * worker only ever runs with every service already up. */
+    bootUnlockInit(searchSdMounted);
 
     while (true)
     {

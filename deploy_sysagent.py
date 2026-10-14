@@ -10,6 +10,10 @@ sys-agent to already be running on the Switch because it uses the built-in FTP s
 (port 6001) and the reboot command (port 6000); first-time installation must follow the
 manual SD-card instructions in the README.
 
+That reboot goes through ``systemRebootEmuMMC``, which arms the boot unlock, so the console
+comes back at the HOME menu instead of sitting on Horizon's lock screen (see the
+"Boot unlock" section in commands.md).
+
 By design this script does NOT back up the Switch-side sys-agent. The console's existing
 ``atmosphere/contents/43000000000000A6`` directory is overwritten in place. Roll back by
 re-deploying an older build or by editing the SD card manually.

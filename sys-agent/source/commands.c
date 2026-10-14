@@ -28,6 +28,11 @@ u64 controllerTakeoverMode = 1;
 /* The virtual pad always presents itself as a Bluetooth Pro Controller. */
 #define CONTROLLER_INTERFACE_TYPE HidNpadInterfaceType_Bluetooth
 static Result controllerLastStateError = 0;
+/* Accepted hiddbgSetHdlsState writes since boot. A press on a device that is not
+ * attached (yet) writes nowhere and fails, so this is what tells "the input went
+ * out" from "nothing could receive it" - the boot unlock reads it around its HOME
+ * presses to know whether the virtual pad was there to take them. */
+static u64 controllerStateWrites = 0;
 static u64 controllerTopology = 0;
 static u64 controllerRealPadSampleTick = 0;
 static s32 controllerRealPadSample = -1;
@@ -1434,7 +1439,13 @@ static void writeControllerStateLocked(void)
     }
     else {
         controllerLastStateError = 0;
+        __atomic_add_fetch(&controllerStateWrites, 1, __ATOMIC_SEQ_CST);
     }
+}
+
+u64 controllerStateWriteSuccesses(void)
+{
+    return __atomic_load_n(&controllerStateWrites, __ATOMIC_SEQ_CST);
 }
 
 void press(HidNpadButton btn)

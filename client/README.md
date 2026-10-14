@@ -40,8 +40,8 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.0.0
-sys-agent 2.13.2  (switch:6000)
+client    1.0.1
+sys-agent 2.14.0  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
@@ -72,6 +72,7 @@ python3 client/sysagent.py --host switch system wireless enabled
 python3 client/sysagent.py --host switch system lock-screen status
 python3 client/sysagent.py --host switch system action reboot
 python3 client/sysagent.py --host switch system action reboot-emummc
+python3 client/sysagent.py --host switch system action reboot --no-unlock
 ```
 
 `system query network-profile` returns the Wi-Fi passphrase over an unauthenticated,
