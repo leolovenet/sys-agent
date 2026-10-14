@@ -9,7 +9,7 @@
 
 ## 仓库边界
 
-- `origin` = `https://github.com/leolovenet/sys-agent.git`(fork);`upstream` = `https://github.com/olliz0r/sys-botbase.git`(只读)。
+- `origin` = `https://github.com/leolovenet/sys-agent.git`(fork),同时是 `gh` 在本目录的默认仓库(`gh repo set-default leolovenet/sys-agent`)。上游 `olliz0r/sys-botbase` **不配 remote**:它只是只读参考,而把它配成 remote 会让 `gh` 在"需要挑一个仓库"的命令上默认选中它(例如 `gh release create` 会报 "tag exists locally but has not been pushed to olliz0r/sys-botbase");要读上游代码用 `gh repo view olliz0r/sys-botbase` 或直接 URL。
 - 只向 fork 与分支提交/推送;向上游贡献走 GitHub PR,绝不直接推官方 upstream。
 - `third_party/ftpsrv` submodule 固定 commit `7c82402e8f9a53400ea33b82eebd961dfa83a422`(MIT);构建前用递归 submodule 克隆/更新。
 
