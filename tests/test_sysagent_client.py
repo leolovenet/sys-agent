@@ -6,7 +6,8 @@ import threading
 import time
 import unittest
 
-from client.sysagent import SysAgentProtocolError, SysAgentClient, parse_response, require_ok
+from client.sysagent import (SysAgentProtocolError, SysAgentClient, parse_response, require_ok,
+                             text_runs)
 
 
 def build_test_ticket() -> bytes:
@@ -41,6 +42,11 @@ class FakeState:
         self.flaky_peek_remaining = 0
         self.repeat_support = True
         self.sequence_error = False
+        # What `configure <name>` answers, like the sysmodule's own setting table.
+        self.config_settings: dict[str, int] = {"controllerIdleReleaseMs": 1000,
+                                               "freezeRate": 3,
+                                               "keySleepTime": 30,
+                                               "pollRate": 20}
 
 
 class FakeHandler(socketserver.StreamRequestHandler):
@@ -192,16 +198,18 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 if len(command) == 3:
                     response = None
                 elif len(command) == 2:
-                    fake = {"controllerIdleReleaseMs": 1000, "freezeRate": 3}
-                    if command[1] in fake:
-                        response = (f"OK settings=1\n{command[1]}={fake[command[1]]}\n"
+                    if command[1] in state.config_settings:
+                        response = (f"OK settings=1\n{command[1]}="
+                                    f"{state.config_settings[command[1]]}\n"
                                     "END configure")
                     else:
                         response = (f"ERR configure unknown={command[1]} "
                                     "hint=controllerIdleReleaseMs\nEND configure")
                 else:
-                    response = ("OK settings=2\nfreezeRate=3\n"
-                                "controllerIdleReleaseMs=1000\nEND configure")
+                    settings = "\n".join(f"{name}={value}"
+                                         for name, value in state.config_settings.items())
+                    response = (f"OK settings={len(state.config_settings)}\n{settings}\n"
+                                "END configure")
             elif command[0] == "clickSeqCapabilities":
                 repeat = "repeat=paren-star" if state.repeat_support else "repeat=absent"
                 response = ("OK version=1 syntax=click,press,release,wait,stick "
@@ -711,6 +719,49 @@ class ClientTests(unittest.TestCase):
                 client.set_stick("UP", 0, 0)
             with self.assertRaises(ValueError):
                 client.set_stick("LEFT", 0x8000, 0)
+
+    def test_text_runs_are_one_command_per_run(self) -> None:
+        """Unshifted characters share a report list; a shifted one is its own report
+        (shift plus the key), because the software keyboard ignores the autopilot's
+        own modifier byte -- measured on the console, which is why `keyMod` is not
+        what this uses."""
+        self.assertEqual(text_runs("ab%9:"),
+                         [("keys", [0x04, 0x05]), ("shift", [0x22]),
+                          ("keys", [0x26]), ("shift", [0x33])])
+        self.assertEqual(text_runs("Az"), [("shift", [0x04]), ("keys", [0x1D])])
+        self.assertEqual(text_runs(""), [])
+
+    def test_text_run_refuses_what_the_layout_cannot_type(self) -> None:
+        """Chinese needs the console's input method, a newline is Enter: both are
+        refused before the first key goes out, so a half-typed field cannot be
+        mistaken for a complete one."""
+        with self.assertRaises(SysAgentProtocolError):
+            text_runs("已安装")
+        with self.assertRaises(SysAgentProtocolError):
+            text_runs("a\nb")
+
+    def test_type_text_sends_key_runs_and_shift_pairs(self) -> None:
+        with self.client() as client:
+            client.type_text("Az5", per_char_ms=0)
+            commands = self.server.state.commands
+            self.assertEqual(commands[-2], ["keyMulti", "225", "4"])  # shift + A
+            self.assertEqual(commands[-1], ["key", "29", "34"])       # z, 5
+
+    def test_text_pacing_comes_from_the_console_settings(self) -> None:
+        """keySleepTime + pollRate is what the console spends per character, so the
+        client asks the console instead of hard-coding a pace: the fake answers
+        30 + 20, which is neither default."""
+        with self.client() as client:
+            self.assertEqual(client.text_per_char_ms(), 50.0)
+            self.assertEqual(self.server.state.commands[-2], ["configure", "keySleepTime"])
+            self.assertEqual(self.server.state.commands[-1], ["configure", "pollRate"])
+
+    def test_text_pacing_falls_back_without_console_settings(self) -> None:
+        """A console that does not report these settings still gets paced typing
+        instead of an unpaced run, using the compiled-in defaults (25 + 17)."""
+        self.server.state.config_settings = {"controllerIdleReleaseMs": 1000, "freezeRate": 3}
+        with self.client() as client:
+            self.assertEqual(client.text_per_char_ms(), 42.0)
 
     def test_click_seq_done(self) -> None:
         with self.client() as client:

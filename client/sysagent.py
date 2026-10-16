@@ -20,7 +20,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.0.1"
+CLIENT_VERSION = "1.0.2"
 
 # Ordinary command responses are small, but the screenCapture (legacy
 # "pixelPeek") command returns the captured JPEG as a single hex line. The
@@ -1103,6 +1103,52 @@ class SysAgentClient:
         args = " ".join(str(key) for key in keys)
         self._bare_command(f"keyMulti {args}", expect_output=False)
 
+    def type_text(self, value: str, *, per_char_ms: float | None = None) -> None:
+        """Type `value` on the console's virtual keyboard, character by character.
+
+        The console can press keys, not "type a string": it takes a list of HID reports, and the
+        system software keyboard translates a US HID layout into text.  This method does that
+        translation (see `text_runs`), and it also handles the two things a caller cannot see
+        from the wire format:
+
+        * characters that need shift go out as one `keyMulti` (shift keycode 0xE1 plus the key),
+          which is what a real keyboard sends -- the keyboard autopilot's own modifier byte is not
+          honoured by the software keyboard;
+        * the console types asynchronously, and a second `key`/`keyMulti` command arriving while
+          the first is still running replaces the pending report list, so the client waits
+          `per_char_ms` (default: the console's own `keySleepTime` + `pollRate`) for every
+          character of the command it just sent before sending the next one.
+
+        Only printable ASCII is typable this way; anything else (a Chinese character, a newline)
+        is refused with `SysAgentProtocolError` *before* the first key is sent, so a partially
+        typed field never looks like a complete one.  Fields that need the console's IME or a
+        paste are out of reach of HID reports.
+        """
+        runs = text_runs(value)
+        if per_char_ms is None:
+            per_char_ms = self.text_per_char_ms()
+        for kind, codes in runs:
+            if kind == "shift":
+                self.key_multi([KEY_SHIFT, *codes])
+            else:
+                self.key(codes)
+            time.sleep(len(codes) * per_char_ms / 1000.0 + 0.15)
+
+    def text_per_char_ms(self) -> float:
+        """How long the console needs per typed character, from its own settings.
+
+        `keySleepTime` is the gap after each report and `pollRate` the gap when a release has to
+        be inserted between two identical reports; together they bound the per-character cost.
+        An older console that does not answer `configure` falls back to the compiled-in defaults.
+        """
+        total = 0.0
+        for name, default in (("keySleepTime", 25.0), ("pollRate", 17.0)):
+            try:
+                total += float(self.config_get(name))
+            except (SysAgentProtocolError, ValueError):
+                total += default
+        return total
+
     # ---- Screen ---------------------------------------------------------------
 
     def screen_off(self) -> None:
@@ -1504,6 +1550,65 @@ def pair_values(values: Sequence[int]) -> list[tuple[int, int]]:
     if len(values) % 2:
         raise ValueError("expected an even number of arguments")
     return list(zip(values[0::2], values[1::2]))
+
+
+# --- typing text over the virtual HID keyboard ------------------------------
+# The console's keyboard autopilot takes HID *keycodes*, and the software keyboard turns them into
+# characters with its own layout: the unshifted US layout (HID usage 0x04..0x1D = a..z, 0x1E..0x27
+# = 1..0, 0x2C space, then the punctuation a US keyboard has in those positions).  Measured on the
+# console: pressing 0x22 types "5", 0x33 types ";", 0x2F types "[" -- while the on-screen keycaps
+# show the Switch's own labels (":" and "_" sit where a US keyboard has ";" and "-"), so the
+# keycaps are *not* the mapping to trust.
+#
+# Shift is a keycode in the same bitfield (0xE1, left shift), which is why a shifted character is
+# sent as one report holding both keys -- `keyMulti`, not `keyMod`: the autopilot state's own
+# modifier byte is ignored by the software keyboard (measured: `keyMod <key> 1` types the
+# unshifted character).
+KEY_SHIFT = 0xE1
+
+_KEY_UNSHIFTED: dict[str, int] = {chr(ord("a") + i): 0x04 + i for i in range(26)}
+_KEY_UNSHIFTED.update({chr(ord("1") + i): 0x1E + i for i in range(9)})
+_KEY_UNSHIFTED["0"] = 0x27
+_KEY_UNSHIFTED.update({
+    " ": 0x2C, "-": 0x2D, "=": 0x2E, "[": 0x2F, "]": 0x30, "\\": 0x31,
+    ";": 0x33, "'": 0x34, "`": 0x35, ",": 0x36, ".": 0x37, "/": 0x38,
+})
+
+_KEY_SHIFTED: dict[str, int] = {chr(ord("A") + i): 0x04 + i for i in range(26)}
+_KEY_SHIFTED.update({
+    "!": 0x1E, "@": 0x1F, "#": 0x20, "$": 0x21, "%": 0x22, "^": 0x23, "&": 0x24,
+    "*": 0x25, "(": 0x26, ")": 0x27, "_": 0x2D, "+": 0x2E, "{": 0x2F, "}": 0x30,
+    "|": 0x31, ":": 0x33, '"': 0x34, "~": 0x35, "<": 0x36, ">": 0x37, "?": 0x38,
+})
+
+
+def text_runs(value: str) -> list[tuple[str, list[int]]]:
+    """Turns a string into the keyboard reports that type it.
+
+    Answers a list of ``(kind, keycodes)``: ``("keys", [...])`` is a run of characters typed by one
+    `key` command, ``("shift", [code])`` is one character that needs shift (`keyMulti` with
+    `KEY_SHIFT`).  Consecutive unshifted characters share a command, one shifted character is one
+    command -- which is exactly how many commands the console needs, no more.
+
+    Anything this layout cannot produce (non-ASCII, control characters) raises
+    `SysAgentProtocolError` here, before any key is sent.
+    """
+    runs: list[tuple[str, list[int]]] = []
+    for char in value:
+        if char in _KEY_UNSHIFTED:
+            codes = _KEY_UNSHIFTED[char]
+            if runs and runs[-1][0] == "keys":
+                runs[-1][1].append(codes)
+            else:
+                runs.append(("keys", [codes]))
+        elif char in _KEY_SHIFTED:
+            runs.append(("shift", [_KEY_SHIFTED[char]]))
+        else:
+            raise SysAgentProtocolError(
+                f"the console's virtual keyboard cannot type {char!r} (U+{ord(char):04X}): it "
+                "sends HID keyboard reports, so only printable ASCII works -- text in another "
+                "script needs the console's own input method, which is not reachable this way")
+    return runs
 
 
 def image_diff(baseline: str, current: str) -> dict[str, object]:
@@ -1931,6 +2036,10 @@ def _cmd_key_multi(client: SysAgentClient, args: argparse.Namespace) -> None:
     client.key_multi(args.keys)
 
 
+def _cmd_text(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.type_text(" ".join(args.text))
+
+
 def _require_game_running(client: SysAgentClient, command: str) -> None:
     status = client.system_query("application")
     running = status.get("running", "NA")
@@ -2161,6 +2270,21 @@ CLICK_SEQ_HELP = "\n".join((
     "  is refused with ERR code=BAD_SEQUENCE before any input is sent.",
     "",
     BUTTON_HELP,
+))
+
+TEXT_HELP = "\n".join((
+    "Types a string by sending HID keyboard reports; the character-to-keycode",
+    "mapping is the unshifted/shifted US layout, which is what the console's",
+    "software keyboard turns those reports into.",
+    "",
+    "  input text 'https://example.com/download/%e5%8f%8c.nsz'",
+    "",
+    "Only printable ASCII is typable this way: a character this layout cannot",
+    "produce (non-ASCII, a newline) is refused before any key is sent -- there is",
+    "no HID report for the console's own input method.",
+    "",
+    "The command waits for the console to finish each batch of characters before",
+    "sending the next one, sized from the console's own keySleepTime + pollRate.",
 ))
 
 CONTROLLER_STATUS_HELP = "\n".join((
@@ -2481,6 +2605,9 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 (Arg("pairs", "key modifier key modifier ...", nargs="+", type=parse_int),)),
         Command("key-multi", "Press several keys at once", _cmd_key_multi,
                 (Arg("keys", "HidKeyboardKey values", nargs="+", type=parse_int),)),
+        Command("text", "Type a string on the virtual keyboard", _cmd_text,
+                (Arg("text", "text; multiple words are joined with spaces", nargs="+"),),
+                TEXT_HELP),
     )),
 
     CommandGroup("controller", "Inspect and recover the virtual controller", (

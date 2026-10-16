@@ -279,14 +279,24 @@ python3 client/sysagent.py --host switch input touch-hold 200 500 1000
 python3 client/sysagent.py --host switch input touch-draw 100 200 100 500 200 500
 python3 client/sysagent.py --host switch input key 11 8 15 15 18
 python3 client/sysagent.py --host switch input key-mod 4 1
+python3 client/sysagent.py --host switch input text "Anno 1800"
+python3 client/sysagent.py --host switch input text "https://example.com/%e5%8f%8c.nsz"
 ```
 
 Input subcommands are `press`, `release`, `click`, `set-stick`, `click-seq`, `capabilities`
 (the click-seq syntax the console supports), `click-cancel`, `detach-controller`, `touch`,
-`touch-hold`, `touch-draw`, `touch-cancel`, `key`, `key-mod`, and `key-multi`. `click-seq` blocks
+`touch-hold`, `touch-draw`, `touch-cancel`, `key`, `key-mod`, `key-multi`, and `text`. `click-seq` blocks
 until the server reports `done` unless `--no-wait` is given, and prints what the console expanded
 (`done tokens=25 estMs=1400`); `touch`, `touch-hold`, and `touch-draw` expect `x y` coordinate
 pairs.
+
+`input text` types a string: the client maps the characters onto the HID keycodes the console's
+software keyboard turns back into text (unshifted US layout, with `keyMulti` for the shifted
+characters -- the autopilot's own modifier byte is ignored by that keyboard, so `keyMod` is not
+what it uses), and waits for each batch of characters to be typed before sending the next command.
+Only printable ASCII can be typed this way; anything else is refused before the first key goes out,
+because the console's own input method is not reachable through HID reports.
+
 `input press|release|click|click-seq -h` prints the full table of accepted button names
 (`A`, `B`, `X`, `Y`, `L`, `R`, `ZL`, `ZR`, `PLUS`, `MINUS`, `DUP`/`DU`, `DDOWN`/`DD`,
 `DLEFT`/`DL`, `DRIGHT`/`DR`, `LSTICK`, `RSTICK`, `HOME`, `CAPTURE`, `PALMA`, `UNUSED`);
