@@ -40,7 +40,7 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.0.1
+client    1.0.3
 sys-agent 2.14.0  (switch:6000)
 ```
 
@@ -295,7 +295,10 @@ software keyboard turns back into text (unshifted US layout, with `keyMulti` for
 characters -- the autopilot's own modifier byte is ignored by that keyboard, so `keyMod` is not
 what it uses), and waits for each batch of characters to be typed before sending the next command.
 Only printable ASCII can be typed this way; anything else is refused before the first key goes out,
-because the console's own input method is not reachable through HID reports.
+because the console's own input method is not reachable through HID reports. While typing, the
+client raises the console's `keySleepTime` to at least 50 ms and restores the previous value
+afterwards: the 25 ms default is fine for the home menu but drops characters in a game's chat
+field (ACNH 3.0.3 measured 25/30 ms dropping keys, 35 ms occasionally, 40 ms clean).
 
 `input press|release|click|click-seq -h` prints the full table of accepted button names
 (`A`, `B`, `X`, `Y`, `L`, `R`, `ZL`, `ZR`, `PLUS`, `MINUS`, `DUP`/`DU`, `DDOWN`/`DD`,

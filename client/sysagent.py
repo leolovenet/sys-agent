@@ -20,7 +20,13 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.0.2"
+CLIENT_VERSION = "1.0.3"
+
+# The console's default keySleepTime (25 ms) is fast enough for the home menu but too
+# fast for the game's on-screen keyboard: measured in ACNH 3.0.3's chat field, 25/30 ms
+# drop characters, 35 ms occasionally drops one, and 40 ms was clean in 10/10 runs.
+# `type_text` temporarily raises the setting to this floor and restores it afterwards.
+TEXT_MIN_KEY_SLEEP_MS = 50
 
 # Ordinary command responses are small, but the screenCapture (legacy
 # "pixelPeek") command returns the captured JPEG as a single hex line. The
@@ -531,6 +537,10 @@ class SysAgentClient:
         self._stream_dirty = False
         # Cached `clickSeqCapabilities`; a client instance talks to one sysmodule.
         self._sequence_capabilities: dict[str, str] | None = None
+        # Set when `configure` reads time out (an older sysmodule has only the write form).
+        # One timeout is enough: later probes use the compiled-in defaults instead of
+        # waiting again for an answer that will never come.
+        self._config_read_unavailable = False
 
     def __enter__(self) -> "SysAgentClient":
         # Deliberately no connection here: the first command opens one (`_command_once` calls
@@ -1108,16 +1118,22 @@ class SysAgentClient:
 
         The console can press keys, not "type a string": it takes a list of HID reports, and the
         system software keyboard translates a US HID layout into text.  This method does that
-        translation (see `text_runs`), and it also handles the two things a caller cannot see
-        from the wire format:
+        translation (see `text_runs`), and it also handles the things a caller cannot see from
+        the wire format:
 
         * characters that need shift go out as one `keyMulti` (shift keycode 0xE1 plus the key),
           which is what a real keyboard sends -- the keyboard autopilot's own modifier byte is not
           honoured by the software keyboard;
-        * the console types asynchronously, and a second `key`/`keyMulti` command arriving while
-          the first is still running replaces the pending report list, so the client waits
-          `per_char_ms` (default: the console's own `keySleepTime` + `pollRate`) for every
-          character of the command it just sent before sending the next one.
+        * the console types asynchronously: a `key`/`keyMulti` command queues a report list, and
+          the keyboard thread takes it on its next poll (it holds `keyMutex` while typing).  A
+          command arriving before that poll replaces the queued list; one arriving during the run
+          waits.  The client therefore waits `per_char_ms` (default: the console's own
+          `keySleepTime` + `pollRate`) for every character of the command it just sent before
+          sending the next one;
+        * the game's on-screen keyboard drops keys at the console's default 25 ms gap, so the
+          console's `keySleepTime` is raised to at least `TEXT_MIN_KEY_SLEEP_MS` for the duration
+          of this call and restored afterwards.  The raise happens before `per_char_ms` is read,
+          so the client's own pacing also uses the effective gap.
 
         Only printable ASCII is typable this way; anything else (a Chinese character, a newline)
         is refused with `SysAgentProtocolError` *before* the first key is sent, so a partially
@@ -1125,14 +1141,71 @@ class SysAgentClient:
         paste are out of reach of HID reports.
         """
         runs = text_runs(value)
-        if per_char_ms is None:
-            per_char_ms = self.text_per_char_ms()
-        for kind, codes in runs:
-            if kind == "shift":
-                self.key_multi([KEY_SHIFT, *codes])
-            else:
-                self.key(codes)
-            time.sleep(len(codes) * per_char_ms / 1000.0 + 0.15)
+        if not runs:
+            return
+        original_key_sleep = self._raise_key_sleep_for_text()
+        try:
+            if per_char_ms is None:
+                per_char_ms = self.text_per_char_ms()
+            for kind, codes in runs:
+                if kind == "shift":
+                    self.key_multi([KEY_SHIFT, *codes])
+                else:
+                    self.key(codes)
+                time.sleep(len(codes) * per_char_ms / 1000.0 + 0.15)
+        finally:
+            self._restore_key_sleep(original_key_sleep)
+
+    def _config_value(self, name: str) -> str | None:
+        """Read one runtime setting, or None when the console cannot answer.
+
+        A sysmodule that predates the read form of `configure` stays silent; the read then
+        sits until the socket timeout.  One such timeout marks the read path unavailable and
+        drops the connection, so the remaining probes (and the next `input text`) use the
+        compiled-in defaults instead of waiting again.
+        """
+        if self._config_read_unavailable:
+            return None
+        try:
+            return self.config_get(name)
+        except (SysAgentProtocolError, ValueError):
+            return None
+        except OSError:
+            self._config_read_unavailable = True
+            self.close()
+            return None
+
+    def _raise_key_sleep_for_text(self) -> int | None:
+        """Raise the console's key gap to the text floor; return the value to restore.
+
+        A console that cannot report or change the setting (an older sysmodule, or one whose
+        `configure` reply is missing) is left alone: the caller still gets typed text, paced by
+        `text_per_char_ms`'s compiled-in fallback.
+        """
+        value = self._config_value("keySleepTime")
+        if value is None:
+            return None
+        try:
+            current = int(value)
+        except ValueError:
+            return None
+        if current >= TEXT_MIN_KEY_SLEEP_MS:
+            return None
+        try:
+            self.configure("keySleepTime", TEXT_MIN_KEY_SLEEP_MS)
+        except (SysAgentProtocolError, ValueError, OSError) as error:
+            print(f"warning: could not raise keySleepTime: {error}", file=sys.stderr)
+            return None
+        return current
+
+    def _restore_key_sleep(self, original: int | None) -> None:
+        if original is None:
+            return
+        try:
+            self.configure("keySleepTime", original)
+        except (SysAgentProtocolError, ValueError, OSError) as error:
+            print(f"warning: could not restore keySleepTime to {original}: {error}",
+                  file=sys.stderr)
 
     def text_per_char_ms(self) -> float:
         """How long the console needs per typed character, from its own settings.
@@ -1143,9 +1216,13 @@ class SysAgentClient:
         """
         total = 0.0
         for name, default in (("keySleepTime", 25.0), ("pollRate", 17.0)):
+            value = self._config_value(name)
+            if value is None:
+                total += default
+                continue
             try:
-                total += float(self.config_get(name))
-            except (SysAgentProtocolError, ValueError):
+                total += float(value)
+            except ValueError:
                 total += default
         return total
 
@@ -2285,6 +2362,8 @@ TEXT_HELP = "\n".join((
     "",
     "The command waits for the console to finish each batch of characters before",
     "sending the next one, sized from the console's own keySleepTime + pollRate.",
+    "The console's keySleepTime is temporarily raised to at least 50 ms while typing",
+    "(game keyboards drop keys at the 25 ms default) and restored afterwards.",
 ))
 
 CONTROLLER_STATUS_HELP = "\n".join((

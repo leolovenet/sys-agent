@@ -5,6 +5,7 @@ import socketserver
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from client.sysagent import (SysAgentProtocolError, SysAgentClient, parse_response, require_ok,
                              text_runs)
@@ -42,6 +43,9 @@ class FakeState:
         self.flaky_peek_remaining = 0
         self.repeat_support = True
         self.sequence_error = False
+        # An older sysmodule has only `configure <name> <value>` and stays silent for a
+        # read (`configure <name>`), which is what makes the client hit its socket timeout.
+        self.silent_configure = False
         # What `configure <name>` answers, like the sysmodule's own setting table.
         self.config_settings: dict[str, int] = {"controllerIdleReleaseMs": 1000,
                                                "freezeRate": 3,
@@ -193,10 +197,15 @@ class FakeHandler(socketserver.StreamRequestHandler):
                     time.sleep(0.05)
                     self._write("ERR controllerState result=0x1C24CA attached=1 takeover=1")
             elif command[0] == "configure":
+                # A pre-read-path sysmodule reads the command and prints nothing.
+                if state.silent_configure:
+                    continue
                 # `configure <name> <value>` is silent; the read paths answer with
                 # `name=value` lines terminated by END, like the sysmodule does.
                 if len(command) == 3:
                     response = None
+                    if command[1] in state.config_settings:
+                        state.config_settings[command[1]] = int(command[2])
                 elif len(command) == 2:
                     if command[1] in state.config_settings:
                         response = (f"OK settings=1\n{command[1]}="
@@ -744,8 +753,74 @@ class ClientTests(unittest.TestCase):
         with self.client() as client:
             client.type_text("Az5", per_char_ms=0)
             commands = self.server.state.commands
-            self.assertEqual(commands[-2], ["keyMulti", "225", "4"])  # shift + A
-            self.assertEqual(commands[-1], ["key", "29", "34"])       # z, 5
+            key_commands = [command for command in commands
+                            if command[0] in {"key", "keyMulti"}]
+            self.assertEqual(key_commands, [["keyMulti", "225", "4"],  # shift + A
+                                            ["key", "29", "34"]])      # z, 5
+
+    def test_type_text_raises_and_restores_key_sleep(self) -> None:
+        """The console's 25 ms default drops keys in a game's chat field (ACNH 3.0.3
+        was measured at 25/30 ms losing characters).  type_text raises keySleepTime
+        to the text floor for the call and puts the original value back afterwards."""
+        with self.client() as client:
+            client.type_text("Az5", per_char_ms=0)
+            commands = self.server.state.commands
+            key_sleep_sets = [command for command in commands
+                              if command[0] == "configure" and len(command) == 3
+                              and command[1] == "keySleepTime"]
+            self.assertEqual(key_sleep_sets, [["configure", "keySleepTime", "50"],
+                                              ["configure", "keySleepTime", "30"]])
+            self.assertEqual(self.server.state.config_settings["keySleepTime"], 30)
+
+    def test_type_text_leaves_a_slow_key_sleep_alone(self) -> None:
+        self.server.state.config_settings["keySleepTime"] = 60
+        with self.client() as client:
+            client.type_text("a", per_char_ms=0)
+            key_sleep_sets = [command for command in self.server.state.commands
+                              if command[0] == "configure" and len(command) == 3
+                              and command[1] == "keySleepTime"]
+            self.assertEqual(key_sleep_sets, [])
+
+    def test_type_text_survives_a_console_without_key_sleep_setting(self) -> None:
+        """Old sysmodules do not answer `configure keySleepTime`; typing still goes
+        through, paced by the compiled-in fallback, and no setting is written."""
+        self.server.state.config_settings = {"controllerIdleReleaseMs": 1000, "freezeRate": 3}
+        with self.client() as client:
+            client.type_text("a")
+            commands = self.server.state.commands
+            key_sleep_sets = [command for command in commands
+                              if command[0] == "configure" and len(command) == 3
+                              and command[1] == "keySleepTime"]
+            self.assertEqual(key_sleep_sets, [])
+            self.assertIn(["key", "4"], commands)
+
+    def test_type_text_restores_key_sleep_when_a_key_command_fails(self) -> None:
+        """The restore lives in `finally`: a typing error must not leave the console
+        at the raised 50 ms value."""
+        with self.client() as client:
+            with patch.object(client, "key_multi",
+                              side_effect=SysAgentProtocolError("boom")):
+                with self.assertRaises(SysAgentProtocolError):
+                    client.type_text("A", per_char_ms=0)
+            commands = self.server.state.commands
+            key_sleep_sets = [command for command in commands
+                              if command[0] == "configure" and len(command) == 3
+                              and command[1] == "keySleepTime"]
+            self.assertEqual(key_sleep_sets, [["configure", "keySleepTime", "50"],
+                                              ["configure", "keySleepTime", "30"]])
+            self.assertEqual(self.server.state.config_settings["keySleepTime"], 30)
+
+    def test_type_text_falls_back_once_when_configure_reads_are_silent(self) -> None:
+        """A sysmodule with only `configure <name> <value>` never answers a read.  The
+        first probe times out; the client drops the connection and uses the compiled-in
+        defaults for the rest of the call instead of waiting once per setting."""
+        self.server.state.silent_configure = True
+        with self.client() as client:
+            client.type_text("a")
+            commands = self.server.state.commands
+            self.assertEqual(commands.count(["configure", "keySleepTime"]), 1)
+            self.assertNotIn(["configure", "pollRate"], commands)
+            self.assertIn(["key", "4"], commands)
 
     def test_text_pacing_comes_from_the_console_settings(self) -> None:
         """keySleepTime + pollRate is what the console spends per character, so the
