@@ -358,9 +358,28 @@ Requirements and conflict rules:
 |debug watch-status|Reports arming state (`active`), process, address, hit count, discovered breakpoint slots (ctx/wp), the ring size and count (`ring`/`ringCount`), whether a PC filter is set (`filter`), and the latest hit's PC/LR/SP/data/thread. `stale=1` marks address/hit fields left over from a finished session (so `active=0` with a non-zero address is not a live breakpoint), and `memoryBlocked=1` says memory commands are refused while a session is attached|none|`debug watch-status`|
 |debug watch-last|Dumps the full register snapshot (x0-x30, sp, pc), the instruction window at pc-8..pc+3, and the stack windows captured at hit time: `fpStack` (0x200 bytes at x29, caller frame chain) and `spStack` (0x100 bytes at sp, current frame locals)|none|`debug watch-last`|
 |debug watch-ring|Dumps one stored hit from a `ring` session, oldest first; same fields as `debug watch-last`|ring entry index (0 = oldest)|`debug watch-ring 0`|
+|debug modules|Lists up to `limit` modules of a process through `ldr:dmnt`, including each module's base, size and Build ID; default is the foreground application and 2 modules. The service is only known to accept two modules per request; larger limits are rejected instead of closing the session|optional: `[pid] [limit]`; pid is `0x`-hex or decimal, limit 1..2|`debug modules 0x71 2`|
+|debug maps|Lists mapped memory regions of any process as `index=0xADDR+0xSIZE:tTYPE/pPERM` (libnx `MemoryType`/`MemoryPerm` values); unmapped regions are skipped and the reply is capped by `limit`|optional: `[pid] [limit]`; pid is `0x`-hex or decimal, limit 1..256 (default 64)|`debug maps 0x71 64`|
+|debug threads|Pauses any process, dumps up to 256 threads with PC/LR/SP, raw kernel thread `state`, current core and core mask, then resumes; `reported` is the actual count and `truncated=1` means the reply omitted IDs above the output cap. The target is stopped only for the duration of the command|optional: `[pid]`; pid is `0x`-hex or decimal|`debug threads 0x71`|
 |debug patch-code|Generic transactional code patch (any process, any size up to 1 KiB): pause, optionally verify no thread PC is inside the patched range, optionally verify the original bytes, write, read back, resume; resume is guaranteed on every error path. Target cache maintenance is handled by the kernel debug-write path — never add explicit cache ops on a target address from this sysmodule|1. absolute address (0x-hex or decimal)<br>2. expected bytes as hex pairs of the same length as the patch, or `-` to skip verification<br>3. new bytes as hex pairs (0x optional; length 1..1024 bytes)<br>optional: `pid=<hex>` target process (default: foreground application), `no-pc-check` (only for provably cold code)|`debug patch-code 0x2B5D9CF4C8 FD7BBAA9FC6F01A9FD030091FA6702A9 5000005800021FD6...`<br>`debug patch-code 0x2B5D9CF4C8 - 5000005800021FD6...`<br>`debug patch-code 0x2B5D9CF4C8 FD7B... 5000... pid=0x2B5D900000`|
 |debug watch-stop|Requests the watch thread to detach and waits for it|none|`debug watch-stop`|
 |debug force-close|Closes gen1's (`dmnt:cht`) debug handle to the game if it is attached; the next memory command re-attaches it automatically|none|`debug force-close`|
+
+### Generic process inspection
+
+`debug modules`, `debug maps`, and `debug threads` are process-agnostic: any
+PID the kernel lets sys-agent debug can be inspected, including system
+sysmodules. `debug maps` prints libnx `MemoryType`/`MemoryPerm` numbers
+(`tTYPE` / `pPERM`); `debug threads` briefly stops the target while reading
+the register and scheduler state; `debug modules` reports whatever Build IDs
+`ldr:dmnt` provides. All three default to the foreground application when no
+pid is supplied. Use `processList` to discover PIDs and their title IDs.
+`debug maps` and `debug threads` use a short-lived direct debug handle. If
+`dmnt:cht` already owns the foreground application, they close that handle and
+report `dmntClosed=1`; the next automatic memory operation reattaches dmnt.
+They fail while a `debug watch` session is active or when another debugger
+such as the standalone gdbstub owns the target. `debug modules` is an
+`ldr:dmnt` query and does not pause the target.
 
 `debug watch` first live-checks whether gen1 owns the debug handle and, if so,
 closes it (`dmntClosed=1` in the response) before attaching directly -- so it

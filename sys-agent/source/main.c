@@ -15,6 +15,7 @@
 #include "search.h"
 #include "process_memory.h"
 #include "debug_watch.h"
+#include "debug_process.h"
 #include "patch_code.h"
 #include "sequence_repeat.h"
 #include "dmnt_client.h"
@@ -27,7 +28,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.14.0"
+#define VERSION_S "2.15.0"
 
 typedef enum {
     Active = 0,
@@ -488,6 +489,65 @@ int argmain(int argc, char** argv)
             printf("ERR code=INVALID_ARGUMENTS\n");
             return 0;
         }
+        if (!strcmp(argv[1], "maps"))
+        {
+            /* debug maps [pid] [limit] */
+            u64 pid = 0;
+            u64 limit = 64;
+            int index = 2;
+            if (index < argc) {
+                if (!tryParseStringToInt(argv[index], &pid)) {
+                    printf("ERR code=INVALID_PID\n");
+                    return 0;
+                }
+                index++;
+            }
+            if (index < argc) {
+                if (!tryParseStringToInt(argv[index], &limit)
+                    || limit == 0 || limit > DEBUG_PROCESS_MAX_MAPS) {
+                    printf("ERR code=INVALID_LIMIT\n");
+                    return 0;
+                }
+                index++;
+            }
+            if (index != argc) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            if (pid == 0) {
+                Result rc = pmdmntGetApplicationProcessId(&pid);
+                if (R_FAILED(rc) || pid == 0) {
+                    printf("ERR code=NO_APP result=0x%X\n", rc);
+                    return 0;
+                }
+            }
+            debugProcessPrintMaps(pid, (u32)limit);
+            return 0;
+        }
+        if (!strcmp(argv[1], "threads"))
+        {
+            /* debug threads [pid] */
+            u64 pid = 0;
+            if (argc > 3) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            if (argc == 3) {
+                if (!tryParseStringToInt(argv[2], &pid)) {
+                    printf("ERR code=INVALID_PID\n");
+                    return 0;
+                }
+            }
+            if (pid == 0) {
+                Result rc = pmdmntGetApplicationProcessId(&pid);
+                if (R_FAILED(rc) || pid == 0) {
+                    printf("ERR code=NO_APP result=0x%X\n", rc);
+                    return 0;
+                }
+            }
+            debugProcessPrintThreads(pid);
+            return 0;
+        }
         if (!strcmp(argv[1], "watch"))
         {
             /* debug watch <address|main+offset> [size] [hits N] [duration N] */
@@ -698,33 +758,30 @@ int argmain(int argc, char** argv)
         }
         if (!strcmp(argv[1], "modules"))
         {
-            if (argc != 2) {
+            /* debug modules [pid] [limit] */
+            if (argc > 4) {
                 printf("ERR code=INVALID_ARGUMENTS\n");
                 return 0;
             }
             u64 pid = 0;
-            Result rc = pmdmntGetApplicationProcessId(&pid);
-            if (R_FAILED(rc) || pid == 0) {
-                printf("ERR code=NO_APP result=0x%X\n", rc);
+            u64 limit = 2;
+            if (argc >= 3 && !tryParseStringToInt(argv[2], &pid)) {
+                printf("ERR code=INVALID_PID\n");
                 return 0;
             }
-            /* Requesting more than 2 modules over ldr:dmnt closes the session
-             * on this stack (ConnectionClosed 0xF601); the full module map is
-             * derived from the main base by host-side tooling instead. */
-            LoaderModuleInfo modules[2];
-            s32 count = 0;
-            rc = ldrDmntGetProcessModuleInfo(pid, modules, 2, &count);
-            if (R_FAILED(rc) || count <= 0) {
-                printf("ERR code=MODULES_UNAVAILABLE result=0x%X\n", rc);
+            if (argc >= 4 && (!tryParseStringToInt(argv[3], &limit)
+                    || limit == 0 || limit > DEBUG_PROCESS_MAX_MODULES)) {
+                printf("ERR code=INVALID_LIMIT\n");
                 return 0;
             }
-            printf("OK pid=%016lX count=%d modules=", pid, count);
-            s32 i = 0;
-            for (i = 0; i < count; i++) {
-                printf("%s%d=%016lX+%lX", i ? "," : "", i,
-                    modules[i].base_address, modules[i].size);
+            if (pid == 0) {
+                Result rc = pmdmntGetApplicationProcessId(&pid);
+                if (R_FAILED(rc) || pid == 0) {
+                    printf("ERR code=NO_APP result=0x%X\n", rc);
+                    return 0;
+                }
             }
-            printf("\n");
+            debugProcessPrintModules(pid, (u32)limit);
             return 0;
         }
         if (!strcmp(argv[1], "watch-last"))

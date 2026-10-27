@@ -6,6 +6,7 @@
 
 - sys-agent 是**通用 Switch 工具箱**(见 README "Project scope and philosophy")。命令保持进程与游戏无关;游戏专属偏移、hook 布局与签名属于消费方项目。
 - `debug patch-code` 是通用事务性代码补丁原语:任意进程(经 `pid=`),载荷 ≤ 1 KiB,pause/verify/write/readback/resume,保证恢复。普通数据 poke 保持不暂停。
+- `debug maps` / `debug threads` / `debug modules` 是通用的任意进程检查原语(内存区域、线程 PC/LR/SP、模块列表);保持与游戏/具体系统服务无关,不要为单一调查加特例。
 
 ## 仓库边界
 

@@ -72,6 +72,10 @@ commands should follow this rule:
   resume guaranteed on every error path. It targets the foreground application by default
   or any process via `pid=`. Cache maintenance for the target is handled by the kernel's
   debug-write path; the primitive never issues cache ops on a target address.
+- Generic process inspection (`debug maps`, `debug threads`, `debug modules`) works on
+  the foreground application or an explicit PID. It reports mapped regions, thread
+  PC/LR/SP plus scheduler state, and module base/size/Build ID information supplied by
+  `ldr:dmnt`; the latter is capped at the two-module request size this stack supports.
 - Numeric and payload parsing is strict: byte payloads are hex pairs only (optional `0x`,
   odd length or non-hex characters rejected with `INVALID_HEX_PAYLOAD`); plain numbers are
   0x/0X-hex or decimal and invalid strings parse as 0 instead of a silent partial value;
