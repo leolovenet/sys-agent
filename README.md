@@ -52,14 +52,18 @@ commands should follow this rule:
 - A hardware execution tracer (`debug trace`) attaches to any PID, arms before the target
   function runs, and records hits at up to four addresses with target identity, thread,
   PC/LR/SP, x0-x7, core and instruction bytes. Each hit can also snapshot up to two register
-  pointers with offsets. It uses a fixed-size ring (up to 64 events) or a one-shot hit limit,
+  pointers with offsets. Every hit temporarily hardware-single-steps the stopped thread over
+  the matched instruction before rearming, so one hot entry cannot starve later targets. It
+  uses a fixed-size ring (up to 64 events) or a one-shot hit limit,
   defaults ring sessions to a 64-hit safety cap so a hot instruction cannot starve the target,
   exposes `trace-status` / `trace-read` / `trace-stop`, and never modifies target instructions.
   The client `trace-dump` writes versioned JSONL with session metadata; `trace-analyze` and
   `trace-diff` summarize, pair explicit entry/return sites and compare A/B captures.
 - Experimental `debug multitrace` holds two debug handles simultaneously with independently
-  probed context-IDR slots, allowing one instruction target in each of two processes. It is a
-  capacity/event-demux prototype, not yet an IPC-aware tracer.
+  probed context-IDR slots, allowing up to two instruction targets in each of two processes.
+  The optional second target on each side can be the corresponding caller return address,
+  yielding a real return-time `x0` without patching code. It remains a generic hardware-event
+  prototype rather than an IPC-aware tracer.
 - Verified memory access: `poke*Verified` writes and reads the range back, reporting
   `WRITE_FAILED`, `READBACK_FAILED`, or `WRITE_VERIFY_FAILED` distinctly; `peek*Verified`
   reads twice and retries until two reads agree, so zero data and a failed read are

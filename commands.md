@@ -377,33 +377,39 @@ This command validates hardware capacity only. It is not a cross-process IPC tra
 
 ### Experimental dual-process trace
 
-After the layout probe confirms two context-IDR slots, `debug multitrace` can observe one
-instruction in each of two processes at the same time:
+After the layout probe confirms two context-IDR slots, `debug multitrace` can observe up to two
+instructions in each of two processes at the same time:
 
 ```text
-debug multitrace PID1 TARGET1 PID2 TARGET2 [hits N] [ring N] [duration N] [args N]
+debug multitrace PID1 TARGET1 PID2 TARGET2 \
+    [also TARGET1B TARGET2B] [hits N] [ring N] [duration N] [args N]
 debug multitrace-status
 debug multitrace-read 0
 debug multitrace-stop
 ```
 
-Python client equivalents are `debug multitrace PID1 TARGET1 PID2 TARGET2`, followed by
+The Python client exposes the optional pair as `--extra-target1 TARGET1B
+--extra-target2 TARGET2B`; the flags must be used together. Set the second address to the
+caller's return address to observe an entry and actual return-time `x0` on both sides of a
+synchronous IPC. Follow it with
 `multitrace-status`, `multitrace-read`, `multitrace-stop` and `multitrace-dump`. The dump stores
-a `targets[]` process table; `trace-analyze` uses each event's target index to attribute counts
-to the correct process.
+a `targets[]` process table with each target's process index; `trace-analyze` uses each event's
+target index to attribute counts to the correct process.
 
 Targets may be absolute instruction addresses or `main+offset`, resolved independently against
 each PID. Addresses must be distinct because event routing uses the exception PC. Context and
-instruction slot assignment comes from runtime probing; on this console the layout is normally
-context `4,5` and instruction slots `0,1`. Events use target index 0/1 and otherwise match the
+instruction slot assignment comes from runtime probing; on this console the four-target layout
+is normally context `4,5` and instruction slots `0,1,2,3`. Target indices `0,1` are the first
+site for processes 0 and 1; indices `2,3` are their second sites. Events otherwise match the
 single-process trace field set.
 
 The ring and hit limit are shared across both processes. A process exit stops the whole session.
 This prototype does not capture memory snapshots and does not understand CMIF/HIPC operations;
-it proves synchronous two-process observation only. Memory commands remain blocked while it is
-active, and all four hardware registers plus both debug handles are released on stop/error.
-`multitrace-status.ignoredHits` counts hardware-instruction events that did not match either
-configured address or arrived on the wrong process debug handle.
+it provides generic synchronous two-process observation only. Memory commands remain blocked
+while it is active, and both context registers, every armed instruction register and both debug
+handles are released on stop/error. `multitrace-status.ignoredHits` counts
+hardware-instruction events that did not match a configured address or arrived on the wrong
+process debug handle.
 
 The same ownership rules as `debug watch` apply. For the foreground application, an existing
 `dmnt:cht` handle is closed when necessary and later memory commands reattach it. A trace of a

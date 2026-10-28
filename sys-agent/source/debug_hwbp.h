@@ -34,9 +34,10 @@ Result debugHwBpSetInstruction(u32 instructionSlot, u32 contextSlot,
     u64 address);
 Result debugHwBpArmInstructionTrace(u32 contextSlot, Handle debugHandle,
     const u32* instructionSlots, const u64* addresses, u32 count);
-Result debugHwBpArmDualInstructionTrace(u32 contextSlot1, Handle debugHandle1,
-    u32 instructionSlot1, u64 address1, u32 contextSlot2, Handle debugHandle2,
-    u32 instructionSlot2, u64 address2);
+Result debugHwBpArmDualProcessInstructionTrace(
+    const u32 contextSlots[2], const Handle debugHandles[2],
+    const u32* instructionSlots, const u64* addresses,
+    const u32* targetProcesses, u32 targetCount);
 Result debugHwBpClearRegistersAllCores(const u32* registers, u32 count);
 bool debugHwBpIsValidWatchPoint(u64 address, u64 size);
 Result debugHwBpSetData(u32 dataSlot, u32 contextSlot, u64 address, u64 size,
@@ -45,6 +46,8 @@ Result debugHwBpSetData(u32 dataSlot, u32 contextSlot, u64 address, u64 size,
 /* ExceptionHandled | EnableExceptionEvent | ContinueAll, with the valid dummy
  * thread-id list required by the kernel ABI. */
 Result debugHwBpContinueAll(Handle debugHandle);
+Result debugHwBpStepOverInstruction(Handle debugHandle, u64 threadId,
+    u32 instructionSlot, u32 contextSlot, u64 address);
 
 /*
  * Stop the target and drain its debug-event queue before clearing hardware

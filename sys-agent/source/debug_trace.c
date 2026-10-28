@@ -438,6 +438,13 @@ static void traceThreadMain(void* arg)
                     rc = 0;
                     goto cleanup;
                 }
+                rc = debugHwBpStepOverInstruction(debugHandle,
+                    event.thread_id, instructionSlots[targetIndex],
+                    contextSlot, targets[targetIndex]);
+                if (R_FAILED(rc)) {
+                    setError("stepInstruction", rc);
+                    goto cleanup;
+                }
             }
         }
 

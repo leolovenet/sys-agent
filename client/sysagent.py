@@ -21,7 +21,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.3.0"
+CLIENT_VERSION = "1.4.0"
 TRACE_SCHEMA_VERSION = 1
 
 # The console's default keySleepTime (25 ms) is fast enough for the home menu but too
@@ -322,7 +322,7 @@ ERROR_CODE_NOTES = {
     "INVALID_SNAPSHOT": "snapshot must be REG[+/-OFFSET]:SIZE, with REG in x0..x30, sp, pc, or lr",
     "DUPLICATE_TARGET": "trace target addresses must be distinct",
     "MULTITRACE_BUSY": "another watch/trace session is active or multitrace could not start",
-    "MULTITRACE_START_FAILED": "the dual-process trace could not attach and arm both targets",
+    "MULTITRACE_START_FAILED": "the dual-process trace could not attach and arm its targets",
     "MULTITRACE_STOP_INCOMPLETE": "the dual-process trace did not release all debug state",
 }
 
@@ -2649,6 +2649,8 @@ def _cmd_debug_trace_dump(client: SysAgentClient, args: argparse.Namespace) -> N
 def _cmd_debug_multitrace(client: SysAgentClient, args: argparse.Namespace) -> None:
     if args.pid1 == args.pid2:
         raise ValueError("multitrace process IDs must differ")
+    if ((args.extra_target1 is None) != (args.extra_target2 is None)):
+        raise ValueError("--extra-target1 and --extra-target2 must be used together")
     if args.hits is not None and args.hits < 0:
         raise ValueError("hits must be non-negative")
     if args.hits == 0 and args.ring is None:
@@ -2665,6 +2667,8 @@ def _cmd_debug_multitrace(client: SysAgentClient, args: argparse.Namespace) -> N
         f"0x{args.pid1:X}", args.target1,
         f"0x{args.pid2:X}", args.target2,
     ]
+    if args.extra_target1 is not None:
+        parts.extend(("also", args.extra_target1, args.extra_target2))
     if args.hits is not None:
         parts.extend(("hits", str(args.hits)))
     if args.ring is not None:
@@ -2718,6 +2722,25 @@ def _cmd_debug_multitrace_dump(client: SysAgentClient,
 
     process0 = _trace_process_metadata(client, before.get("pid0", "0"))
     process1 = _trace_process_metadata(client, before.get("pid1", "0"))
+    processes = (process0, process1)
+    target_count = parse_int(before.get("targetCount", "2"))
+    if not 2 <= target_count <= 4:
+        raise SysAgentProtocolError(
+            f"unsupported multitrace target count: {target_count}")
+    process_text = before.get("targetProcesses", "0,1,0,1")
+    try:
+        target_processes = [
+            int(value) for value in process_text.split(",")
+        ]
+    except ValueError as exc:
+        raise SysAgentProtocolError(
+            f"invalid multitrace target process map: {process_text!r}") from exc
+    if len(target_processes) < target_count:
+        raise SysAgentProtocolError(
+            "multitrace target process map is shorter than the target count")
+    if any(value not in (0, 1) for value in target_processes[:target_count]):
+        raise SysAgentProtocolError(
+            "multitrace target process map contains an unknown process")
     output = args.output or f"multitrace-{int(time.time())}.jsonl"
     session_id = (
         f"{int(time.time() * 1000):x}-"
@@ -2732,15 +2755,12 @@ def _cmd_debug_multitrace_dump(client: SysAgentClient,
         "status": {key: value for key, value in before.items() if key != "ok"},
         "targets": [
             {
-                "index": 0,
-                "address": before.get("target0", "0"),
-                "process": process0,
-            },
-            {
-                "index": 1,
-                "address": before.get("target1", "0"),
-                "process": process1,
-            },
+                "index": index,
+                "address": before.get(f"target{index}", "0"),
+                "processIndex": target_processes[index],
+                "process": processes[target_processes[index]],
+            }
+            for index in range(target_count)
         ],
     }
     _write_versioned_trace(output, metadata, events)
@@ -3165,12 +3185,18 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      nargs="?", default=0), JSON_ARG, OUT_ARG)),
         Command("trace-stop", "Stop the active trace and release the debug handle",
                 _cmd_debug_trace_stop, (JSON_ARG, OUT_ARG)),
-        Command("multitrace", "Trace one instruction in each of two processes",
+        Command("multitrace", "Trace up to two instructions in each of two processes",
                 _cmd_debug_multitrace,
                 (Arg("pid1", "first process ID", type=parse_int),
                  Arg("target1", "first instruction address or main+OFFSET"),
                  Arg("pid2", "second process ID", type=parse_int),
                  Arg("target2", "second instruction address or main+OFFSET"),
+                 Arg("extra_target1",
+                     "second instruction for pid1, in addition to target1",
+                     flags=("--extra-target1",), default=None),
+                 Arg("extra_target2",
+                     "second instruction for pid2, in addition to target2",
+                     flags=("--extra-target2",), default=None),
                  Arg("hits", "shared total-hit safety limit; 0 means unlimited with --ring",
                      type=parse_int, default=None, flags=("--hits",)),
                  Arg("ring", "keep the most recent N events (1..64)",
@@ -3180,7 +3206,11 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                  Arg("args", "capture x0 through x(N-1), N=0..8",
                      type=parse_int, default=None, flags=("--args",)),
                  JSON_ARG, OUT_ARG),
-                "Experimental: assigns one runtime-probed hardware slot to each process."),
+                "\n".join((
+                    "Experimental: assigns one runtime-probed context slot to each process",
+                    "and one instruction slot to each target. Use the extra-target options",
+                    "together to observe an entry/return pair on both sides of an IPC.",
+                ))),
         Command("multitrace-status", "Show the experimental dual-process trace state",
                 _cmd_debug_multitrace_status, (JSON_ARG, OUT_ARG)),
         Command("multitrace-read", "Read one dual-process trace event",

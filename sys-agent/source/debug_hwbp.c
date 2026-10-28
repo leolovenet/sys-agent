@@ -1,10 +1,18 @@
 #include "debug_hwbp.h"
 
+#include <string.h>
+
 #define DEBUG_HWBP_PIN_RETRY_US 100LL
 #define DEBUG_HWBP_PIN_ATTEMPTS 20000
 #define DEBUG_HWBP_CLEAR_RETRIES 3
 #define DEBUG_HWBP_DEFAULT_CORE 3
 #define DEBUG_HWBP_BATCH_MAX 4
+#define DEBUG_HWBP_DUAL_PROCESS_COUNT 2
+#define DEBUG_HWBP_STEP_TIMEOUT_SECONDS 5
+/* Atmosphere's svcSetDebugThreadContext extensions; libnx 4.12 does not
+ * expose names for these two flags. */
+#define DEBUG_THREAD_CONTEXT_FLAG_SET_SINGLE_STEP (1u << 30)
+#define DEBUG_THREAD_CONTEXT_FLAG_CLEAR_SINGLE_STEP (1u << 31)
 
 #define DEBUG_CONTINUE_FLAG_EXCEPTION_HANDLED (1u << 0)
 #define DEBUG_CONTINUE_FLAG_ENABLE_EXCEPTION_EVENT (1u << 1)
@@ -221,33 +229,48 @@ Result debugHwBpArmInstructionTrace(u32 contextSlot, Handle debugHandle,
     return setRegistersOnAllCores(registers, controls, values, count + 1);
 }
 
-Result debugHwBpArmDualInstructionTrace(u32 contextSlot1, Handle debugHandle1,
-    u32 instructionSlot1, u64 address1, u32 contextSlot2, Handle debugHandle2,
-    u32 instructionSlot2, u64 address2)
+Result debugHwBpArmDualProcessInstructionTrace(
+    const u32 contextSlots[2], const Handle debugHandles[2],
+    const u32* instructionSlots, const u64* addresses,
+    const u32* targetProcesses, u32 targetCount)
 {
-    if (contextSlot1 == contextSlot2
-        || instructionSlot1 == instructionSlot2
-        || instructionSlot1 == contextSlot1
-        || instructionSlot1 == contextSlot2
-        || instructionSlot2 == contextSlot1
-        || instructionSlot2 == contextSlot2
-        || address1 == 0 || address2 == 0
-        || (address1 & 3) != 0 || (address2 & 3) != 0)
+    if (contextSlots == NULL || debugHandles == NULL
+        || instructionSlots == NULL || addresses == NULL
+        || targetProcesses == NULL || targetCount == 0
+        || targetCount > DEBUG_HWBP_BATCH_MAX
+        || contextSlots[0] == contextSlots[1])
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
 
-    const u32 registers[4] = {
-        contextSlot1, contextSlot2, instructionSlot1, instructionSlot2,
-    };
-    const u64 controls[4] = {
-        (0x3ULL << 20) | (0xFULL << 5) | 1,
-        (0x3ULL << 20) | (0xFULL << 5) | 1,
-        (0x1ULL << 20) | ((u64)contextSlot1 << 16) | (0xFULL << 5) | 1,
-        (0x1ULL << 20) | ((u64)contextSlot2 << 16) | (0xFULL << 5) | 1,
-    };
-    const u64 values[4] = {
-        (u64)debugHandle1, (u64)debugHandle2, address1, address2,
-    };
-    return setRegistersOnAllCores(registers, controls, values, 4);
+    u32 registers[DEBUG_HWBP_DUAL_PROCESS_COUNT + DEBUG_HWBP_BATCH_MAX];
+    u64 controls[DEBUG_HWBP_DUAL_PROCESS_COUNT + DEBUG_HWBP_BATCH_MAX];
+    u64 values[DEBUG_HWBP_DUAL_PROCESS_COUNT + DEBUG_HWBP_BATCH_MAX];
+    for (u32 process = 0; process < DEBUG_HWBP_DUAL_PROCESS_COUNT;
+        process++) {
+        registers[process] = contextSlots[process];
+        controls[process] = (0x3ULL << 20) | (0xFULL << 5) | 1;
+        values[process] = (u64)debugHandles[process];
+    }
+    for (u32 target = 0; target < targetCount; target++) {
+        const u32 process = targetProcesses[target];
+        if (process >= DEBUG_HWBP_DUAL_PROCESS_COUNT
+            || addresses[target] == 0
+            || (addresses[target] & 3) != 0
+            || instructionSlots[target] == contextSlots[0]
+            || instructionSlots[target] == contextSlots[1])
+            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        for (u32 prior = 0; prior < target; prior++) {
+            if (instructionSlots[prior] == instructionSlots[target]
+                || addresses[prior] == addresses[target])
+                return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        }
+        const u32 arrayIndex = DEBUG_HWBP_DUAL_PROCESS_COUNT + target;
+        registers[arrayIndex] = instructionSlots[target];
+        controls[arrayIndex] = (0x1ULL << 20)
+            | ((u64)contextSlots[process] << 16) | (0xFULL << 5) | 1;
+        values[arrayIndex] = addresses[target];
+    }
+    return setRegistersOnAllCores(registers, controls, values,
+        DEBUG_HWBP_DUAL_PROCESS_COUNT + targetCount);
 }
 
 Result debugHwBpClearRegistersAllCores(const u32* registers, u32 count)
@@ -310,6 +333,90 @@ Result debugHwBpContinueAll(Handle debugHandle)
     u64 threadIds[] = { 0 };
     return svcContinueDebugEvent(debugHandle, DEBUG_CONTINUE_FLAGS,
         threadIds, 1);
+}
+
+Result debugHwBpStepOverInstruction(Handle debugHandle, u64 threadId,
+    u32 instructionSlot, u32 contextSlot, u64 address)
+{
+    if (debugHandle == INVALID_HANDLE || threadId == 0 || address == 0)
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+    Result rc = debugHwBpClearAllCores(instructionSlot);
+    if (R_FAILED(rc))
+        return rc;
+
+    ThreadContext context;
+    memset(&context, 0, sizeof(context));
+    rc = svcSetDebugThreadContext(debugHandle, threadId, &context,
+        DEBUG_THREAD_CONTEXT_FLAG_SET_SINGLE_STEP);
+    if (R_FAILED(rc))
+        goto rearm;
+
+    u64 threadIds[] = { threadId };
+    rc = svcContinueDebugEvent(debugHandle,
+        DEBUG_CONTINUE_FLAG_EXCEPTION_HANDLED
+            | DEBUG_CONTINUE_FLAG_ENABLE_EXCEPTION_EVENT,
+        threadIds, 1);
+    if (R_FAILED(rc))
+        goto clearStep;
+
+    const u64 deadline = armGetSystemTick()
+        + armGetSystemTickFreq() * DEBUG_HWBP_STEP_TIMEOUT_SECONDS;
+    bool stepEventSeen = false;
+    while (!stepEventSeen && armGetSystemTick() < deadline) {
+        s32 signaled = -1;
+        rc = svcWaitSynchronization(&signaled, &debugHandle, 1,
+            20000000LL);
+        if (rc == KERNELRESULT(TimedOut)) {
+            rc = 0;
+            continue;
+        }
+        if (R_FAILED(rc))
+            break;
+        while (true) {
+            DebugEventInfo event;
+            Result eventRc = svcGetDebugEvent(&event, debugHandle);
+            if (R_FAILED(eventRc))
+                break;
+            if (event.type == DebugEventType_ExitProcess) {
+                rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+                break;
+            }
+            if (event.type == DebugEventType_Exception
+                && event.thread_id == threadId
+                && event.info.exception.type == DebugException_BreakPoint
+                && event.info.exception.specific.break_point.type
+                    == BreakPointType_HardwareInstruction) {
+                stepEventSeen = true;
+                break;
+            }
+        }
+        if (R_FAILED(rc))
+            break;
+    }
+    if (R_SUCCEEDED(rc) && !stepEventSeen) {
+        Result stopRc = debugHwBpQuiesce(debugHandle, false);
+        rc = R_SUCCEEDED(stopRc) ? KERNELRESULT(TimedOut) : stopRc;
+    }
+
+clearStep:
+    {
+        ThreadContext emptyContext;
+        memset(&emptyContext, 0, sizeof(emptyContext));
+        Result clearRc = svcSetDebugThreadContext(debugHandle, threadId,
+            &emptyContext, DEBUG_THREAD_CONTEXT_FLAG_CLEAR_SINGLE_STEP);
+        if (R_FAILED(clearRc) && R_SUCCEEDED(rc))
+            rc = clearRc;
+    }
+
+rearm:
+    {
+        Result armRc = debugHwBpSetInstruction(instructionSlot,
+            contextSlot, address);
+        if (R_FAILED(armRc) && R_SUCCEEDED(rc))
+            rc = armRc;
+    }
+    return rc;
 }
 
 Result debugHwBpQuiesce(Handle debugHandle, bool exceptionPending)

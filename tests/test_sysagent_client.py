@@ -97,25 +97,30 @@ class FakeHandler(socketserver.StreamRequestHandler):
                     response = (
                         "OK state=started active=1 pid0=0000000000000071 "
                         "target0=0000000000001000 pid1=0000000000000085 "
-                        "target1=0000000000002000 hits=64 ring=8 duration=30 "
-                        "args=4 ctx=4,5 slots=0,1"
+                        "target1=0000000000002000 targetCount=4 "
+                        "target2=0000000000003000 target3=0000000000004000 "
+                        "targetProcesses=0,1,0,1 hits=64 ring=8 duration=30 "
+                        "args=4 ctx=4,5 slots=0,1,2,3"
                     )
                 elif command[1] == "multitrace-status":
                     response = (
                         "OK active=0 armed=0 everArmed=1 stale=1 memoryBlocked=0 "
                         "pid0=0000000000000071 target0=0000000000001000 "
                         "pid1=0000000000000085 target1=0000000000002000 hits=2,1 "
+                        "targetCount=4 target2=0000000000003000 "
+                        "target3=0000000000004000 targetProcesses=0,1,0,1 "
+                        "hits2=1,1 "
                         "hitCount=3 maxHits=64 ring=8 ringCount=1 duration=30 "
-                        "startedTick=100 args=4 ctx=4,5 slots=0,1 lastSeq=3 "
+                        "startedTick=100 args=4 ctx=4,5 slots=0,1,2,3 lastSeq=3 "
                         "lastPc=0000000000002000 lastLr=0000000000002004 "
                         "lastSp=0000000000003000 lastThread=0000000000000088 "
                         "lastCore=2 stage=hitsReached lastError=0x0"
                     )
                 elif command[1] == "multitrace-read":
                     response = (
-                        "OK seq=3 target=1 targetAddress=0000000000002000 "
+                        "OK seq=3 target=3 targetAddress=0000000000004000 "
                         "thread=0000000000000088 core=2 tick=300 "
-                        "pc=0000000000002000 lr=0000000000002004 "
+                        "pc=0000000000004000 lr=0000000000004004 "
                         "sp=0000000000003000 args=2 contextResult=0x0 "
                         "coreResult=0x0 insnBytes=0 insn= snapshots=0 "
                         "x0=0000000000000000 x1=0000000000000001"
@@ -607,10 +612,16 @@ class ClientTests(unittest.TestCase):
                 str(self.server.server_address[1]), "--timeout", "1", "debug"]
         self.assertEqual(main(base + [
             "multitrace", "0x71", "main+0x10", "0x85", "0x2000",
+            "--extra-target1", "main+0x20",
+            "--extra-target2", "main+0x30",
             "--ring", "8", "--duration", "30", "--args", "4"]), 0)
         self.assertEqual(self.server.state.last_command, [
             "debug", "multitrace", "0x71", "main+0x10", "0x85", "0x2000",
+            "also", "main+0x20", "main+0x30",
             "ring", "8", "duration", "30", "args", "4"])
+        self.assertEqual(main(base + [
+            "multitrace", "0x71", "0x10", "0x85", "0x20",
+            "--extra-target1", "0x30"]), 2)
         self.assertEqual(main(base + ["multitrace-status"]), 0)
         self.assertEqual(main(base + ["multitrace-read", "0"]), 0)
         self.assertEqual(main(base + ["multitrace-stop"]), 0)
@@ -623,8 +634,10 @@ class ClientTests(unittest.TestCase):
                 metadata = json.loads(handle.readline())
                 event = json.loads(handle.readline())
             self.assertEqual(metadata["kind"], "multitrace")
-            self.assertEqual(len(metadata["targets"]), 2)
-            self.assertEqual(event["target"], "1")
+            self.assertEqual(len(metadata["targets"]), 4)
+            self.assertEqual(metadata["targets"][2]["processIndex"], 0)
+            self.assertEqual(metadata["targets"][3]["processIndex"], 1)
+            self.assertEqual(event["target"], "3")
 
     def test_trace_analyze_and_diff(self) -> None:
         import json

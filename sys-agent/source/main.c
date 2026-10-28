@@ -31,7 +31,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.17.0"
+#define VERSION_S "2.18.0"
 
 typedef enum {
     Active = 0,
@@ -667,6 +667,7 @@ int argmain(int argc, char** argv)
             /*
              * Experimental dual-process trace:
              * debug multitrace PID1 TARGET1 PID2 TARGET2
+             *     [also TARGET1B TARGET2B]
              *     [hits N] [ring N] [duration N] [args N]
              */
             if (argc < 6) {
@@ -695,18 +696,44 @@ int argmain(int argc, char** argv)
             }
             resolveRc = resolveAddressForProcess(config.processIds[1],
                 argv[5], &config.addresses[1]);
-            if (R_FAILED(resolveRc)
-                || config.addresses[0] == config.addresses[1]) {
+            if (R_FAILED(resolveRc)) {
                 printf("ERR code=INVALID_ADDRESS index=2 result=0x%X\n",
                     resolveRc);
                 return 0;
             }
+            config.targetCount = 2;
+            config.targetProcesses[0] = 0;
+            config.targetProcesses[1] = 1;
 
             config.maxHits = 1;
             config.durationSeconds = 60;
             config.argsCount = DEBUG_TRACE_ARGS_MAX;
             bool hitsSpecified = false;
             int index = 6;
+            if (index < argc && !strcmp(argv[index], "also")) {
+                if (index + 2 >= argc) {
+                    printf("ERR code=INVALID_ARGUMENTS\n");
+                    return 0;
+                }
+                resolveRc = resolveAddressForProcess(config.processIds[0],
+                    argv[index + 1], &config.addresses[2]);
+                if (R_FAILED(resolveRc)) {
+                    printf("ERR code=INVALID_ADDRESS index=3"
+                        " result=0x%X\n", resolveRc);
+                    return 0;
+                }
+                resolveRc = resolveAddressForProcess(config.processIds[1],
+                    argv[index + 2], &config.addresses[3]);
+                if (R_FAILED(resolveRc)) {
+                    printf("ERR code=INVALID_ADDRESS index=4"
+                        " result=0x%X\n", resolveRc);
+                    return 0;
+                }
+                config.targetCount = 4;
+                config.targetProcesses[2] = 0;
+                config.targetProcesses[3] = 1;
+                index += 3;
+            }
             while (index < argc) {
                 if (!strcmp(argv[index], "hits") && index + 1 < argc) {
                     u64 parsed = 0;
@@ -783,14 +810,20 @@ int argmain(int argc, char** argv)
             }
             printf("OK state=started active=%d pid0=%016lX"
                 " target0=%016lX pid1=%016lX target1=%016lX"
+                " targetCount=%u"
+                " target2=%016lX target3=%016lX"
+                " targetProcesses=0,1,0,1"
                 " hits=%u ring=%u duration=%lu args=%u"
-                " ctx=%u,%u slots=%u,%u\n",
+                " ctx=%u,%u slots=%u,%u,%u,%u\n",
                 status.active, status.processIds[0], status.addresses[0],
                 status.processIds[1], status.addresses[1],
+                status.targetCount, status.addresses[2],
+                status.addresses[3],
                 config.maxHits, config.ringSize, config.durationSeconds,
                 config.argsCount, status.contextSlots[0],
                 status.contextSlots[1], status.instructionSlots[0],
-                status.instructionSlots[1]);
+                status.instructionSlots[1], status.instructionSlots[2],
+                status.instructionSlots[3]);
             return 0;
         }
         if (!strcmp(argv[1], "multitrace-status"))
@@ -804,9 +837,12 @@ int argmain(int argc, char** argv)
             printf("OK active=%d armed=%d everArmed=%d stale=%d"
                 " memoryBlocked=%d pid0=%016lX target0=%016lX"
                 " pid1=%016lX target1=%016lX hits=%u,%u"
+                " targetCount=%u"
+                " target2=%016lX target3=%016lX"
+                " targetProcesses=0,1,0,1 hits2=%u,%u"
                 " hitCount=%lu maxHits=%u ring=%u ringCount=%u"
                 " duration=%lu startedTick=%lu args=%u ignoredHits=%u"
-                " ctx=%u,%u slots=%u,%u lastSeq=%lu"
+                " ctx=%u,%u slots=%u,%u,%u,%u lastSeq=%lu"
                 " lastPc=%016lX lastLr=%016lX lastSp=%016lX"
                 " lastThread=%016lX lastCore=%u"
                 " stage=%s lastError=0x%X\n",
@@ -815,11 +851,15 @@ int argmain(int argc, char** argv)
                 status.processIds[0], status.addresses[0],
                 status.processIds[1], status.addresses[1],
                 status.targetHits[0], status.targetHits[1],
+                status.targetCount, status.addresses[2],
+                status.addresses[3],
+                status.targetHits[2], status.targetHits[3],
                 status.hitCount, status.maxHits, status.ringSize,
                 status.ringCount, status.durationSeconds,
                 status.startedTick, status.argsCount, status.ignoredHits,
                 status.contextSlots[0], status.contextSlots[1],
                 status.instructionSlots[0], status.instructionSlots[1],
+                status.instructionSlots[2], status.instructionSlots[3],
                 status.lastSequence, status.lastPc, status.lastLr,
                 status.lastSp, status.lastThreadId, status.lastCore,
                 status.stage, status.lastError);

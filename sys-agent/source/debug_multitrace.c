@@ -23,10 +23,12 @@ typedef struct {
     bool stopRequested;
     bool hasEvent;
     u64 processIds[DEBUG_MULTITRACE_PROCESS_COUNT];
-    u64 addresses[DEBUG_MULTITRACE_PROCESS_COUNT];
-    u32 targetHits[DEBUG_MULTITRACE_PROCESS_COUNT];
+    u64 addresses[DEBUG_MULTITRACE_TARGET_MAX];
+    u32 targetProcesses[DEBUG_MULTITRACE_TARGET_MAX];
+    u32 targetHits[DEBUG_MULTITRACE_TARGET_MAX];
     u32 contextSlots[DEBUG_MULTITRACE_PROCESS_COUNT];
-    u32 instructionSlots[DEBUG_MULTITRACE_PROCESS_COUNT];
+    u32 instructionSlots[DEBUG_MULTITRACE_TARGET_MAX];
+    u32 targetCount;
     u32 maxHits;
     u64 hitCount;
     u64 durationSeconds;
@@ -187,7 +189,7 @@ static void recordEvent(DebugTraceEvent* event)
     mutexLock(&multiState.mutex);
     multiState.hitCount++;
     event->sequence = multiState.hitCount;
-    if (event->targetIndex < DEBUG_MULTITRACE_PROCESS_COUNT)
+    if (event->targetIndex < multiState.targetCount)
         multiState.targetHits[event->targetIndex]++;
     multiState.lastEvent = *event;
     multiState.hasEvent = true;
@@ -228,15 +230,20 @@ static void multiTraceThreadMain(void* arg)
     Result rc = 0;
     Result cleanupRc = 0;
     u64 pids[DEBUG_MULTITRACE_PROCESS_COUNT];
-    u64 addresses[DEBUG_MULTITRACE_PROCESS_COUNT];
+    u64 addresses[DEBUG_MULTITRACE_TARGET_MAX];
+    u32 targetProcesses[DEBUG_MULTITRACE_TARGET_MAX];
+    u32 targetCount = 0;
     u32 argsCount = 0;
     u32 context1 = 0;
     u32 context2 = 0;
-    u32 slots[DEBUG_MULTITRACE_PROCESS_COUNT] = { 0, 0 };
+    u32 slots[DEBUG_MULTITRACE_TARGET_MAX] = { 0, 0, 0, 0 };
 
     mutexLock(&multiState.mutex);
     memcpy(pids, multiState.processIds, sizeof(pids));
     memcpy(addresses, multiState.addresses, sizeof(addresses));
+    memcpy(targetProcesses, multiState.targetProcesses,
+        sizeof(targetProcesses));
+    targetCount = multiState.targetCount;
     argsCount = multiState.argsCount;
     mutexUnlock(&multiState.mutex);
 
@@ -289,11 +296,11 @@ static void multiTraceThreadMain(void* arg)
     }
     u32 slotCount = 0;
     for (u32 i = 0; i < allCount
-        && slotCount < DEBUG_MULTITRACE_PROCESS_COUNT; i++) {
+        && slotCount < targetCount; i++) {
         if (allSlots[i] != context2)
             slots[slotCount++] = allSlots[i];
     }
-    if (slotCount < DEBUG_MULTITRACE_PROCESS_COUNT) {
+    if (slotCount < targetCount) {
         setError("instructionSlots", MAKERESULT(Module_Libnx,
             LibnxError_NotFound));
         goto cleanup;
@@ -302,13 +309,15 @@ static void multiTraceThreadMain(void* arg)
     mutexLock(&multiState.mutex);
     multiState.contextSlots[0] = context1;
     multiState.contextSlots[1] = context2;
-    multiState.instructionSlots[0] = slots[0];
-    multiState.instructionSlots[1] = slots[1];
+    for (u32 i = 0; i < targetCount; i++)
+        multiState.instructionSlots[i] = slots[i];
     mutexUnlock(&multiState.mutex);
 
-    rc = debugHwBpArmDualInstructionTrace(context1, handles[0],
-        slots[0], addresses[0], context2, handles[1],
-        slots[1], addresses[1]);
+    rc = debugHwBpArmDualProcessInstructionTrace((const u32[2]) {
+            context1, context2,
+        }, (const Handle[2]) {
+            handles[0], handles[1],
+        }, slots, addresses, targetProcesses, targetCount);
     if (R_FAILED(rc)) {
         setError("armTrace", rc);
         goto cleanup;
@@ -357,14 +366,14 @@ static void multiTraceThreadMain(void* arg)
                 && event.info.exception.specific.break_point.type
                     == BreakPointType_HardwareInstruction) {
                 u32 targetIndex = UINT32_MAX;
-                for (u32 i = 0; i < DEBUG_MULTITRACE_PROCESS_COUNT; i++) {
+                for (u32 i = 0; i < targetCount; i++) {
                     if (addresses[i] == (u64)event.info.exception.address) {
                         targetIndex = i;
                         break;
                     }
                 }
                 if (targetIndex != UINT32_MAX
-                    && targetIndex == processIndex) {
+                    && targetProcesses[targetIndex] == processIndex) {
                     DebugTraceEvent captured;
                     captureEvent(handles[processIndex], &event, targetIndex,
                         addresses[targetIndex], argsCount, &captured);
@@ -375,6 +384,15 @@ static void multiTraceThreadMain(void* arg)
                             sizeof(multiState.stage) - 1);
                         multiState.stage[sizeof(multiState.stage) - 1] = 0;
                         mutexUnlock(&multiState.mutex);
+                        goto cleanup;
+                    }
+                    rc = debugHwBpStepOverInstruction(
+                        handles[processIndex], event.thread_id,
+                        slots[targetIndex], processIndex == 0
+                            ? context1 : context2,
+                        addresses[targetIndex]);
+                    if (R_FAILED(rc)) {
+                        setError("stepInstruction", rc);
                         goto cleanup;
                     }
                 } else {
@@ -401,10 +419,14 @@ cleanup:
         }
     }
     if (armed) {
-        const u32 registers[4] = {
-            context1, context2, slots[0], slots[1],
-        };
-        Result clearRc = debugHwBpClearRegistersAllCores(registers, 4);
+        u32 registers[2 + DEBUG_MULTITRACE_TARGET_MAX];
+        for (u32 i = 0; i < 2; i++)
+            registers[i] = i == 0 ? context1 : context2;
+        for (u32 i = 0; i < targetCount; i++)
+            registers[i + 2] = slots[i];
+        const u32 clearCount = 2 + targetCount;
+        Result clearRc = debugHwBpClearRegistersAllCores(registers,
+            clearCount);
         if (R_FAILED(clearRc) && R_SUCCEEDED(cleanupRc))
             cleanupRc = clearRc;
     }
@@ -442,14 +464,37 @@ bool debugMultiTraceStart(const DebugMultiTraceConfig* config)
     if (config == NULL || config->processIds[0] == 0
         || config->processIds[1] == 0
         || config->processIds[0] == config->processIds[1]
-        || config->addresses[0] == 0 || config->addresses[1] == 0
-        || config->addresses[0] == config->addresses[1]
-        || (config->addresses[0] & 3) != 0
-        || (config->addresses[1] & 3) != 0
+        || config->targetCount < DEBUG_MULTITRACE_PROCESS_COUNT
+        || config->targetCount > DEBUG_MULTITRACE_TARGET_MAX
         || (config->maxHits == 0 && config->ringSize == 0)
         || config->ringSize > DEBUG_TRACE_RING_MAX
         || config->argsCount > DEBUG_TRACE_ARGS_MAX) {
         setError("invalid", MAKERESULT(Module_Libnx,
+            LibnxError_BadInput));
+        return false;
+    }
+    bool processRepresented[DEBUG_MULTITRACE_PROCESS_COUNT] = {
+        false, false,
+    };
+    for (u32 i = 0; i < config->targetCount; i++) {
+        if (config->addresses[i] == 0
+            || (config->addresses[i] & 3) != 0
+            || config->targetProcesses[i] >= DEBUG_MULTITRACE_PROCESS_COUNT) {
+            setError("invalidTarget", MAKERESULT(Module_Libnx,
+                LibnxError_BadInput));
+            return false;
+        }
+        processRepresented[config->targetProcesses[i]] = true;
+        for (u32 prior = 0; prior < i; prior++) {
+            if (config->addresses[prior] == config->addresses[i]) {
+                setError("duplicateTarget", MAKERESULT(Module_Libnx,
+                    LibnxError_BadInput));
+                return false;
+            }
+        }
+    }
+    if (!processRepresented[0] || !processRepresented[1]) {
+        setError("missingProcessTarget", MAKERESULT(Module_Libnx,
             LibnxError_BadInput));
         return false;
     }
@@ -479,10 +524,13 @@ bool debugMultiTraceStart(const DebugMultiTraceConfig* config)
         sizeof(multiState.processIds));
     memcpy(multiState.addresses, config->addresses,
         sizeof(multiState.addresses));
+    memcpy(multiState.targetProcesses, config->targetProcesses,
+        sizeof(multiState.targetProcesses));
     memset(multiState.targetHits, 0, sizeof(multiState.targetHits));
     memset(multiState.contextSlots, 0, sizeof(multiState.contextSlots));
     memset(multiState.instructionSlots, 0,
         sizeof(multiState.instructionSlots));
+    multiState.targetCount = config->targetCount;
     multiState.maxHits = config->maxHits;
     multiState.durationSeconds = config->durationSeconds;
     multiState.hitCount = 0;
@@ -562,12 +610,15 @@ bool debugMultiTraceGetStatus(DebugMultiTraceStatus* out)
     memcpy(out->processIds, multiState.processIds,
         sizeof(out->processIds));
     memcpy(out->addresses, multiState.addresses, sizeof(out->addresses));
+    memcpy(out->targetProcesses, multiState.targetProcesses,
+        sizeof(out->targetProcesses));
     memcpy(out->targetHits, multiState.targetHits,
         sizeof(out->targetHits));
     memcpy(out->contextSlots, multiState.contextSlots,
         sizeof(out->contextSlots));
     memcpy(out->instructionSlots, multiState.instructionSlots,
         sizeof(out->instructionSlots));
+    out->targetCount = multiState.targetCount;
     out->hitCount = multiState.hitCount;
     out->durationSeconds = multiState.durationSeconds;
     out->startedTick = multiState.startedTick;

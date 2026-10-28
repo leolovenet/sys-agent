@@ -41,8 +41,8 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.3.0
-sys-agent 2.17.0  (switch:6000)
+client    1.4.0
+sys-agent 2.18.0  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
@@ -136,7 +136,9 @@ python3 client/sysagent.py --host switch debug trace-status
 python3 client/sysagent.py --host switch debug trace-read 0
 python3 client/sysagent.py --host switch debug trace-dump --output trace.jsonl
 python3 client/sysagent.py --host switch debug multitrace \
-  0x71 main+0x1000 0x85 main+0x2000 --ring 64 --duration 30
+  0x71 main+0x1000 0x85 main+0x2000 \
+  --extra-target1 main+0x1010 --extra-target2 main+0x2010 \
+  --ring 64 --duration 30
 python3 client/sysagent.py --host switch debug multitrace-status
 python3 client/sysagent.py --host switch debug multitrace-dump --output multi.jsonl
 python3 client/sysagent.py debug trace-analyze trace.jsonl \
@@ -149,9 +151,12 @@ records target index/address, thread/core/PC/LR/SP, `x0`–`x7`, and instruction
 `--ring 64 --duration 300` to keep recent hits, or `--hits N` for a one-shot hit limit. Ring
 mode defaults to a 64-hit safety cap; `--hits 0 --ring 64` explicitly removes it. Each
 `--snapshot REG[+/-OFFSET]:SIZE` reads memory through `x0`–`x30`, `sp`, `pc`, or `lr` while the
-target is stopped and records its own Result; two snapshots are supported. The selected PID
-defaults to the foreground application; `main+OFFSET` is resolved against that process. The
-record is an entry-event trace, not a return-value or call-stack tracer. `debug trace-stop`
+target is stopped and records its own Result; two snapshots are supported. On each retained hit
+the tracer clears that execution slot, single-steps the stopped thread once, restores the slot,
+and then resumes, so later targets can execute. The selected PID defaults to the foreground
+application; `main+OFFSET` is resolved against that process. Configure a caller return address
+as another target to capture its return-time `x0`; the trace itself is not a call-stack tracer.
+`debug trace-stop`
 releases the debug handle, after which memory commands can attach normally again. `trace-dump`
 writes the retained ring as versioned JSONL (`schemaVersion=1`, one metadata record and event
 records, including best-effort PID/Title ID/main-module/Build ID identity) and rejects a ring
@@ -161,10 +166,14 @@ session and thread; the return event's `x0` is reported as the candidate Result.
 are directly comparable when captured in the same boot, because ordering uses the device system
 tick. `trace-diff` compares event, process, thread and target counts between an A/B pair.
 
-`debug multitrace` is the experimental two-process client for sysmodule `2.17.0+`. It assigns
+`debug multitrace` is the experimental two-process client for sysmodule `2.18.0+`. It assigns
 one instruction target to each explicitly supplied PID, using runtime-probed context and
-instruction slots. `multitrace-dump` writes the same versioned JSONL schema with a `targets[]`
-process table, so `trace-analyze` attributes each event to the correct PID by target index.
+instruction slots. `--extra-target1` and `--extra-target2` add one more target to each side;
+use them together to observe client/server entry and caller-return sites in one session. The
+return event's `x0` is the actual function Result when the runtime function returns through
+that address.
+`multitrace-dump` writes the same versioned JSONL schema with a `targets[]` process table, so
+`trace-analyze` attributes each event to the correct PID by target index.
 
 ## Controller
 

@@ -5,10 +5,13 @@
 #include "debug_trace_model.h"
 
 #define DEBUG_MULTITRACE_PROCESS_COUNT 2
+#define DEBUG_MULTITRACE_TARGET_MAX 4
 
 typedef struct {
     u64 processIds[DEBUG_MULTITRACE_PROCESS_COUNT];
-    u64 addresses[DEBUG_MULTITRACE_PROCESS_COUNT];
+    u64 addresses[DEBUG_MULTITRACE_TARGET_MAX];
+    u32 targetProcesses[DEBUG_MULTITRACE_TARGET_MAX];
+    u32 targetCount;
     u32 maxHits;
     u64 durationSeconds;
     u32 ringSize;
@@ -22,10 +25,12 @@ typedef struct {
     bool stale;
     bool memoryBlocked;
     u64 processIds[DEBUG_MULTITRACE_PROCESS_COUNT];
-    u64 addresses[DEBUG_MULTITRACE_PROCESS_COUNT];
-    u32 targetHits[DEBUG_MULTITRACE_PROCESS_COUNT];
+    u64 addresses[DEBUG_MULTITRACE_TARGET_MAX];
+    u32 targetProcesses[DEBUG_MULTITRACE_TARGET_MAX];
+    u32 targetHits[DEBUG_MULTITRACE_TARGET_MAX];
     u32 contextSlots[DEBUG_MULTITRACE_PROCESS_COUNT];
-    u32 instructionSlots[DEBUG_MULTITRACE_PROCESS_COUNT];
+    u32 instructionSlots[DEBUG_MULTITRACE_TARGET_MAX];
+    u32 targetCount;
     u64 hitCount;
     u64 durationSeconds;
     u64 startedTick;
