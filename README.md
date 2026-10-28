@@ -59,6 +59,9 @@ commands should follow this rule:
   exposes `trace-status` / `trace-read` / `trace-stop`, and never modifies target instructions.
   The client `trace-dump` writes versioned JSONL with session metadata; `trace-analyze` and
   `trace-diff` summarize, pair explicit entry/return sites and compare A/B captures.
+  Versioned trace profiles resolve foreground/title-ID process selectors, verify Build ID and
+  emit `trace-plan` / `trace-run` / `trace-report` workflows without embedding game offsets in
+  the sysmodule; see `docs/trace-profiles.md`.
 - Experimental `debug multitrace` holds two debug handles simultaneously with independently
   probed context-IDR slots, allowing up to two instruction targets in each of two processes.
   The optional second target on each side can be the corresponding caller return address,

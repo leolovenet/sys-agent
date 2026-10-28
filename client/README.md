@@ -41,7 +41,7 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.4.0
+client    1.5.0
 sys-agent 2.18.0  (switch:6000)
 ```
 
@@ -144,6 +144,10 @@ python3 client/sysagent.py --host switch debug multitrace-dump --output multi.js
 python3 client/sysagent.py debug trace-analyze trace.jsonl \
   --pair 0x...:0x... --json
 python3 client/sysagent.py debug trace-diff before.jsonl after.jsonl
+python3 client/sysagent.py --host switch debug trace-plan profile.json
+python3 client/sysagent.py --host switch debug trace-run profile.json \
+  --duration 30 --ring 64
+python3 client/sysagent.py debug trace-report trace.jsonl profile.json --json
 ```
 
 `debug trace` arms one to four hardware execution breakpoints without patching target code. It
@@ -174,6 +178,13 @@ return event's `x0` is the actual function Result when the runtime function retu
 that address.
 `multitrace-dump` writes the same versioned JSONL schema with a `targets[]` process table, so
 `trace-analyze` attributes each event to the correct PID by target index.
+
+`trace-plan`, `trace-run` and `trace-report` consume the versioned profile documented in
+`docs/trace-profiles.md`. Profiles select processes by foreground status, Title ID or explicit
+PID, verify title/Build IDs, resolve main-module offsets, and retain stable target IDs for
+entry/return reporting. `trace-run --output FILE` waits for completion and exports JSONL;
+without that option it returns immediately after the breakpoints are armed so the caller can
+trigger the operation.
 
 ## Controller
 

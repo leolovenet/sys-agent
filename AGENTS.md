@@ -9,6 +9,7 @@
 - `debug maps` / `debug threads` / `debug modules` 是通用的任意进程检查原语(内存区域、线程 PC/LR/SP、模块列表);保持与游戏/具体系统服务无关,不要为单一调查加特例。
 - `debug trace` 是通用的任意 PID 硬件执行 tracer:不修改目标代码,单会话最多 4 个目标,记录目标/线程/core/PC/LR/SP/参数/指令、命中时最多 2 个寄存器指针内存快照与固定 ring。命中后必须清除当前执行槽、对命中的线程硬件单步一条指令、恢复执行槽,再继续整个进程;省略这一步会让同一断点原地反复触发,永远到不了后续目标。ring 仍受默认 64 次总命中安全上限约束,只有显式 `hits 0` 才解除;实机表明 4096 次快速命中已足以触发 ACNH watchdog。它只记录显式配置的站点;客户端配对 entry/return 仍是离线分析,不是自动调用栈追踪。游戏偏移仍由消费方提供。
 - `trace-dump` 的版本化 JSONL、`trace-analyze` 与 `trace-diff` 属于客户端离线关联层:只能对已显式记录的站点做同 session/thread 配对,不代表已实现跨进程 IPC 自动追踪。
+- `trace-plan` / `trace-run` / `trace-report` 的 profile 层只做通用进程选择、Title/Build ID 校验、主模块 offset 解析和稳定 target ID 映射。ACNH、Account、SSL 等具体 offset/profile 必须由消费方提供,不得写入 sysmodule;schema 与限制见 `docs/trace-profiles.md`。
 - `debug hwbp-layout <pid1> <pid2>` 是实验性硬件容量探针:短生命周期间时 attach 两个进程,只验证两个 context-IDR 句柄和可用执行槽是否可共存,不安装实际执行地址。结果用于决定同步多进程 trace 的架构,不要把它描述成已经支持 IPC trace。
 - `debug multitrace` 是实验性同步双进程 trace:固定两个独立 PID、每进程最多两个目标地址,共享 ring 和总命中上限,事件用 target index 区分目标。两个执行站点可分别传函数入口与调用者返回地址,用于捕获真实返回 `x0`;它不含 snapshot,也不自动解析 CMIF/HIPC;一个目标退出时整个会话停止。不要扩成 IPC 特例,后续接口/Result 关联应建立在通用 profile 层。
 
@@ -106,6 +107,7 @@ docker run --rm \
 | `docs/lock-screen-notes.md` | 锁屏识别规则与阈值、四种界面实测数据、fixture 与主机回归(改 `boot unlock`/屏幕分类前必读) |
 | `docs/headless-launch-rights-key-notes.md` | headless 启动与 external key 机制(改 launch/keys 前必读) |
 | `docs/process-memory-backend.md` | 统一内存后端设计(direct/auto) |
+| `docs/trace-profiles.md` | versioned trace profile schema、动态进程/模块解析、plan/run/report 与当前限制(改 trace profile 或消费方偏移配置前必读) |
 | `docs/search-a-level-design.md` | A 级精确搜索设计与部署门槛 |
 | `docs/search-c-level-design.md` | C 级未知值搜索设计 |
 | `docs/research/audio-control.md` | 系统音量控制研究(`aud:ctl`/`audctl`) |

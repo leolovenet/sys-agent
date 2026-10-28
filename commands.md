@@ -411,6 +411,29 @@ handles are released on stop/error. `multitrace-status.ignoredHits` counts
 hardware-instruction events that did not match a configured address or arrived on the wrong
 process debug handle.
 
+### Trace profiles
+
+Versioned profiles turn process selectors and main-module offsets into a validated trace plan:
+
+```bash
+python3 client/sysagent.py --host switch debug trace-plan profile.json
+python3 client/sysagent.py --host switch debug trace-run profile.json \
+  --duration 30 --ring 64
+python3 client/sysagent.py --host switch debug trace-run profile.json \
+  --wait --output trace.jsonl
+python3 client/sysagent.py debug trace-report trace.jsonl profile.json --json
+```
+
+Profiles support one foreground/title-ID/PID process with up to four targets, or exactly two
+processes with two targets each. They verify Title ID and Build ID before arming, resolve all
+offsets against the selected main module, and preserve stable target IDs for entry/return
+correlation. `trace-run` returns immediately after arming unless `--wait` or `--output` is used;
+consumers therefore remain responsible for triggering the game or service operation.
+
+The schema, selector rules, target ordering and current limitations are documented in
+`docs/trace-profiles.md`. Profile files belong to the consumer project; sys-agent does not ship
+game-specific offsets.
+
 The same ownership rules as `debug watch` apply. For the foreground application, an existing
 `dmnt:cht` handle is closed when necessary and later memory commands reattach it. A trace of a
 system process does not disturb the game's dmnt handle. While a trace is active, memory,

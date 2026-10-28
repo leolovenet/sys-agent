@@ -21,8 +21,9 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.4.0"
+CLIENT_VERSION = "1.5.0"
 TRACE_SCHEMA_VERSION = 1
+TRACE_PROFILE_SCHEMA_VERSION = 1
 
 # The console's default keySleepTime (25 ms) is fast enough for the home menu but too
 # fast for the game's on-screen keyboard: measured in ACNH 3.0.3's chat field, 25/30 ms
@@ -1768,6 +1769,422 @@ def parse_trace_pair_spec(value: str) -> tuple[int, int]:
     return entry, return_address
 
 
+def _profile_object(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    return value
+
+
+def _profile_list(value: object, label: str) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be an array")
+    return value
+
+
+def _profile_hex_id(value: object, label: str) -> int:
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value, 16)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be a hexadecimal ID") from exc
+    else:
+        raise ValueError(f"{label} must be a hexadecimal ID")
+    if parsed <= 0:
+        raise ValueError(f"{label} must be positive")
+    return parsed
+
+
+def _profile_offset(value: object, label: str) -> int:
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        if not value.lower().startswith("0x"):
+            raise ValueError(f"{label} must use a 0x-prefixed hexadecimal offset")
+        try:
+            parsed = int(value, 16)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be a hexadecimal offset") from exc
+    else:
+        raise ValueError(f"{label} must be a hexadecimal offset")
+    if parsed < 0 or parsed & 3:
+        raise ValueError(f"{label} must be a non-negative 4-byte-aligned offset")
+    return parsed
+
+
+def load_trace_profile(path: str) -> dict[str, object]:
+    """Load and validate a versioned, game-independent execution-trace profile."""
+    with open(path, encoding="utf-8") as handle:
+        profile = json.load(handle)
+    profile = _profile_object(profile, "trace profile")
+    schema = parse_int(str(profile.get("schemaVersion", "0")))
+    if schema != TRACE_PROFILE_SCHEMA_VERSION:
+        raise ValueError(f"unsupported trace profile schema {schema}")
+    if "name" in profile and (
+            not isinstance(profile["name"], str) or not profile["name"]):
+        raise ValueError("profile name must be a non-empty string")
+
+    processes = [
+        _profile_object(value, f"processes[{index}]")
+        for index, value in enumerate(
+            _profile_list(profile.get("processes"), "processes"))
+    ]
+    if not 1 <= len(processes) <= 2:
+        raise ValueError("trace profile needs one or two processes")
+    process_ids: dict[str, dict[str, object]] = {}
+    for index, process in enumerate(processes):
+        process_id = process.get("id")
+        if not isinstance(process_id, str) or not process_id:
+            raise ValueError(f"processes[{index}].id must be a non-empty string")
+        if process_id in process_ids:
+            raise ValueError(f"duplicate process id: {process_id}")
+        selectors = [
+            name for name in ("foreground", "titleId", "pid")
+            if name in process
+        ]
+        if len(selectors) != 1:
+            raise ValueError(
+                f"process {process_id} needs exactly one of foreground/titleId/pid")
+        if selectors[0] == "foreground" and process["foreground"] is not True:
+            raise ValueError(f"process {process_id} foreground must be true")
+        if selectors[0] == "titleId":
+            _profile_hex_id(process["titleId"], f"process {process_id} titleId")
+        if selectors[0] == "pid":
+            _profile_hex_id(process["pid"], f"process {process_id} pid")
+        if "mainModuleIndex" in process:
+            module_index = process["mainModuleIndex"]
+            if (not isinstance(module_index, int) or module_index < 0):
+                raise ValueError(
+                    f"process {process_id} mainModuleIndex must be non-negative")
+        expected = process.get("expect")
+        if expected is not None:
+            expected = _profile_object(expected, f"process {process_id} expect")
+            if "titleId" in expected:
+                _profile_hex_id(
+                    expected["titleId"], f"process {process_id} expect.titleId")
+            build_id = expected.get("buildId")
+            if build_id is not None and not isinstance(build_id, str):
+                raise ValueError(
+                    f"process {process_id} expect.buildId must be a string")
+        process_ids[process_id] = process
+
+    targets = [
+        _profile_object(value, f"targets[{index}]")
+        for index, value in enumerate(
+            _profile_list(profile.get("targets"), "targets"))
+    ]
+    if not 1 <= len(targets) <= 4:
+        raise ValueError("trace profile needs one to four targets")
+    target_ids: dict[str, dict[str, object]] = {}
+    targets_per_process: dict[str, int] = {
+        process_id: 0 for process_id in process_ids
+    }
+    for index, target in enumerate(targets):
+        target_id = target.get("id")
+        if not isinstance(target_id, str) or not target_id:
+            raise ValueError(f"targets[{index}].id must be a non-empty string")
+        if target_id in target_ids:
+            raise ValueError(f"duplicate target id: {target_id}")
+        process_id = target.get("process")
+        if not isinstance(process_id, str) or process_id not in process_ids:
+            raise ValueError(
+                f"target {target_id} references unknown process {process_id!r}")
+        _profile_offset(target.get("offset"), f"target {target_id} offset")
+        targets_per_process[process_id] += 1
+        target_ids[target_id] = target
+
+    if len(processes) == 2 and any(
+            count != 2 for count in targets_per_process.values()):
+        raise ValueError(
+            "two-process profiles need exactly two targets per process")
+    if any(count > 4 for count in targets_per_process.values()):
+        raise ValueError("a process cannot have more than four trace targets")
+
+    pairs = [
+        _profile_object(value, f"pairs[{index}]")
+        for index, value in enumerate(
+            _profile_list(profile.get("pairs", []), "pairs"))
+    ]
+    for index, pair in enumerate(pairs):
+        entry_id = pair.get("entry")
+        return_id = pair.get("return")
+        if entry_id not in target_ids or return_id not in target_ids:
+            raise ValueError(
+                f"pairs[{index}] must reference existing entry and return target ids")
+        if entry_id == return_id:
+            raise ValueError(f"pairs[{index}] entry and return must differ")
+        entry_process = target_ids[str(entry_id)].get("process")
+        return_process = target_ids[str(return_id)].get("process")
+        if entry_process != return_process:
+            raise ValueError(
+                f"pairs[{index}] entry and return must belong to the same process")
+
+    trace_options = profile.get("trace", {})
+    if trace_options is not None:
+        trace_options = _profile_object(trace_options, "trace")
+        for name in ("hits", "ring", "duration", "args"):
+            if name in trace_options and (
+                    not isinstance(trace_options[name], int)
+                    or trace_options[name] < 0):
+                raise ValueError(f"trace.{name} must be a non-negative integer")
+    return profile
+
+
+def _parse_debug_modules(response: dict[str, str]) -> dict[int, dict[str, object]]:
+    require_ok(response)
+    modules: dict[int, dict[str, object]] = {}
+    for raw_entry in response.get("modules", "").split(","):
+        if not raw_entry or "=" not in raw_entry:
+            continue
+        index_text, payload = raw_entry.split("=", 1)
+        address_size, _, build_id = payload.partition(":build=")
+        base_text, _, size_text = address_size.partition("+")
+        try:
+            modules[int(index_text)] = {
+                "base": int(base_text, 16),
+                "size": int(size_text, 16),
+                "buildId": build_id,
+            }
+        except ValueError as exc:
+            raise SysAgentProtocolError(
+                f"invalid debug modules entry: {raw_entry!r}") from exc
+    if not modules:
+        raise SysAgentProtocolError("debug modules returned no modules")
+    return modules
+
+
+def _parse_executable_maps(
+        response: dict[str, str]) -> tuple[list[dict[str, int]], bool]:
+    require_ok(response)
+    maps: list[dict[str, int]] = []
+    for raw_entry in response.get("maps", "").split(","):
+        if not raw_entry or "=" not in raw_entry:
+            continue
+        _, payload = raw_entry.split("=", 1)
+        address_size, _, attributes = payload.partition(":")
+        base_text, _, size_text = address_size.partition("+")
+        _, _, permission_text = attributes.partition("/p")
+        try:
+            base = int(base_text, 16)
+            size = int(size_text, 16)
+            permission = int(permission_text, 0)
+        except ValueError as exc:
+            raise SysAgentProtocolError(
+                f"invalid debug maps entry: {raw_entry!r}") from exc
+        if (permission & 5) == 5:
+            maps.append({"base": base, "size": size, "permission": permission})
+    return maps, response.get("truncated") == "1"
+
+
+def _find_profile_pid(client: SysAgentClient, wanted_title: int) -> int:
+    offset = 0
+    matches: list[int] = []
+    while True:
+        listing = client.process_list(offset, 64)
+        entries = listing.get("processes", "")
+        for entry in entries.split(","):
+            pid_text, _, title_text = entry.partition(":")
+            try:
+                if int(title_text, 16) == wanted_title:
+                    pid = int(pid_text, 16)
+                    if pid not in matches:
+                        matches.append(pid)
+            except ValueError:
+                continue
+        total = parse_int(listing.get("total", "0"))
+        captured = parse_int(listing.get("captured", "0"))
+        offset += captured
+        if captured == 0 or offset >= total:
+            break
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise SysAgentProtocolError(
+            f"title ID {wanted_title:016X} has multiple running processes: "
+            + ", ".join(f"0x{pid:X}" for pid in matches))
+    raise SysAgentProtocolError(
+        f"no running process has title ID {wanted_title:016X}")
+
+
+def _profile_title_for_pid(client: SysAgentClient, pid: int) -> int | None:
+    offset = 0
+    while True:
+        listing = client.process_list(offset, 64)
+        entries = listing.get("processes", "")
+        for entry in entries.split(","):
+            pid_text, _, title_text = entry.partition(":")
+            try:
+                if int(pid_text, 16) == pid:
+                    return int(title_text, 16)
+            except ValueError:
+                continue
+        total = parse_int(listing.get("total", "0"))
+        captured = parse_int(listing.get("captured", "0"))
+        offset += captured
+        if captured == 0 or offset >= total:
+            break
+    return None
+
+
+def _profile_target_order(profile: dict[str, object]) -> list[dict[str, object]]:
+    processes = [
+        _profile_object(value, "process")
+        for value in _profile_list(profile["processes"], "processes")
+    ]
+    targets = [
+        _profile_object(value, "target")
+        for value in _profile_list(profile["targets"], "targets")
+    ]
+    if len(processes) == 1:
+        return targets
+    by_process: dict[str, list[dict[str, object]]] = {
+        str(process["id"]): [] for process in processes
+    }
+    for target in targets:
+        by_process[str(target["process"])].append(target)
+    return [
+        by_process[str(processes[0]["id"])][0],
+        by_process[str(processes[1]["id"])][0],
+        by_process[str(processes[0]["id"])][1],
+        by_process[str(processes[1]["id"])][1],
+    ]
+
+
+def resolve_trace_profile(client: SysAgentClient,
+                          profile: dict[str, object]) -> dict[str, object]:
+    """Resolve PIDs/modules/offsets in a validated profile into a trace plan."""
+    game = client.game_status()
+    resolved_processes: list[dict[str, object]] = []
+    resolved_by_id: dict[str, dict[str, object]] = {}
+    executable_maps_by_pid: dict[
+        int, tuple[list[dict[str, int]], bool]] = {}
+    for raw_process in _profile_list(profile["processes"], "processes"):
+        process = _profile_object(raw_process, "process")
+        process_id = str(process["id"])
+        if "foreground" in process:
+            if not game.running:
+                raise SysAgentProtocolError(
+                    f"process {process_id} selects the foreground application, "
+                    "but no application is running")
+            pid = game.pid
+            title_id = game.title_id
+        elif "titleId" in process:
+            title_id = _profile_hex_id(
+                process["titleId"], f"process {process_id} titleId")
+            pid = _find_profile_pid(client, title_id)
+        else:
+            pid = _profile_hex_id(process["pid"], f"process {process_id} pid")
+            title_id = _profile_title_for_pid(client, pid)
+            if title_id is None:
+                raise SysAgentProtocolError(
+                    f"process {process_id} PID {pid:X} is not running")
+
+        modules = _parse_debug_modules(require_ok(client.command(
+            f"debug modules 0x{pid:X} 2", retry=True)))
+        if "foreground" in process:
+            module_index = next(
+                (index for index, module in modules.items()
+                 if module["base"] == game.main_base),
+                None)
+            if module_index is None:
+                raise SysAgentProtocolError(
+                    f"foreground main base 0x{game.main_base:X} is absent "
+                    "from debug modules")
+        else:
+            module_index = int(process.get("mainModuleIndex", 0))
+        module = modules.get(module_index)
+        if module is None:
+            raise SysAgentProtocolError(
+                f"process {process_id} has no module index {module_index}")
+        executable_maps_by_pid[pid] = _parse_executable_maps(
+            require_ok(client.command(
+                f"debug maps 0x{pid:X} 256", retry=True)))
+
+        expected = process.get("expect", {})
+        if expected:
+            expected = _profile_object(expected, f"process {process_id} expect")
+            expected_title = (
+                _profile_hex_id(expected["titleId"], "expect.titleId")
+                if "titleId" in expected else None)
+            if expected_title is not None and title_id != expected_title:
+                raise SysAgentProtocolError(
+                    f"process {process_id} title ID mismatch: "
+                    f"got {title_id:016X}, expected {expected_title:016X}")
+            expected_build = expected.get("buildId")
+            actual_build = str(module["buildId"])
+            if (expected_build
+                    and not actual_build.upper().startswith(str(expected_build).upper())):
+                raise SysAgentProtocolError(
+                    f"process {process_id} build ID mismatch: "
+                    f"got {actual_build}, expected {expected_build}")
+
+        resolved = {
+            "id": process_id,
+            "pid": pid,
+            "titleId": f"{title_id:016X}" if title_id is not None else "NA",
+            "moduleIndex": module_index,
+            "moduleBase": f"0x{int(module['base']):X}",
+            "moduleSize": f"0x{int(module['size']):X}",
+            "buildId": module["buildId"],
+        }
+        resolved_processes.append(resolved)
+        resolved_by_id[process_id] = resolved
+
+    pids = [int(process["pid"]) for process in resolved_processes]
+    if len(set(pids)) != len(pids):
+        raise SysAgentProtocolError("trace profile resolves to duplicate PIDs")
+
+    resolved_targets: list[dict[str, object]] = []
+    addresses: set[int] = set()
+    for index, raw_target in enumerate(_profile_target_order(profile)):
+        target = _profile_object(raw_target, "target")
+        target_id = str(target["id"])
+        process = resolved_by_id[str(target["process"])]
+        offset = _profile_offset(target.get("offset"), f"target {target_id} offset")
+        address = int(str(process["moduleBase"]), 0) + offset
+        if address in addresses:
+            raise SysAgentProtocolError(
+                f"trace profile resolves duplicate target address 0x{address:X}")
+        executable_maps, maps_truncated = executable_maps_by_pid[
+            int(process["pid"])]
+        mapping = next(
+            (entry for entry in executable_maps
+             if int(entry["base"]) <= address
+             < int(entry["base"]) + int(entry["size"])),
+            None)
+        if mapping is None and not maps_truncated:
+            raise SysAgentProtocolError(
+                f"target {target_id} address 0x{address:X} is not in an "
+                "executable mapping")
+        addresses.add(address)
+        resolved_targets.append({
+            "id": target_id,
+            "index": index,
+            "processId": process["id"],
+            "pid": process["pid"],
+            "address": f"0x{address:X}",
+            "moduleIndex": process["moduleIndex"],
+            "moduleBase": process["moduleBase"],
+            "offset": f"0x{offset:X}",
+            "mapping": (
+                f"0x{int(mapping['base']):X}+0x{int(mapping['size']):X}"
+                f":p{int(mapping['permission'])}"
+                if mapping is not None else "unverified-truncated"),
+        })
+
+    return {
+        "schemaVersion": TRACE_PROFILE_SCHEMA_VERSION,
+        "kind": "trace-plan",
+        "profile": profile.get("name", "trace-profile"),
+        "mode": "single" if len(resolved_processes) == 1 else "multitrace",
+        "processes": resolved_processes,
+        "targets": resolved_targets,
+        "pairs": profile.get("pairs", []),
+        "trace": profile.get("trace", {}),
+    }
+
+
 def load_trace_jsonl(paths: Sequence[str]) -> list[dict[str, object]]:
     """Load versioned JSONL trace exports, accepting old event-only dumps."""
     documents: list[dict[str, object]] = []
@@ -1967,6 +2384,124 @@ def analyze_trace_documents(
         },
         "pairs": pair_reports,
     }
+
+
+def report_trace_with_profile(document: dict[str, object],
+                              profile: dict[str, object]) -> dict[str, object]:
+    """Correlate a trace export using target identities from a trace profile."""
+    metadata = _profile_object(document.get("metadata"), "trace metadata")
+    trace_targets = metadata.get("targets")
+    if not isinstance(trace_targets, list):
+        raise SysAgentProtocolError("trace has no target metadata")
+    target_by_index: dict[int, dict[str, object]] = {}
+    for raw_target in trace_targets:
+        if not isinstance(raw_target, dict):
+            continue
+        index = parse_int(str(raw_target.get("index", "-1")))
+        if index >= 0:
+            target_by_index[index] = raw_target
+
+    ordered_targets = _profile_target_order(profile)
+    if len(target_by_index) < len(ordered_targets):
+        raise SysAgentProtocolError(
+            "trace target count does not match the profile")
+    process_specs = {
+        str(process["id"]): process
+        for process in (
+            _profile_object(value, "process")
+            for value in _profile_list(profile["processes"], "processes")
+        )
+    }
+
+    resolved_targets: list[dict[str, object]] = []
+    address_by_id: dict[str, int] = {}
+    for index, raw_target in enumerate(ordered_targets):
+        target = _profile_object(raw_target, "target")
+        target_id = str(target["id"])
+        trace_target = target_by_index.get(index)
+        if trace_target is None:
+            raise SysAgentProtocolError(
+                f"trace has no target index {index} for {target_id}")
+        process = _profile_object(
+            trace_target.get("process"), f"target {target_id} process")
+        module_base = _trace_address(process.get("moduleBase"))
+        trace_address = _trace_address(trace_target.get("address"))
+        if module_base is None or trace_address is None:
+            raise SysAgentProtocolError(
+                f"trace target {target_id} has no module/address metadata")
+        offset = _profile_offset(target.get("offset"), f"target {target_id} offset")
+        expected_address = module_base + offset
+        if trace_address != expected_address:
+            raise SysAgentProtocolError(
+                f"trace target {target_id} address mismatch: "
+                f"trace has 0x{trace_address:X}, profile expects "
+                f"0x{expected_address:X}")
+        process_spec = process_specs[str(target["process"])]
+        expected = process_spec.get("expect", {})
+        expected = expected if isinstance(expected, dict) else {}
+        expected_title = (
+            process_spec.get("titleId", expected.get("titleId")))
+        actual_title = process.get("titleId")
+        if expected_title is not None:
+            try:
+                parsed_actual_title = int(str(actual_title), 16)
+            except (TypeError, ValueError):
+                parsed_actual_title = None
+            if (parsed_actual_title
+                    != _profile_hex_id(expected_title, "expected titleId")):
+                raise SysAgentProtocolError(
+                    f"trace target {target_id} title ID does not match the profile")
+        expected_build = expected.get("buildId")
+        actual_build = process.get("buildId")
+        if (expected_build and (
+                not isinstance(actual_build, str)
+                or not actual_build.upper().startswith(str(expected_build).upper()))):
+            raise SysAgentProtocolError(
+                f"trace target {target_id} build ID does not match the profile")
+        address_by_id[target_id] = trace_address
+        resolved_targets.append({
+            "id": target_id,
+            "index": index,
+            "processId": target.get("process"),
+            "pid": process.get("pid"),
+            "titleId": process.get("titleId"),
+            "buildId": process.get("buildId"),
+            "address": f"0x{trace_address:X}",
+            "offset": f"0x{offset:X}",
+        })
+
+    pairs: list[dict[str, object]] = []
+    numeric_pairs: list[tuple[int, int]] = []
+    for raw_pair in _profile_list(profile.get("pairs", []), "pairs"):
+        pair = _profile_object(raw_pair, "pair")
+        entry_id = str(pair["entry"])
+        return_id = str(pair["return"])
+        numeric_pairs.append((address_by_id[entry_id], address_by_id[return_id]))
+        pairs.append({"entryId": entry_id, "returnId": return_id})
+
+    report = analyze_trace_documents([document], numeric_pairs)
+    raw_pair_reports = report.get("pairs")
+    assert isinstance(raw_pair_reports, list)
+    for pair, pair_report in zip(pairs, raw_pair_reports):
+        assert isinstance(pair_report, dict)
+        pair_report.update(pair)
+        calls = pair_report.get("calls")
+        assert isinstance(calls, list)
+        first_nonzero = None
+        for call in calls:
+            assert isinstance(call, dict)
+            result = _trace_address(call.get("x0"))
+            call["returnX0"] = call.get("x0")
+            call["x0NonZero"] = result is not None and result != 0
+            if first_nonzero is None and result not in (None, 0):
+                first_nonzero = call.get("x0")
+        pair_report["firstNonZeroX0"] = first_nonzero
+    report["profile"] = {
+        "schemaVersion": profile["schemaVersion"],
+        "name": profile.get("name"),
+    }
+    report["targets"] = resolved_targets
+    return report
 
 
 def diff_trace_summaries(left: dict[str, object],
@@ -2601,7 +3136,8 @@ def _write_versioned_trace(output: str, metadata: dict[str, object],
             handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
-def _cmd_debug_trace_dump(client: SysAgentClient, args: argparse.Namespace) -> None:
+def _export_single_trace(client: SysAgentClient,
+                         output: str) -> tuple[int, str]:
     client.timeout = max(client.timeout, 30.0)
     before = require_ok(client.command("debug trace-status", retry=True))
     ring_count = parse_int(before.get("ringCount", "0"))
@@ -2621,12 +3157,21 @@ def _cmd_debug_trace_dump(client: SysAgentClient, args: argparse.Namespace) -> N
         raise SysAgentProtocolError(
             "the trace ring changed during dump; stop the trace first and retry")
 
-    output = args.output or f"trace-{int(time.time())}.jsonl"
     session_id = (
         f"{int(time.time() * 1000):x}-"
         f"{before.get('pid', '0')}-"
         f"{before.get('address', '0')}")
     process = _trace_process_metadata(client, before.get("pid", "0"))
+    target_count = parse_int(before.get("targetCount", "1"))
+    target_addresses: dict[int, str] = {}
+    for entry in before.get("targets", "").split(","):
+        if not entry or ":" not in entry:
+            continue
+        index_text, address_text = entry.split(":", 1)
+        try:
+            target_addresses[int(index_text)] = address_text
+        except ValueError:
+            continue
     metadata = {
         "record": "meta",
         "schemaVersion": TRACE_SCHEMA_VERSION,
@@ -2636,14 +3181,24 @@ def _cmd_debug_trace_dump(client: SysAgentClient, args: argparse.Namespace) -> N
         "host": client.host,
         "status": {key: value for key, value in before.items() if key != "ok"},
         "process": process,
-        "targets": [{
-            "index": 0,
-            "address": before.get("address", "0"),
-            "process": process,
-        }],
+        "targets": [
+            {
+                "index": index,
+                "address": target_addresses.get(
+                    index, before.get("address", "0") if index == 0 else "0"),
+                "process": process,
+            }
+            for index in range(max(1, target_count))
+        ],
     }
     _write_versioned_trace(output, metadata, events)
-    print(f"{output} ({len(events)} events, session={session_id})")
+    return len(events), session_id
+
+
+def _cmd_debug_trace_dump(client: SysAgentClient, args: argparse.Namespace) -> None:
+    output = args.output or f"trace-{int(time.time())}.jsonl"
+    event_count, session_id = _export_single_trace(client, output)
+    print(f"{output} ({event_count} events, session={session_id})")
 
 
 def _cmd_debug_multitrace(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -2699,8 +3254,8 @@ def _cmd_debug_multitrace_stop(client: SysAgentClient,
     _emit(require_ok(client.command("debug multitrace-stop")), args)
 
 
-def _cmd_debug_multitrace_dump(client: SysAgentClient,
-                               args: argparse.Namespace) -> None:
+def _export_multitrace(client: SysAgentClient,
+                       output: str) -> tuple[int, str]:
     client.timeout = max(client.timeout, 30.0)
     before = require_ok(client.command("debug multitrace-status", retry=True))
     ring_count = parse_int(before.get("ringCount", "0"))
@@ -2741,7 +3296,6 @@ def _cmd_debug_multitrace_dump(client: SysAgentClient,
     if any(value not in (0, 1) for value in target_processes[:target_count]):
         raise SysAgentProtocolError(
             "multitrace target process map contains an unknown process")
-    output = args.output or f"multitrace-{int(time.time())}.jsonl"
     session_id = (
         f"{int(time.time() * 1000):x}-"
         f"{before.get('pid0', '0')}-{before.get('pid1', '0')}")
@@ -2764,7 +3318,194 @@ def _cmd_debug_multitrace_dump(client: SysAgentClient,
         ],
     }
     _write_versioned_trace(output, metadata, events)
-    print(f"{output} ({len(events)} events, session={session_id})")
+    return len(events), session_id
+
+
+def _cmd_debug_multitrace_dump(client: SysAgentClient,
+                               args: argparse.Namespace) -> None:
+    output = args.output or f"multitrace-{int(time.time())}.jsonl"
+    event_count, session_id = _export_multitrace(client, output)
+    print(f"{output} ({event_count} events, session={session_id})")
+
+
+def _trace_profile_options(profile: dict[str, object],
+                           args: argparse.Namespace) -> dict[str, int | None]:
+    configured = profile.get("trace", {})
+    configured = configured if isinstance(configured, dict) else {}
+    options = {
+        name: configured.get(name)
+        for name in ("hits", "ring", "duration", "args")
+    }
+    for name in options:
+        value = getattr(args, name, None)
+        if value is not None:
+            options[name] = value
+    if options["hits"] is not None and int(options["hits"]) < 0:
+        raise ValueError("hits must be non-negative")
+    if options["hits"] == 0 and options["ring"] is None:
+        raise ValueError("hits 0 (unlimited) requires a ring")
+    if (options["ring"] is not None
+            and not 1 <= int(options["ring"]) <= 64):
+        raise ValueError("ring must be in 1..64")
+    if options["duration"] is not None and int(options["duration"]) < 0:
+        raise ValueError("duration must be non-negative")
+    if options["args"] is not None and not 0 <= int(options["args"]) <= 8:
+        raise ValueError("args must be in 0..8")
+    return {name: (int(value) if value is not None else None)
+            for name, value in options.items()}
+
+
+def _start_plan_trace(client: SysAgentClient, plan: dict[str, object],
+                      options: dict[str, int | None]) -> dict[str, str]:
+    processes = _profile_list(plan["processes"], "plan processes")
+    targets = _profile_list(plan["targets"], "plan targets")
+    parts: list[str]
+    if plan["mode"] == "single":
+        address_args = [
+            str(_profile_object(target, "plan target")["address"])
+            for target in targets
+        ]
+        parts = ["debug", "trace", *address_args]
+        process = _profile_object(processes[0], "plan process")
+        parts.append(f"pid=0x{int(process['pid']):X}")
+    else:
+        if len(processes) != 2 or len(targets) != 4:
+            raise ValueError("multitrace plans need two processes and four targets")
+        primary0 = _profile_object(targets[0], "plan target")
+        primary1 = _profile_object(targets[1], "plan target")
+        secondary0 = _profile_object(targets[2], "plan target")
+        secondary1 = _profile_object(targets[3], "plan target")
+        process0 = _profile_object(processes[0], "plan process")
+        process1 = _profile_object(processes[1], "plan process")
+        parts = [
+            "debug", "multitrace",
+            f"0x{int(process0['pid']):X}", str(primary0["address"]),
+            f"0x{int(process1['pid']):X}", str(primary1["address"]),
+            "also", str(secondary0["address"]), str(secondary1["address"]),
+        ]
+    for name in ("hits", "ring", "duration", "args"):
+        value = options.get(name)
+        if value is not None:
+            parts.extend((name, str(value)))
+    client.timeout = max(client.timeout, 30.0)
+    return require_ok(client.command(" ".join(parts)))
+
+
+def _wait_for_plan_trace(client: SysAgentClient, mode: str,
+                         timeout_seconds: float) -> dict[str, str]:
+    if timeout_seconds <= 0:
+        raise ValueError("wait timeout must be positive")
+    command = (
+        "debug trace-status" if mode == "single"
+        else "debug multitrace-status")
+    deadline = time.monotonic() + timeout_seconds
+    client.timeout = max(client.timeout, 30.0)
+    while time.monotonic() < deadline:
+        status = require_ok(client.command(command, retry=True))
+        last_error = parse_int(status.get("lastError", "0"))
+        if last_error:
+            raise SysAgentProtocolError(
+                f"trace failed in stage {status.get('stage', '')}: "
+                f"result=0x{last_error:X}")
+        if status.get("active") != "1":
+            return status
+        time.sleep(0.25)
+    stop_command = (
+        "debug trace-stop" if mode == "single"
+        else "debug multitrace-stop")
+    try:
+        client.command(stop_command)
+    except (OSError, SysAgentProtocolError):
+        pass
+    raise SysAgentProtocolError(
+        f"trace did not finish within {timeout_seconds:g} seconds")
+
+
+def _cmd_debug_trace_plan(client: SysAgentClient,
+                          args: argparse.Namespace) -> None:
+    profile = load_trace_profile(args.profile)
+    plan = resolve_trace_profile(client, profile)
+    payload = json.dumps(plan, indent=2, sort_keys=True)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            handle.write(payload + "\n")
+        print(args.out)
+    else:
+        print(payload)
+
+
+def _cmd_debug_trace_run(client: SysAgentClient,
+                         args: argparse.Namespace) -> None:
+    profile = load_trace_profile(args.profile)
+    plan = resolve_trace_profile(client, profile)
+    options = _trace_profile_options(profile, args)
+    started = _start_plan_trace(client, plan, options)
+    if not args.wait and not args.output:
+        _emit(started, args)
+        return
+
+    duration = options.get("duration")
+    default_wait = 90.0 if duration is None else max(30.0, duration + 15.0)
+    wait_timeout = args.wait_timeout if args.wait_timeout is not None else default_wait
+    status = _wait_for_plan_trace(client, str(plan["mode"]), wait_timeout)
+    output_path = args.output
+    if output_path:
+        if plan["mode"] == "single":
+            event_count, session_id = _export_single_trace(client, output_path)
+        else:
+            event_count, session_id = _export_multitrace(client, output_path)
+    else:
+        event_count = parse_int(status.get("hitCount", "0"))
+        session_id = ""
+    result = {
+        "ok": "OK",
+        "mode": str(plan["mode"]),
+        "started": started.get("state", started.get("active", "started")),
+        "events": str(event_count),
+        "session": session_id,
+        "output": output_path or "",
+        "plan": plan,
+        "status": status,
+    }
+    if args.json or args.out:
+        _emit(result, args)
+    else:
+        print(
+            f"ok=OK mode={result['mode']} started={result['started']} "
+            f"events={result['events']} output={result['output']} "
+            f"stage={status.get('stage', '')} "
+            f"lastError={status.get('lastError', '0x0')}")
+
+
+def _cmd_debug_trace_report(client: SysAgentClient,
+                            args: argparse.Namespace) -> None:
+    del client
+    profile = load_trace_profile(args.profile)
+    documents = load_trace_jsonl([args.trace])
+    if len(documents) != 1:
+        raise SysAgentProtocolError("trace-report needs exactly one trace file")
+    report = report_trace_with_profile(documents[0], profile)
+    if args.json or args.out:
+        _emit(report, args)
+        return
+    summary = report["summary"]
+    assert isinstance(summary, dict)
+    print(
+        f"profile={report['profile']['name']} "
+        f"events={summary['eventCount']} threads={summary['threadCount']}")
+    for pair in report["pairs"]:
+        assert isinstance(pair, dict)
+        print(
+            f"pair {pair['entryId']}->{pair['returnId']} "
+            f"matched={pair['matched']} unmatchedEntries={pair['unmatchedEntries']} "
+            f"firstNonZeroX0={pair['firstNonZeroX0']}")
+        calls = pair["calls"]
+        assert isinstance(calls, list)
+        for call in calls:
+            assert isinstance(call, dict)
+            print(
+                f"  thread={call['thread']} entrySeq={call['entrySeq']} "
+                f"returnSeq={call['returnSeq']} x0={call['returnX0']}")
 
 
 def _cmd_debug_trace_analyze(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -3224,6 +3965,49 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 (Arg("output", "output JSONL path "
                                "(default: multitrace-<unix time>.jsonl)",
                      flags=("--output",), default=None),)),
+        Command("trace-plan", "Resolve a trace profile against the running console",
+                _cmd_debug_trace_plan,
+                (Arg("profile", "versioned trace profile JSON", metavar="PROFILE"),
+                 OUT_ARG),
+                "\n".join((
+                    "Validates process identities, modules and Build IDs, then",
+                    "prints the resolved PIDs and absolute target addresses as JSON.",
+                    "The profile remains game-independent; consumer repositories",
+                    "provide the actual modules, offsets and target roles.",
+                ))),
+        Command("trace-run", "Arm a trace from a versioned profile",
+                _cmd_debug_trace_run,
+                (Arg("profile", "versioned trace profile JSON", metavar="PROFILE"),
+                 Arg("hits", "total-hit safety limit; 0 means unlimited with --ring",
+                     type=parse_int, default=None, flags=("--hits",)),
+                 Arg("ring", "keep the most recent N hits (1..64)",
+                     type=parse_int, default=None, flags=("--ring",)),
+                 Arg("duration", "failsafe duration in seconds; 0 means unlimited",
+                     type=parse_int, default=None, flags=("--duration",)),
+                 Arg("args", "capture x0 through x(N-1), N=0..8",
+                     type=parse_int, default=None, flags=("--args",)),
+                 Arg("wait", "wait for the trace to finish before returning",
+                     action="store_true", default=False, flags=("--wait",)),
+                 Arg("wait_timeout", "maximum seconds to wait for completion",
+                     type=float, default=None, flags=("--wait-timeout",)),
+                 Arg("output", "wait for completion and write versioned JSONL",
+                     flags=("--output",), default=None),
+                 JSON_ARG, OUT_ARG),
+                "\n".join((
+                    "Resolves the profile immediately, then arms the matching",
+                    "single-process or dual-process hardware trace.",
+                    "--output implies --wait and additionally exports the retained ring.",
+                ))),
+        Command("trace-report", "Correlate a trace with its profile target roles",
+                _cmd_debug_trace_report,
+                (Arg("trace", "versioned trace JSONL", metavar="TRACE"),
+                 Arg("profile", "profile used for the trace", metavar="PROFILE"),
+                 JSON_ARG, OUT_ARG),
+                "\n".join((
+                    "Matches profile offsets against the module bases recorded in",
+                    "the trace, reports entry/return pairs and identifies each call's",
+                    "return-time x0 plus the first non-zero x0.",
+                ))),
         Command("trace-dump", "Write retained trace events to a JSONL file",
                 _cmd_debug_trace_dump,
                 (Arg("output", "output JSONL path (default: trace-<unix time>.jsonl)",

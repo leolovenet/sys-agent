@@ -33,6 +33,10 @@ class FakeState:
         self.commands: list[list[str]] = []
         self.addresses = [0x80000010, 0x80000120, 0x80000230]
         self.application_running = True
+        self.processes = {
+            0x1234: "01006F8002326000",
+            0x6C: "010000000000001E",
+        }
         self.late_diagnostic = False
         self.ticket_hex: str | None = None
         self.last_key_register: list[str] | None = None
@@ -44,6 +48,7 @@ class FakeState:
         self.repeat_support = True
         self.sequence_error = False
         self.trace_busy = False
+        self.trace_target_addresses = [0x2B00001000]
         # An older sysmodule has only `configure <name> <value>` and stays silent for a
         # read (`configure <name>`), which is what makes the client hit its socket timeout.
         self.silent_configure = False
@@ -64,7 +69,34 @@ class FakeHandler(socketserver.StreamRequestHandler):
             state.last_command = command
             state.commands.append(command)
             if command[0] == "debug":
-                if command[1] == "trace":
+                if command[1] == "modules":
+                    pid = int(command[2], 16)
+                    if pid == 0x1234:
+                        response = (
+                            "OK pid=0x1234 count=2 reported=2 truncated=0 "
+                            "modules=0=0x29083FE000+0x6000:build=AAAA,"
+                            "1=0x2908406000+0x5A06000:"
+                            "build=FF1D1C05670DB6021C85B624A710B963")
+                    elif pid == 0x6C:
+                        response = (
+                            "OK pid=0x6C count=1 reported=1 truncated=0 "
+                            "modules=0=0x30000000+0x4F8000:"
+                            "build=C43E2FD4D46907A4033858194F552FCC5A2B089B")
+                    else:
+                        response = (
+                            "OK pid=%016X count=1 reported=1 truncated=0 "
+                            "modules=0=0x2B000000+0x100000:build=AABB" % pid)
+                elif command[1] == "maps":
+                    pid = int(command[2], 16)
+                    if pid == 0x1234:
+                        base, size = 0x2908406000, 0x5A06000
+                    else:
+                        base, size = 0x30000000, 0x4F8000
+                    response = (
+                        f"OK pid=0x{pid:X} count=1 limit={command[3]} "
+                        f"truncated=0 dmntClosed=0 "
+                        f"maps=0=0x{base:X}+0x{size:X}:t3/p5")
+                elif command[1] == "trace":
                     if state.trace_busy:
                         response = "ERR code=TRACE_BUSY result=0x0 stage="
                     else:
@@ -74,9 +106,15 @@ class FakeHandler(socketserver.StreamRequestHandler):
                             "dmntClosed=0"
                         )
                 elif command[1] == "trace-status":
+                    target_text = ",".join(
+                        f"{index}:0x{address:X}"
+                        for index, address in enumerate(
+                            state.trace_target_addresses))
                     response = (
                         "OK active=1 armed=1 stale=0 memoryBlocked=1 dmntClosed=0 "
-                        "pid=0000000000000071 address=0000002B00001000 maxHits=1 "
+                        "pid=0000000000000071 address=0000002B00001000 "
+                        f"targetCount={len(state.trace_target_addresses)} "
+                        f"targets={target_text} maxHits=1 "
                         "hitCount=1 duration=60 startedTick=100 ring=0 ringCount=0 "
                         "overwritten=0 args=8 ctxSlot=1 insnSlot=0 lastSeq=1 "
                         "lastPc=0000002B00001000 lastLr=0000002B00001004 "
@@ -166,7 +204,15 @@ class FakeHandler(socketserver.StreamRequestHandler):
                             "buildId=FF1D1C05670DB6021C85B624A710B963 sample=1 "
                             "errors=field:0x0")
             elif command[0] == "processList":
-                response = f"OK total=3 offset={command[1]} count=1 processes=1:2"
+                offset = int(command[1])
+                count = int(command[2])
+                entries = list(state.processes.items())
+                page = entries[offset:offset + count]
+                encoded = ",".join(
+                    f"{pid:016X}:{title_id}" for pid, title_id in page)
+                response = (
+                    f"OK total={len(entries)} captured={len(page)} "
+                    f"offset={offset} count={len(page)} processes={encoded}")
             elif command[0] in {"systemReboot", "systemRebootEmuMMC", "systemShutdown", "systemSleep",
                                "applicationTerminate"}:
                 response = f"OK action={command[0]}"
@@ -599,9 +645,33 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(metadata["record"], "meta")
             self.assertEqual(metadata["schemaVersion"], 1)
             self.assertIn("sessionId", metadata)
+            self.assertEqual(len(metadata["targets"]), 1)
             self.assertEqual(event["record"], "event")
             self.assertEqual(event["pc"], "0000002B00001000")
             self.assertNotIn("ok", event)
+
+    def test_debug_trace_dump_preserves_multiple_targets(self) -> None:
+        import json
+        import tempfile
+        from client.sysagent import main
+
+        self.server.state.trace_target_addresses = [
+            0x2B00001000,
+            0x2B00002000,
+            0x2B00003000,
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "trace.jsonl")
+            self.assertEqual(main([
+                "--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1",
+                "debug", "trace-dump", "--output", output,
+            ]), 0)
+            with open(output, encoding="utf-8") as handle:
+                metadata = json.loads(handle.readline())
+            self.assertEqual(len(metadata["targets"]), 3)
+            self.assertEqual(
+                metadata["targets"][2]["address"], "0x2B00003000")
 
     def test_debug_multitrace_cli_and_dump(self) -> None:
         import json
@@ -638,6 +708,164 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(metadata["targets"][2]["processIndex"], 0)
             self.assertEqual(metadata["targets"][3]["processIndex"], 1)
             self.assertEqual(event["target"], "3")
+
+    def test_trace_profile_plan_run_and_report(self) -> None:
+        import json
+        import tempfile
+        from client.sysagent import (load_trace_profile, main,
+                                     report_trace_with_profile,
+                                     resolve_trace_profile)
+
+        profile_data = {
+            "schemaVersion": 1,
+            "name": "client-server-entry-return",
+            "processes": [
+                {
+                    "id": "client",
+                    "foreground": True,
+                    "expect": {
+                        "titleId": "01006F8002326000",
+                        "buildId": "FF1D1C05670DB6021C85B624A710B963",
+                    },
+                },
+                {
+                    "id": "server",
+                    "titleId": "010000000000001E",
+                    "mainModuleIndex": 0,
+                    "expect": {
+                        "buildId": "C43E2FD4D46907A4033858194F552FCC5A2B089B",
+                    },
+                },
+            ],
+            "targets": [
+                {"id": "client-entry", "process": "client",
+                 "offset": "0x3DB65C0"},
+                {"id": "server-entry", "process": "server",
+                 "offset": "0x162620"},
+                {"id": "client-return", "process": "client",
+                 "offset": "0x3BA05D4"},
+                {"id": "server-return", "process": "server",
+                 "offset": "0x3C2FC"},
+            ],
+            "pairs": [
+                {"entry": "client-entry", "return": "client-return"},
+                {"entry": "server-entry", "return": "server-return"},
+            ],
+            "trace": {"hits": 16, "ring": 16, "duration": 20, "args": 8},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            profile_path = os.path.join(directory, "profile.json")
+            plan_path = os.path.join(directory, "plan.json")
+            with open(profile_path, "w", encoding="utf-8") as handle:
+                json.dump(profile_data, handle)
+            profile = load_trace_profile(profile_path)
+            with self.client() as client:
+                plan = resolve_trace_profile(client, profile)
+            self.assertEqual(plan["mode"], "multitrace")
+            self.assertEqual([target["id"] for target in plan["targets"]], [
+                "client-entry", "server-entry", "client-return", "server-return"])
+            self.assertEqual(plan["targets"][0]["address"], "0x290C1BC5C0")
+            self.assertEqual(plan["targets"][1]["address"], "0x30162620")
+
+            base = ["--host", "127.0.0.1", "--port",
+                    str(self.server.server_address[1]), "--timeout", "1",
+                    "debug", "trace-plan", profile_path]
+            self.assertEqual(main(base + ["--out", plan_path]), 0)
+            with open(plan_path, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle)["kind"], "trace-plan")
+
+            run_base = ["--host", "127.0.0.1", "--port",
+                        str(self.server.server_address[1]), "--timeout", "1",
+                        "debug", "trace-run", profile_path]
+            self.assertEqual(main(run_base), 0)
+            self.assertEqual(self.server.state.last_command[:7], [
+                "debug", "multitrace", "0x1234", "0x290C1BC5C0",
+                "0x6C", "0x30162620", "also"])
+            trace_output = os.path.join(directory, "profile-trace.jsonl")
+            self.assertEqual(main(run_base + ["--output", trace_output]), 0)
+            with open(trace_output, encoding="utf-8") as handle:
+                self.assertEqual(json.loads(handle.readline())["kind"], "multitrace")
+
+            client_process = {
+                "pid": "0000000000001234",
+                "titleId": "01006F8002326000",
+                "moduleBase": "0x2908406000",
+                "buildId": profile_data["processes"][0]["expect"]["buildId"],
+            }
+            server_process = {
+                "pid": "000000000000006C",
+                "titleId": "010000000000001E",
+                "moduleBase": "0x30000000",
+                "buildId": profile_data["processes"][1]["expect"]["buildId"],
+            }
+            metadata = {
+                "record": "meta",
+                "schemaVersion": 1,
+                "sessionId": "profile-test",
+                "targets": [
+                    {"index": index, "address": target["address"],
+                     "processIndex": 0 if process is client_process else 1,
+                     "process": process}
+                    for index, target, process in zip(
+                        range(4), plan["targets"],
+                        (client_process, server_process,
+                         client_process, server_process))
+                ],
+            }
+            events = [
+                {"seq": "1", "tick": "100", "thread": "AA", "target": "0",
+                 "targetAddress": plan["targets"][0]["address"],
+                 "pc": plan["targets"][0]["address"], "x0": "0"},
+                {"seq": "2", "tick": "200", "thread": "AA", "target": "2",
+                 "targetAddress": plan["targets"][2]["address"],
+                 "pc": plan["targets"][2]["address"], "x0": "1234"},
+                {"seq": "3", "tick": "300", "thread": "BB", "target": "1",
+                 "targetAddress": plan["targets"][1]["address"],
+                 "pc": plan["targets"][1]["address"], "x0": "5678"},
+                {"seq": "4", "tick": "400", "thread": "BB", "target": "3",
+                 "targetAddress": plan["targets"][3]["address"],
+                 "pc": plan["targets"][3]["address"], "x0": "167B"},
+            ]
+            report = report_trace_with_profile(
+                {"metadata": metadata, "events": events, "path": "trace.jsonl"},
+                profile)
+            self.assertEqual(report["pairs"][0]["entryId"], "client-entry")
+            self.assertEqual(report["pairs"][1]["firstNonZeroX0"], "167B")
+            self.assertEqual(report["pairs"][1]["calls"][0]["x0NonZero"], True)
+
+            trace_path = os.path.join(directory, "trace.jsonl")
+            with open(trace_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(metadata) + "\n")
+                for event in events:
+                    handle.write(json.dumps({
+                        "record": "event", "schemaVersion": 1, **event,
+                    }) + "\n")
+            self.assertEqual(main([
+                "--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1",
+                "debug", "trace-report", trace_path, profile_path]), 0)
+
+            single_profile = {
+                "schemaVersion": 1,
+                "name": "single-process",
+                "processes": [{"id": "client", "foreground": True}],
+                "targets": [
+                    {"id": "a", "process": "client", "offset": "0x3DB65C0"},
+                    {"id": "b", "process": "client", "offset": "0x3DB65C4"},
+                    {"id": "c", "process": "client", "offset": "0x3DB65C8"},
+                ],
+                "trace": {"hits": 4, "ring": 4, "duration": 5, "args": 2},
+            }
+            single_path = os.path.join(directory, "single.json")
+            with open(single_path, "w", encoding="utf-8") as handle:
+                json.dump(single_profile, handle)
+            self.assertEqual(main([
+                "--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1",
+                "debug", "trace-run", single_path]), 0)
+            self.assertEqual(self.server.state.last_command[:6], [
+                "debug", "trace", "0x290C1BC5C0", "0x290C1BC5C4",
+                "0x290C1BC5C8", "pid=0x1234"])
 
     def test_trace_analyze_and_diff(self) -> None:
         import json
