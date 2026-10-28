@@ -144,7 +144,7 @@ python3 client/sysagent.py --host switch debug multitrace-dump --output multi.js
 python3 client/sysagent.py debug trace-analyze trace.jsonl \
   --pair 0x...:0x... --json
 python3 client/sysagent.py debug trace-diff before.jsonl after.jsonl
-python3 client/sysagent.py debug trace-ipc trace.jsonl --json
+python3 client/sysagent.py debug trace-ipc trace.jsonl --profile profile.json --json
 python3 client/sysagent.py debug ipc-decode HEX_BYTES --mode request
 python3 client/sysagent.py --host switch debug trace-plan profile.json
 python3 client/sysagent.py --host switch debug trace-run profile.json \
@@ -194,7 +194,8 @@ trigger the operation.
 headers. It reports the target/thread/sequence, command ID for requests, Result for responses,
 token, domain metadata and payload. When the trace metadata contains profile pairs, matching
 request/response records are also emitted as transactions. `ipc-decode` applies the same parser
-to one raw hex message.
+to one raw hex message. `trace-ipc --profile` can supply target IDs and consumer-defined
+service/interface/command labels for manually dumped traces.
 
 ## Controller
 

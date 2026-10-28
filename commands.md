@@ -442,7 +442,8 @@ game-specific offsets.
 
 ```bash
 python3 client/sysagent.py debug ipc-decode HEX_BYTES --mode request
-python3 client/sysagent.py debug trace-ipc trace.jsonl --snapshot 0 --json
+python3 client/sysagent.py debug trace-ipc trace.jsonl --snapshot 0 \
+  --profile profile.json --json
 ```
 
 `ipc-decode` parses the HIPC header, special header, handles, static/buffer descriptors,
@@ -451,6 +452,8 @@ CMIF domain header and the `SFCI`/`SFCO` four-word header. Requests expose `comm
 same decoded structure plus event seq/target/thread. If the trace has profile pair metadata,
 it also correlates request and response records into transactions. These commands interpret
 raw protocol bytes only and do not assign service-specific meanings to Command IDs.
+Optional profile `ipc` metadata can attach consumer-supplied service, interface-hash and
+Command-ID names to those transactions.
 
 The same ownership rules as `debug watch` apply. For the foreground application, an existing
 `dmnt:cht` handle is closed when necessary and later memory commands reattach it. A trace of a

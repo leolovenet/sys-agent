@@ -916,6 +916,11 @@ class ClientTests(unittest.TestCase):
                 "pairs": [{
                     "entry": "account-entry",
                     "return": "account-return",
+                    "ipc": {
+                        "service": "test-service",
+                        "interfaceHash": "0x11223344",
+                        "commands": {"8": "TestCommand"},
+                    },
                 }],
             },
             "targets": [
@@ -961,6 +966,9 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(report["summary"]["transactionCount"], 1)
         self.assertEqual(report["records"][0]["targetId"], "account-entry")
         self.assertEqual(report["transactions"][0]["commandId"], 8)
+        self.assertEqual(report["transactions"][0]["commandName"], "TestCommand")
+        self.assertEqual(report["transactions"][0]["service"], "test-service")
+        self.assertEqual(report["transactions"][0]["interfaceHash"], "0x11223344")
         self.assertEqual(report["transactions"][0]["result"], "0x167B")
 
         with tempfile.TemporaryDirectory() as directory:

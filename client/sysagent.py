@@ -1940,6 +1940,29 @@ def load_trace_profile(path: str) -> dict[str, object]:
         if entry_process != return_process:
             raise ValueError(
                 f"pairs[{index}] entry and return must belong to the same process")
+        if "ipc" in pair:
+            ipc = _profile_object(pair["ipc"], f"pairs[{index}].ipc")
+            protocol = ipc.get("protocol", "cmif")
+            if protocol != "cmif":
+                raise ValueError(
+                    f"pairs[{index}].ipc.protocol currently supports only cmif")
+            if "service" in ipc and (
+                    not isinstance(ipc["service"], str) or not ipc["service"]):
+                raise ValueError(
+                    f"pairs[{index}].ipc.service must be a non-empty string")
+            if "interfaceHash" in ipc:
+                _profile_hex_id(
+                    ipc["interfaceHash"],
+                    f"pairs[{index}].ipc.interfaceHash")
+            commands = ipc.get("commands", {})
+            commands = _profile_object(
+                commands, f"pairs[{index}].ipc.commands")
+            for command_id, command_name in commands.items():
+                parse_int(str(command_id))
+                if not isinstance(command_name, str) or not command_name:
+                    raise ValueError(
+                        f"pairs[{index}].ipc.commands[{command_id}] "
+                        "must be a non-empty string")
 
     trace_options = profile.get("trace", {})
     if trace_options is not None:
@@ -2472,7 +2495,8 @@ def decode_hipc_cmif(data: bytes, mode: str = "auto") -> dict[str, object]:
 
 
 def decode_trace_ipc(documents: Sequence[dict[str, object]],
-                     snapshot_index: int | None = None
+                     snapshot_index: int | None = None,
+                     profile: dict[str, object] | None = None
                      ) -> dict[str, object]:
     """Decode CMIF/HIPC snapshots embedded in versioned trace events."""
     records: list[dict[str, object]] = []
@@ -2490,18 +2514,46 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
             for target in targets
             if isinstance(target, dict)
         } if isinstance(targets, list) else {}
-        profile = metadata.get("profile")
-        profile = profile if isinstance(profile, dict) else {}
-        pair_for_target: dict[str, tuple[str, str]] = {}
-        for pair in profile.get("pairs", []):
+        if profile is not None:
+            for index, raw_target in enumerate(_profile_target_order(profile)):
+                target = _profile_object(raw_target, "profile target")
+                trace_target = target_metadata.get(str(index))
+                if not isinstance(trace_target, dict):
+                    raise SysAgentProtocolError(
+                        f"trace has no target index {index} for {target['id']}")
+                process = _profile_object(
+                    trace_target.get("process"), "trace target process")
+                module_base = _trace_address(process.get("moduleBase"))
+                trace_address = _trace_address(trace_target.get("address"))
+                offset = _profile_offset(
+                    target.get("offset"), f"target {target['id']} offset")
+                if (module_base is None or trace_address is None
+                        or module_base + offset != trace_address):
+                    raise SysAgentProtocolError(
+                        f"trace target index {index} does not match profile "
+                        f"target {target['id']}")
+                target_metadata[str(index)] = {
+                    **trace_target,
+                    "id": target["id"],
+                    "processId": target["process"],
+                }
+            profile_pairs = _profile_list(profile.get("pairs", []), "pairs")
+        else:
+            embedded = metadata.get("profile")
+            embedded = embedded if isinstance(embedded, dict) else {}
+            profile_pairs = embedded.get("pairs", [])
+            if not isinstance(profile_pairs, list):
+                profile_pairs = []
+        pair_for_target: dict[str, dict[str, object]] = {}
+        for pair in profile_pairs:
             if not isinstance(pair, dict):
                 continue
             entry_id = str(pair.get("entry", ""))
             return_id = str(pair.get("return", ""))
             if entry_id:
-                pair_for_target[entry_id] = (entry_id, return_id)
+                pair_for_target[entry_id] = pair
             if return_id:
-                pair_for_target[return_id] = (entry_id, return_id)
+                pair_for_target[return_id] = pair
         events = document.get("events")
         if not isinstance(events, list):
             continue
@@ -2545,7 +2597,8 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
                 cmif = record["cmif"]
                 assert isinstance(cmif, dict)
                 if pair is not None:
-                    entry_id, return_id = pair
+                    entry_id = str(pair["entry"])
+                    return_id = str(pair["return"])
                     key = (session_id, str(event.get("thread", "0")),
                         entry_id, return_id)
                     if target_id == entry_id and cmif["mode"] == "request":
@@ -2560,6 +2613,22 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
                             response_header = cmif["header"]
                             assert isinstance(request_header, dict)
                             assert isinstance(response_header, dict)
+                            ipc_metadata = pair.get("ipc", {})
+                            ipc_metadata = (
+                                ipc_metadata
+                                if isinstance(ipc_metadata, dict) else {})
+                            command_id = request_header.get("commandId")
+                            command_name = None
+                            commands = ipc_metadata.get("commands", {})
+                            if isinstance(commands, dict):
+                                for key_id, label in commands.items():
+                                    if parse_int(str(key_id)) == command_id:
+                                        command_name = label
+                                        break
+                            interface_hash = ipc_metadata.get("interfaceHash")
+                            if interface_hash is not None:
+                                interface_hash = (
+                                    f"0x{_profile_hex_id(interface_hash, 'interfaceHash'):X}")
                             transactions.append({
                                 "sessionId": session_id,
                                 "thread": event.get("thread"),
@@ -2569,7 +2638,10 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
                                 "returnSeq": record.get("seq"),
                                 "requestTick": request.get("tick"),
                                 "returnTick": record.get("tick"),
-                                "commandId": request_header.get("commandId"),
+                                "commandId": command_id,
+                                "commandName": command_name,
+                                "service": ipc_metadata.get("service"),
+                                "interfaceHash": interface_hash,
                                 "requestToken": request_header.get("token"),
                                 "responseToken": response_header.get("token"),
                                 "result": response_header.get("result"),
@@ -2822,7 +2894,13 @@ def report_trace_with_profile(document: dict[str, object],
         entry_id = str(pair["entry"])
         return_id = str(pair["return"])
         numeric_pairs.append((address_by_id[entry_id], address_by_id[return_id]))
-        pairs.append({"entryId": entry_id, "returnId": return_id})
+        pair_metadata = {
+            "entryId": entry_id,
+            "returnId": return_id,
+        }
+        if "ipc" in pair:
+            pair_metadata["ipc"] = pair["ipc"]
+        pairs.append(pair_metadata)
 
     report = analyze_trace_documents([document], numeric_pairs)
     raw_pair_reports = report.get("pairs")
@@ -3936,7 +4014,8 @@ def _cmd_debug_trace_ipc(client: SysAgentClient,
     if args.snapshot not in (None, 0, 1):
         raise ValueError("snapshot index must be 0 or 1")
     documents = load_trace_jsonl(args.traces)
-    report = decode_trace_ipc(documents, args.snapshot)
+    profile = load_trace_profile(args.profile) if args.profile else None
+    report = decode_trace_ipc(documents, args.snapshot, profile)
     if args.json or args.out:
         _emit(report, args)
         return
@@ -3966,7 +4045,10 @@ def _cmd_debug_trace_ipc(client: SysAgentClient,
             f"  transaction seq={transaction['requestSeq']}->{transaction['returnSeq']} "
             f"thread={transaction['thread']} "
             f"target={transaction['entryTarget']}->{transaction['returnTarget']} "
-            f"command={transaction['commandId']} result={transaction['result']}")
+            f"service={transaction['service']} "
+            f"interface={transaction['interfaceHash']} "
+            f"command={transaction['commandId']} "
+            f"name={transaction['commandName']} result={transaction['result']}")
 
 
 def _cmd_debug_trace_analyze(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -4492,6 +4574,8 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      metavar="TRACE"),
                  Arg("snapshot", "only inspect snapshot 0 or 1",
                      type=parse_int, default=None, flags=("--snapshot",)),
+                 Arg("profile", "attach target IDs and IPC semantics from a profile",
+                     default=None, flags=("--profile",)),
                  JSON_ARG, OUT_ARG),
                 "\n".join((
                     "Scans captured snapshots and reports every CMIF request or",

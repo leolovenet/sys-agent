@@ -56,7 +56,18 @@ marks each return-time `x0` as zero or non-zero.
     {"id": "server-return", "process": "server", "offset": "0x2010"}
   ],
   "pairs": [
-    {"entry": "client-entry", "return": "client-return"},
+    {
+      "entry": "client-entry",
+      "return": "client-return",
+      "ipc": {
+        "protocol": "cmif",
+        "service": "example-service",
+        "interfaceHash": "0x0123456789ABCDEF",
+        "commands": {
+          "8": "ExampleCommand"
+        }
+      }
+    },
     {"entry": "server-entry", "return": "server-return"}
   ],
   "trace": {
@@ -97,6 +108,9 @@ prefixes. A mismatch stops the command before any hardware breakpoint is armed.
 - Resolved absolute addresses must be unique because event routing uses the exception PC.
 - A pair names two target IDs owned by the same process. The return target should normally be
   the caller's return address or an actual return instruction.
+- A pair may attach optional `ipc` metadata. `service`, `interfaceHash` and a
+  `commands` ID-to-name table are supplied by the consumer; they are semantic labels, not
+  values guessed from the HIPC message.
 
 The client sends targets to `debug multitrace` in deterministic order:
 
@@ -162,7 +176,7 @@ may return a pointer or another integer instead.
 
 ```bash
 python3 client/sysagent.py debug ipc-decode HEX_BYTES --mode request
-python3 client/sysagent.py debug trace-ipc trace.jsonl --json
+python3 client/sysagent.py debug trace-ipc trace.jsonl --profile profile.json --json
 ```
 
 The decoder accepts a captured HIPC message beginning with its normal header. It handles the
@@ -177,7 +191,10 @@ Command ID has a particular service-specific meaning.
 For trace files produced by `trace-run --output`, the embedded profile pairs let `trace-ipc`
 combine matching request and response records into transactions. Each transaction reports the
 request/return sequences and ticks, thread, target IDs, Command ID, both tokens and the
-response Result. Unmatched requests and responses are counted separately.
+response Result. Consumer-provided service/interface/command labels are attached when present.
+Unmatched requests and responses are counted separately. `--profile` can supply target IDs and
+semantic labels for traces exported through plain `multitrace-dump`, where the profile was not
+embedded by `trace-run`.
 
 ## Current limits
 
