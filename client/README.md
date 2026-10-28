@@ -41,7 +41,7 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.8.0
+client    1.9.0
 sys-agent 2.20.0  (switch:6000)
 ```
 
@@ -206,6 +206,8 @@ token, domain metadata and payload. When the trace metadata contains profile pai
 request/response records are also emitted as transactions. `ipc-decode` applies the same parser
 to one raw hex message. `trace-ipc --profile` can supply target IDs and consumer-defined
 service/interface/command labels for manually dumped traces.
+CMIF domain object IDs are summarized with their observed time range, command/result counts,
+and request/response totals.
 
 `trace-timeline` merges multiple sessions from the same boot into one monotonic timeline,
 including decoded IPC messages and transactions. New exports carry `bootEpochUnixMs`; mixing

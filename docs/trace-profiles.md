@@ -254,6 +254,11 @@ Unmatched requests and responses are counted separately. `--profile` can supply 
 semantic labels for traces exported through plain `multitrace-dump`, where the profile was not
 embedded by `trace-run`.
 
+For CMIF domain requests, `trace-ipc` also emits `domainObjects`. Each object ID records its
+first/last observed tick, request and response counts, observed Command IDs and Result
+frequencies. This is an observed lifecycle summary, not proof that an object was destroyed when
+it stopped appearing.
+
 ## Current limits
 
 - Profiles capture HIPC/CMIF bytes but do not yet assign interface hashes or semantic names to

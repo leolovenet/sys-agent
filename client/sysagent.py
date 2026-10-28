@@ -21,7 +21,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.8.0"
+CLIENT_VERSION = "1.9.0"
 TRACE_SCHEMA_VERSION = 1
 TRACE_PROFILE_SCHEMA_VERSION = 2
 
@@ -2621,6 +2621,7 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
     """Decode CMIF/HIPC snapshots embedded in versioned trace events."""
     records: list[dict[str, object]] = []
     transactions: list[dict[str, object]] = []
+    domain_objects: dict[str, dict[str, object]] = {}
     skipped = 0
     pending_requests: dict[
         tuple[str, str, str, str], list[dict[str, object]]] = {}
@@ -2736,10 +2737,33 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
                     **decoded,
                 }
                 records.append(record)
+                cmif = decoded["cmif"]
+                assert isinstance(cmif, dict)
+                domain_header = cmif.get("domainHeader")
+                if (cmif.get("domain") and isinstance(domain_header, dict)
+                        and domain_header.get("objectId") is not None):
+                    object_id = str(domain_header["objectId"])
+                    object_record = domain_objects.setdefault(object_id, {
+                        "objectId": domain_header["objectId"],
+                        "firstTick": record.get("tick"),
+                        "lastTick": record.get("tick"),
+                        "requestCount": 0,
+                        "responseCount": 0,
+                        "commands": {},
+                        "results": {},
+                    })
+                    object_record["lastTick"] = record.get("tick")
+                    if cmif.get("mode") == "request":
+                        object_record["requestCount"] = (
+                            int(object_record["requestCount"]) + 1)
+                        header = cmif.get("header")
+                        if isinstance(header, dict) and "commandId" in header:
+                            command_key = str(header["commandId"])
+                            commands = object_record["commands"]
+                            assert isinstance(commands, dict)
+                            commands[command_key] = commands.get(command_key, 0) + 1
                 target_id = record.get("targetId")
                 pair = pair_for_target.get(str(target_id))
-                cmif = record["cmif"]
-                assert isinstance(cmif, dict)
                 if pair is not None:
                     entry_id = str(pair["entry"])
                     return_id = str(pair["return"])
@@ -2789,23 +2813,53 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
                                 "requestToken": request_header.get("token"),
                                 "responseToken": response_header.get("token"),
                                 "result": response_header.get("result"),
+                                "objectId": (
+                                    request_cmif.get("domainHeader", {}).get(
+                                        "objectId")
+                                    if isinstance(
+                                        request_cmif.get("domainHeader"), dict)
+                                    else None),
                                 "requestSnapshot": request.get("snapshot"),
                                 "responseSnapshot": record.get("snapshot"),
                             })
+                            if transaction_object_id := transactions[-1].get(
+                                    "objectId"):
+                                object_record = domain_objects.setdefault(
+                                    str(transaction_object_id), {
+                                        "objectId": transaction_object_id,
+                                        "firstTick": record.get("tick"),
+                                        "lastTick": record.get("tick"),
+                                        "requestCount": 0,
+                                        "responseCount": 0,
+                                        "commands": {},
+                                        "results": {},
+                                    })
+                                object_record["lastTick"] = record.get("tick")
+                                object_record["responseCount"] = (
+                                    int(object_record["responseCount"]) + 1)
+                                result = str(response_header.get("result"))
+                                results = object_record["results"]
+                                assert isinstance(results, dict)
+                                results[result] = results.get(result, 0) + 1
                         else:
                             unmatched_responses += 1
     unmatched_requests = sum(
         len(requests) for requests in pending_requests.values())
+    domain_objects_out = sorted(
+        domain_objects.values(),
+        key=lambda item: int(item["objectId"]))
     return {
         "schemaVersion": TRACE_SCHEMA_VERSION,
         "records": records,
         "transactions": transactions,
+        "domainObjects": domain_objects_out,
         "summary": {
             "traceCount": len(documents),
             "ipcCount": len(records),
             "transactionCount": len(transactions),
             "unmatchedRequests": unmatched_requests,
             "unmatchedResponses": unmatched_responses,
+            "domainObjectCount": len(domain_objects_out),
             "skippedSnapshots": skipped,
         },
     }
@@ -4350,6 +4404,7 @@ def _cmd_debug_trace_ipc(client: SysAgentClient,
     assert isinstance(summary, dict)
     print(
         f"ipc={summary['ipcCount']} transactions={summary['transactionCount']} "
+        f"domainObjects={summary['domainObjectCount']} "
         f"skippedSnapshots={summary['skippedSnapshots']}")
     for record in report["records"]:
         assert isinstance(record, dict)
@@ -4376,6 +4431,15 @@ def _cmd_debug_trace_ipc(client: SysAgentClient,
             f"interface={transaction['interfaceHash']} "
             f"command={transaction['commandId']} "
             f"name={transaction['commandName']} result={transaction['result']}")
+    for domain_object in report["domainObjects"]:
+        assert isinstance(domain_object, dict)
+        print(
+            f"  object id={domain_object['objectId']} "
+            f"requests={domain_object['requestCount']} "
+            f"responses={domain_object['responseCount']} "
+            f"commands={domain_object['commands']} "
+            f"results={domain_object['results']} "
+            f"ticks={domain_object['firstTick']}..{domain_object['lastTick']}")
 
 
 def _cmd_debug_trace_timeline(client: SysAgentClient,

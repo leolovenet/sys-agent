@@ -466,6 +466,8 @@ it also correlates request and response records into transactions. These command
 raw protocol bytes only and do not assign service-specific meanings to Command IDs.
 Optional profile `ipc` metadata can attach consumer-supplied service, interface-hash and
 Command-ID names to those transactions.
+Domain object IDs are summarized separately with first/last tick, request/response counts,
+observed commands and Result frequencies.
 
 `trace-timeline` normalizes one or more trace files into a single system-tick timeline,
 including raw events, IPC records and transactions. It rejects files whose recorded boot epochs

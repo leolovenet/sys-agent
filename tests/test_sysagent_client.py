@@ -905,10 +905,13 @@ class ClientTests(unittest.TestCase):
         from client.sysagent import (build_trace_timeline, decode_hipc_cmif,
                                      decode_trace_ipc, load_trace_jsonl, main)
 
-        request = bytearray(40)
+        request = bytearray(48)
         request[0:4] = (4).to_bytes(4, "little")
-        request[4:8] = (8).to_bytes(4, "little")
-        request[16:32] = b"".join((
+        request[4:8] = (10).to_bytes(4, "little")
+        request[16] = 1
+        request[18:20] = (20).to_bytes(2, "little")
+        request[20:24] = (12).to_bytes(4, "little")
+        request[32:48] = b"".join((
             (0x49434653).to_bytes(4, "little"),
             (0).to_bytes(4, "little"),
             (8).to_bytes(4, "little"),
@@ -920,8 +923,9 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(decoded_request["cmif"]["header"]["token"], 0xDEADBEEF)
 
         response = bytearray(request)
-        response[16:20] = (0x4F434653).to_bytes(4, "little")
-        response[24:28] = (0x167B).to_bytes(4, "little")
+        response[16:32] = bytes(16)
+        response[32:36] = (0x4F434653).to_bytes(4, "little")
+        response[40:44] = (0x167B).to_bytes(4, "little")
         decoded_response = decode_hipc_cmif(bytes(response))
         self.assertEqual(decoded_response["cmif"]["mode"], "response")
         self.assertEqual(decoded_response["cmif"]["header"]["result"], "0x167B")
@@ -989,6 +993,9 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(report["transactions"][0]["service"], "test-service")
         self.assertEqual(report["transactions"][0]["interfaceHash"], "0x11223344")
         self.assertEqual(report["transactions"][0]["result"], "0x167B")
+        self.assertEqual(report["domainObjects"][0]["objectId"], 12)
+        self.assertEqual(report["domainObjects"][0]["requestCount"], 1)
+        self.assertEqual(report["domainObjects"][0]["responseCount"], 1)
         timeline = build_trace_timeline([{
             "metadata": metadata,
             "events": [request_event, response_event],
