@@ -28,8 +28,11 @@ That export is annotated with the profile target IDs, process IDs and original m
 
 `trace-timeline` accepts multiple trace files and sorts raw events and decoded IPC transactions
 by the console's monotonic system tick. New exports record a best-effort `bootEpochUnixMs`;
-files from different boots are rejected because their tick domains are unrelated. The optional
-`--profile` supplies target IDs and IPC pairs for files produced by plain `multitrace-dump`.
+files from different boots are rejected because their tick domains are unrelated. Because the
+epoch estimate combines second-precision wall time with a separately sampled millisecond uptime,
+same-boot exports may differ slightly; up to two seconds of estimation drift is accepted. The
+optional `--profile` supplies target IDs and IPC pairs for files produced by plain
+`multitrace-dump`.
 
 `--wait-process` uses the generic PM creation hooks before resolving process IDs and arming.
 Foreground selectors use `debug wait-application`; Title ID selectors use `debug wait-title`.

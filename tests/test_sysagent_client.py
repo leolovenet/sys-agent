@@ -1603,7 +1603,11 @@ class ClientTests(unittest.TestCase):
             "0000000000000020": 1,
         })
 
-        second["metadata"]["clock"]["bootEpochUnixMs"] = 2000
+        second["metadata"]["clock"]["bootEpochUnixMs"] = 1123
+        timeline = build_trace_timeline([first, second])
+        self.assertEqual(timeline["bootEpochUnixMs"], 1000)
+
+        second["metadata"]["clock"]["bootEpochUnixMs"] = 10000
         with self.assertRaisesRegex(
                 SysAgentProtocolError, "different boots"):
             build_trace_timeline([first, second])

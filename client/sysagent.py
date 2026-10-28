@@ -21,9 +21,10 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.1.0"
+CLIENT_VERSION = "1.1.1"
 TRACE_SCHEMA_VERSION = 1
 TRACE_PROFILE_SCHEMA_VERSION = 2
+TRACE_BOOT_EPOCH_TOLERANCE_MS = 2000
 
 # The console's default keySleepTime (25 ms) is fast enough for the home menu but too
 # fast for the game's on-screen keyboard: measured in ACNH 3.0.3's chat field, 25/30 ms
@@ -3419,7 +3420,10 @@ def build_trace_timeline(
                 "ipc": ipc_by_event.get((session_id, str(event.get("seq", ""))), []),
             })
 
-    if len(boot_epochs) > 1:
+    boot_epoch = min(boot_epochs, default=None)
+    if (boot_epochs
+            and max(boot_epochs) - min(boot_epochs)
+            > TRACE_BOOT_EPOCH_TOLERANCE_MS):
         raise SysAgentProtocolError(
             "trace files come from different boots; system ticks are not comparable")
     timeline.sort(key=lambda event: (
@@ -3431,7 +3435,7 @@ def build_trace_timeline(
     return {
         "schemaVersion": TRACE_SCHEMA_VERSION,
         "kind": "trace-timeline",
-        "bootEpochUnixMs": next(iter(boot_epochs), None),
+        "bootEpochUnixMs": boot_epoch,
         "timeline": timeline,
         "summary": {
             "sessionCount": len(documents),
