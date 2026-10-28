@@ -14,6 +14,8 @@
 #include "freeze.h"
 #include "search.h"
 #include "process_memory.h"
+#include "debug_hwbp_layout.h"
+#include "debug_multitrace.h"
 #include "debug_trace.h"
 #include "debug_watch.h"
 #include "debug_process.h"
@@ -29,7 +31,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.16.0"
+#define VERSION_S "2.17.0"
 
 typedef enum {
     Active = 0,
@@ -380,6 +382,29 @@ static void printTraceSnapshotSpec(const DebugTraceSnapshotSpec* spec)
     printf(":0x%X", spec->size);
 }
 
+static Result resolveAddressForProcess(u64 pid, const char* text, u64* out)
+{
+    if (pid == 0 || text == NULL || out == NULL)
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    u64 address = 0;
+    if (!strncmp(text, "main+", 5)) {
+        u64 mainBase = 0;
+        Result rc = debugProcessResolveMainBase(pid, &mainBase);
+        if (R_FAILED(rc))
+            return rc;
+        u64 offset = 0;
+        if (!tryParseStringToInt(text + 5, &offset))
+            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        address = mainBase + offset;
+    } else if (!tryParseStringToInt(text, &address)) {
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    }
+    if (address == 0 || (address & 3) != 0)
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    *out = address;
+    return 0;
+}
+
 /* Print a byte range as uppercase hex (memory order, lowest address first). */
 static void printHexBytes(const u8* bytes, u64 size)
 {
@@ -591,6 +616,254 @@ int argmain(int argc, char** argv)
                 }
             }
             debugProcessPrintThreads(pid);
+            return 0;
+        }
+        if (!strcmp(argv[1], "hwbp-layout"))
+        {
+            if (argc != 4) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            u64 pid1 = 0;
+            u64 pid2 = 0;
+            if (!tryParseStringToInt(argv[2], &pid1) || pid1 == 0) {
+                printf("ERR code=INVALID_PID index=1\n");
+                return 0;
+            }
+            if (!tryParseStringToInt(argv[3], &pid2) || pid2 == 0) {
+                printf("ERR code=INVALID_PID index=2\n");
+                return 0;
+            }
+            DebugHwBpLayout layout;
+            Result rc = debugHwBpProbeLayout(pid1, pid2, &layout);
+            if (R_FAILED(rc)) {
+                printf("ERR code=HWBP_LAYOUT_FAILED result=0x%X"
+                    " pid1=%016lX pid2=%016lX"
+                    " ctx1=%u ctx2=%u ctx1Result=0x%X ctx2Result=0x%X"
+                    " drainResult=0x%X resumeResult=0x%X"
+                    " cleanupResult=0x%X slots=",
+                    rc, pid1, pid2, layout.contextSlot1,
+                    layout.contextSlot2, layout.contextSlot1Result,
+                    layout.contextSlot2Result, layout.drainResult,
+                    layout.resumeResult, layout.cleanupResult);
+            } else {
+                printf("OK pid1=%016lX pid2=%016lX"
+                    " ctx1=%u ctx2=%u ctx1Result=0x%X ctx2Result=0x%X"
+                    " cleanupResult=0x%X slots=",
+                    pid1, pid2, layout.contextSlot1,
+                    layout.contextSlot2, layout.contextSlot1Result,
+                    layout.contextSlot2Result, layout.cleanupResult);
+            }
+            for (u32 i = 0; i < layout.instructionSlotCount; i++) {
+                if (i != 0)
+                    printf(",");
+                printf("%u", layout.instructionSlots[i]);
+            }
+            printf(" slotCount=%u\n", layout.instructionSlotCount);
+            return 0;
+        }
+        if (!strcmp(argv[1], "multitrace"))
+        {
+            /*
+             * Experimental dual-process trace:
+             * debug multitrace PID1 TARGET1 PID2 TARGET2
+             *     [hits N] [ring N] [duration N] [args N]
+             */
+            if (argc < 6) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            DebugMultiTraceConfig config;
+            memset(&config, 0, sizeof(config));
+            if (!tryParseStringToInt(argv[2], &config.processIds[0])
+                || config.processIds[0] == 0) {
+                printf("ERR code=INVALID_PID index=1\n");
+                return 0;
+            }
+            if (!tryParseStringToInt(argv[4], &config.processIds[1])
+                || config.processIds[1] == 0
+                || config.processIds[1] == config.processIds[0]) {
+                printf("ERR code=INVALID_PID index=2\n");
+                return 0;
+            }
+            Result resolveRc = resolveAddressForProcess(
+                config.processIds[0], argv[3], &config.addresses[0]);
+            if (R_FAILED(resolveRc)) {
+                printf("ERR code=INVALID_ADDRESS index=1 result=0x%X\n",
+                    resolveRc);
+                return 0;
+            }
+            resolveRc = resolveAddressForProcess(config.processIds[1],
+                argv[5], &config.addresses[1]);
+            if (R_FAILED(resolveRc)
+                || config.addresses[0] == config.addresses[1]) {
+                printf("ERR code=INVALID_ADDRESS index=2 result=0x%X\n",
+                    resolveRc);
+                return 0;
+            }
+
+            config.maxHits = 1;
+            config.durationSeconds = 60;
+            config.argsCount = DEBUG_TRACE_ARGS_MAX;
+            bool hitsSpecified = false;
+            int index = 6;
+            while (index < argc) {
+                if (!strcmp(argv[index], "hits") && index + 1 < argc) {
+                    u64 parsed = 0;
+                    if (!tryParseStringToInt(argv[index + 1], &parsed)
+                        || parsed > 0xFFFFFFFFULL) {
+                        printf("ERR code=INVALID_HITS\n");
+                        return 0;
+                    }
+                    config.maxHits = (u32)parsed;
+                    hitsSpecified = true;
+                    index += 2;
+                } else if (!strcmp(argv[index], "ring")
+                    && index + 1 < argc) {
+                    u64 parsed = 0;
+                    if (!tryParseStringToInt(argv[index + 1], &parsed)
+                        || parsed == 0 || parsed > DEBUG_TRACE_RING_MAX) {
+                        printf("ERR code=INVALID_RING\n");
+                        return 0;
+                    }
+                    config.ringSize = (u32)parsed;
+                    index += 2;
+                } else if (!strcmp(argv[index], "duration")
+                    && index + 1 < argc) {
+                    u64 parsed = 0;
+                    if (!tryParseStringToInt(argv[index + 1], &parsed)
+                        || parsed > 0x7FFFFFFFULL) {
+                        printf("ERR code=INVALID_DURATION\n");
+                        return 0;
+                    }
+                    config.durationSeconds = parsed;
+                    index += 2;
+                } else if (!strcmp(argv[index], "args")
+                    && index + 1 < argc) {
+                    u64 parsed = 0;
+                    if (!tryParseStringToInt(argv[index + 1], &parsed)
+                        || parsed > DEBUG_TRACE_ARGS_MAX) {
+                        printf("ERR code=INVALID_ARGS\n");
+                        return 0;
+                    }
+                    config.argsCount = (u32)parsed;
+                    index += 2;
+                } else {
+                    printf("ERR code=INVALID_ARGUMENTS\n");
+                    return 0;
+                }
+            }
+            if (config.ringSize > 0 && !hitsSpecified)
+                config.maxHits = DEBUG_TRACE_DEFAULT_RING_HITS;
+            if (config.ringSize == 0 && config.maxHits == 0) {
+                printf("ERR code=INVALID_HITS"
+                    " detail=unlimited_requires_ring\n");
+                return 0;
+            }
+            if (!debugMultiTraceStart(&config)) {
+                DebugMultiTraceStatus status;
+                debugMultiTraceGetStatus(&status);
+                printf("ERR code=MULTITRACE_BUSY result=0x%X stage=%s\n",
+                    status.lastError, status.stage);
+                return 0;
+            }
+            DebugMultiTraceStatus status;
+            u32 attempts = 0;
+            do {
+                svcSleepThread(100 * 1000 * 1000LL);
+                debugMultiTraceGetStatus(&status);
+            } while (!status.everArmed && status.active
+                && ++attempts < 120);
+            if (!status.everArmed) {
+                printf("ERR code=MULTITRACE_START_FAILED active=%d"
+                    " result=0x%X stage=%s\n",
+                    status.active, status.lastError, status.stage);
+                debugMultiTraceStop();
+                return 0;
+            }
+            printf("OK state=started active=%d pid0=%016lX"
+                " target0=%016lX pid1=%016lX target1=%016lX"
+                " hits=%u ring=%u duration=%lu args=%u"
+                " ctx=%u,%u slots=%u,%u\n",
+                status.active, status.processIds[0], status.addresses[0],
+                status.processIds[1], status.addresses[1],
+                config.maxHits, config.ringSize, config.durationSeconds,
+                config.argsCount, status.contextSlots[0],
+                status.contextSlots[1], status.instructionSlots[0],
+                status.instructionSlots[1]);
+            return 0;
+        }
+        if (!strcmp(argv[1], "multitrace-status"))
+        {
+            if (argc != 2) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            DebugMultiTraceStatus status;
+            debugMultiTraceGetStatus(&status);
+            printf("OK active=%d armed=%d everArmed=%d stale=%d"
+                " memoryBlocked=%d pid0=%016lX target0=%016lX"
+                " pid1=%016lX target1=%016lX hits=%u,%u"
+                " hitCount=%lu maxHits=%u ring=%u ringCount=%u"
+                " duration=%lu startedTick=%lu args=%u ignoredHits=%u"
+                " ctx=%u,%u slots=%u,%u lastSeq=%lu"
+                " lastPc=%016lX lastLr=%016lX lastSp=%016lX"
+                " lastThread=%016lX lastCore=%u"
+                " stage=%s lastError=0x%X\n",
+                status.active, status.armed, status.everArmed,
+                status.stale, status.memoryBlocked,
+                status.processIds[0], status.addresses[0],
+                status.processIds[1], status.addresses[1],
+                status.targetHits[0], status.targetHits[1],
+                status.hitCount, status.maxHits, status.ringSize,
+                status.ringCount, status.durationSeconds,
+                status.startedTick, status.argsCount, status.ignoredHits,
+                status.contextSlots[0], status.contextSlots[1],
+                status.instructionSlots[0], status.instructionSlots[1],
+                status.lastSequence, status.lastPc, status.lastLr,
+                status.lastSp, status.lastThreadId, status.lastCore,
+                status.stage, status.lastError);
+            return 0;
+        }
+        if (!strcmp(argv[1], "multitrace-read"))
+        {
+            if (argc > 3) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            u64 index = 0;
+            if (argc == 3
+                && (!tryParseStringToInt(argv[2], &index)
+                    || index > DEBUG_TRACE_RING_MAX)) {
+                printf("ERR code=INVALID_INDEX\n");
+                return 0;
+            }
+            DebugTraceEvent event;
+            if (!debugMultiTraceGetEvent((u32)index, &event)) {
+                printf("ERR code=NO_TRACE_EVENT\n");
+                return 0;
+            }
+            printTraceEvent(&event);
+            return 0;
+        }
+        if (!strcmp(argv[1], "multitrace-stop"))
+        {
+            if (argc != 2) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            debugMultiTraceStop();
+            DebugMultiTraceStatus status;
+            debugMultiTraceGetStatus(&status);
+            if (status.lastError != 0) {
+                printf("ERR code=MULTITRACE_STOP_INCOMPLETE"
+                    " result=0x%X stage=%s hitCount=%lu ringCount=%u\n",
+                    status.lastError, status.stage, status.hitCount,
+                    status.ringCount);
+                return 0;
+            }
+            printf("OK state=stopped hitCount=%lu ringCount=%u\n",
+                status.hitCount, status.ringCount);
             return 0;
         }
         if (!strcmp(argv[1], "trace"))
@@ -2806,6 +3079,7 @@ int main()
 
     initFreezes();
     processMemoryInitialize();
+    debugMultiTraceInitialize();
     debugTraceInitialize();
     debugWatchInitialize();
     searchInitialize(searchSdMounted);

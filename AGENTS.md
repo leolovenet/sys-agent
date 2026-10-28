@@ -9,6 +9,8 @@
 - `debug maps` / `debug threads` / `debug modules` 是通用的任意进程检查原语(内存区域、线程 PC/LR/SP、模块列表);保持与游戏/具体系统服务无关,不要为单一调查加特例。
 - `debug trace` 是通用的任意 PID 硬件执行入口 tracer:不修改目标代码,单会话最多 4 个目标,记录目标/线程/core/PC/LR/SP/参数/指令、命中时最多 2 个寄存器指针内存快照与固定 ring。ring 仍受默认 64 次总命中安全上限约束,只有显式 `hits 0` 才解除;实机表明 4096 次快速命中已足以触发 ACNH watchdog。它只承诺入口命中,不要在未实现可靠线程关联前把它描述成 call/return tracer;游戏偏移仍由消费方提供。
 - `trace-dump` 的版本化 JSONL、`trace-analyze` 与 `trace-diff` 属于客户端离线关联层:只能对已显式记录的站点做同 session/thread 配对,不代表已实现跨进程 IPC 自动追踪。
+- `debug hwbp-layout <pid1> <pid2>` 是实验性硬件容量探针:短生命周期间时 attach 两个进程,只验证两个 context-IDR 句柄和可用执行槽是否可共存,不安装实际执行地址。结果用于决定同步多进程 trace 的架构,不要把它描述成已经支持 IPC trace。
+- `debug multitrace` 是实验性同步双进程入口 trace:固定两个独立 PID、每进程一个目标地址,共享 ring 和总命中上限,事件用 target index 区分进程。它不含 snapshot,也不自动解析 CMIF/HIPC;一个目标退出时整个会话停止。不要扩成 IPC 特例,后续接口/Result 关联应建立在通用 profile 层。
 
 ## 仓库边界
 

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "debug_trace.h"
+#include "debug_multitrace.h"
 #include "debug_watch.h"
 #include "dmnt_client.h"
 
@@ -25,7 +26,8 @@ Result debugProcessOpen(u64 pid, Handle* out, bool* dmntClosed)
     *dmntClosed = false;
     if (pid == 0)
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-    if (debugWatchIsActive() || debugTraceIsActive())
+    if (debugWatchIsActive() || debugTraceIsActive()
+        || debugMultiTraceIsActive())
         return KERNELRESULT(OwnedByAnotherProcess);
 
     /* dmnt:cht owns the single debug handle to the foreground application.

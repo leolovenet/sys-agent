@@ -1,6 +1,7 @@
 #include <string.h>
 
 #include "debug_hwbp.h"
+#include "debug_multitrace.h"
 #include "debug_trace.h"
 #include "debug_watch.h"
 #include "dmnt_client.h"
@@ -525,7 +526,7 @@ bool debugTraceStart(const DebugTraceConfig* config)
     memcpy(model.addresses, config->addresses, sizeof(model.addresses));
     memcpy(model.snapshots, config->snapshots, sizeof(model.snapshots));
 
-    if (debugWatchIsActive()) {
+    if (debugWatchIsActive() || debugMultiTraceIsActive()) {
         mutexLock(&traceState.mutex);
         traceState.lastError = KERNELRESULT(OwnedByAnotherProcess);
         strncpy(traceState.stage, "watchActive",

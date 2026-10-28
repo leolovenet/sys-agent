@@ -2,6 +2,7 @@
 #include <stdio.h>
 
 #include "debug_hwbp.h"
+#include "debug_multitrace.h"
 #include "debug_trace.h"
 #include "debug_watch.h"
 
@@ -486,7 +487,7 @@ bool debugWatchStart(const DebugWatchConfig* config)
 {
     if (config == NULL)
         return false;
-    if (debugTraceIsActive()) {
+    if (debugTraceIsActive() || debugMultiTraceIsActive()) {
         mutexLock(&watchState.mutex);
         watchState.lastError = KERNELRESULT(OwnedByAnotherProcess);
         mutexUnlock(&watchState.mutex);

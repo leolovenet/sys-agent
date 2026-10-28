@@ -57,6 +57,9 @@ commands should follow this rule:
   exposes `trace-status` / `trace-read` / `trace-stop`, and never modifies target instructions.
   The client `trace-dump` writes versioned JSONL with session metadata; `trace-analyze` and
   `trace-diff` summarize, pair explicit entry/return sites and compare A/B captures.
+- Experimental `debug multitrace` holds two debug handles simultaneously with independently
+  probed context-IDR slots, allowing one instruction target in each of two processes. It is a
+  capacity/event-demux prototype, not yet an IPC-aware tracer.
 - Verified memory access: `poke*Verified` writes and reads the range back, reporting
   `WRITE_FAILED`, `READBACK_FAILED`, or `WRITE_VERIFY_FAILED` distinctly; `peek*Verified`
   reads twice and retries until two reads agree, so zero data and a failed read are

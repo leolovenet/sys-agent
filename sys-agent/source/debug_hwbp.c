@@ -221,6 +221,35 @@ Result debugHwBpArmInstructionTrace(u32 contextSlot, Handle debugHandle,
     return setRegistersOnAllCores(registers, controls, values, count + 1);
 }
 
+Result debugHwBpArmDualInstructionTrace(u32 contextSlot1, Handle debugHandle1,
+    u32 instructionSlot1, u64 address1, u32 contextSlot2, Handle debugHandle2,
+    u32 instructionSlot2, u64 address2)
+{
+    if (contextSlot1 == contextSlot2
+        || instructionSlot1 == instructionSlot2
+        || instructionSlot1 == contextSlot1
+        || instructionSlot1 == contextSlot2
+        || instructionSlot2 == contextSlot1
+        || instructionSlot2 == contextSlot2
+        || address1 == 0 || address2 == 0
+        || (address1 & 3) != 0 || (address2 & 3) != 0)
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+    const u32 registers[4] = {
+        contextSlot1, contextSlot2, instructionSlot1, instructionSlot2,
+    };
+    const u64 controls[4] = {
+        (0x3ULL << 20) | (0xFULL << 5) | 1,
+        (0x3ULL << 20) | (0xFULL << 5) | 1,
+        (0x1ULL << 20) | ((u64)contextSlot1 << 16) | (0xFULL << 5) | 1,
+        (0x1ULL << 20) | ((u64)contextSlot2 << 16) | (0xFULL << 5) | 1,
+    };
+    const u64 values[4] = {
+        (u64)debugHandle1, (u64)debugHandle2, address1, address2,
+    };
+    return setRegistersOnAllCores(registers, controls, values, 4);
+}
+
 Result debugHwBpClearRegistersAllCores(const u32* registers, u32 count)
 {
     if (registers == NULL || count == 0 || count > 16)

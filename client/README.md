@@ -41,8 +41,8 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.2.0
-sys-agent 2.16.0  (switch:6000)
+client    1.3.0
+sys-agent 2.17.0  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
@@ -135,6 +135,10 @@ python3 client/sysagent.py --host switch debug trace \
 python3 client/sysagent.py --host switch debug trace-status
 python3 client/sysagent.py --host switch debug trace-read 0
 python3 client/sysagent.py --host switch debug trace-dump --output trace.jsonl
+python3 client/sysagent.py --host switch debug multitrace \
+  0x71 main+0x1000 0x85 main+0x2000 --ring 64 --duration 30
+python3 client/sysagent.py --host switch debug multitrace-status
+python3 client/sysagent.py --host switch debug multitrace-dump --output multi.jsonl
 python3 client/sysagent.py debug trace-analyze trace.jsonl \
   --pair 0x...:0x... --json
 python3 client/sysagent.py debug trace-diff before.jsonl after.jsonl
@@ -156,6 +160,11 @@ exports, summarizes processes/threads/targets and pairs explicit entry/return ad
 session and thread; the return event's `x0` is reported as the candidate Result. Multiple files
 are directly comparable when captured in the same boot, because ordering uses the device system
 tick. `trace-diff` compares event, process, thread and target counts between an A/B pair.
+
+`debug multitrace` is the experimental two-process client for sysmodule `2.17.0+`. It assigns
+one instruction target to each explicitly supplied PID, using runtime-probed context and
+instruction slots. `multitrace-dump` writes the same versioned JSONL schema with a `targets[]`
+process table, so `trace-analyze` attributes each event to the correct PID by target index.
 
 ## Controller
 

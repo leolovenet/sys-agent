@@ -365,6 +365,46 @@ Device system ticks make multiple exports directly orderable only when they came
 boot. The metadata retains host export time for cross-boot approximate ordering, but that is
 not a substitute for a shared device clock.
 
+### Experimental hardware layout probe
+
+`debug hwbp-layout <pid1> <pid2>` temporarily attaches two distinct processes, drains and
+resumes both, and reports whether two debug handles can occupy separate context-IDR registers
+at the same time. It also lists usable instruction-breakpoint registers after excluding both
+context registers. No execution address is installed, so the probe does not stop or trace the
+targets. The handles are closed and both context registers are cleared before returning.
+
+This command validates hardware capacity only. It is not a cross-process IPC tracer.
+
+### Experimental dual-process trace
+
+After the layout probe confirms two context-IDR slots, `debug multitrace` can observe one
+instruction in each of two processes at the same time:
+
+```text
+debug multitrace PID1 TARGET1 PID2 TARGET2 [hits N] [ring N] [duration N] [args N]
+debug multitrace-status
+debug multitrace-read 0
+debug multitrace-stop
+```
+
+Python client equivalents are `debug multitrace PID1 TARGET1 PID2 TARGET2`, followed by
+`multitrace-status`, `multitrace-read`, `multitrace-stop` and `multitrace-dump`. The dump stores
+a `targets[]` process table; `trace-analyze` uses each event's target index to attribute counts
+to the correct process.
+
+Targets may be absolute instruction addresses or `main+offset`, resolved independently against
+each PID. Addresses must be distinct because event routing uses the exception PC. Context and
+instruction slot assignment comes from runtime probing; on this console the layout is normally
+context `4,5` and instruction slots `0,1`. Events use target index 0/1 and otherwise match the
+single-process trace field set.
+
+The ring and hit limit are shared across both processes. A process exit stops the whole session.
+This prototype does not capture memory snapshots and does not understand CMIF/HIPC operations;
+it proves synchronous two-process observation only. Memory commands remain blocked while it is
+active, and all four hardware registers plus both debug handles are released on stop/error.
+`multitrace-status.ignoredHits` counts hardware-instruction events that did not match either
+configured address or arrived on the wrong process debug handle.
+
 The same ownership rules as `debug watch` apply. For the foreground application, an existing
 `dmnt:cht` handle is closed when necessary and later memory commands reattach it. A trace of a
 system process does not disturb the game's dmnt handle. While a trace is active, memory,

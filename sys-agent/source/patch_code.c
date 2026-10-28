@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "debug_multitrace.h"
 #include "debug_trace.h"
 #include "debug_watch.h"
 #include "dmnt_client.h"
@@ -109,7 +110,8 @@ Result patchCodeRun(u64 address, const u8* expected, u64 expectedSize,
     if (!skipVerify && (expected == NULL || expectedSize != patchSize))
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
 
-    if (debugWatchIsActive() || debugTraceIsActive())
+    if (debugWatchIsActive() || debugTraceIsActive()
+        || debugMultiTraceIsActive())
         return KERNELRESULT(OwnedByAnotherProcess);
 
     Result rc = 0;

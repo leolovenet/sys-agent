@@ -93,6 +93,35 @@ class FakeHandler(socketserver.StreamRequestHandler):
                     )
                 elif command[1] == "trace-stop":
                     response = "OK state=stopped hitCount=1 ringCount=0 lastError=0x0 stage=hitsReached"
+                elif command[1] == "multitrace":
+                    response = (
+                        "OK state=started active=1 pid0=0000000000000071 "
+                        "target0=0000000000001000 pid1=0000000000000085 "
+                        "target1=0000000000002000 hits=64 ring=8 duration=30 "
+                        "args=4 ctx=4,5 slots=0,1"
+                    )
+                elif command[1] == "multitrace-status":
+                    response = (
+                        "OK active=0 armed=0 everArmed=1 stale=1 memoryBlocked=0 "
+                        "pid0=0000000000000071 target0=0000000000001000 "
+                        "pid1=0000000000000085 target1=0000000000002000 hits=2,1 "
+                        "hitCount=3 maxHits=64 ring=8 ringCount=1 duration=30 "
+                        "startedTick=100 args=4 ctx=4,5 slots=0,1 lastSeq=3 "
+                        "lastPc=0000000000002000 lastLr=0000000000002004 "
+                        "lastSp=0000000000003000 lastThread=0000000000000088 "
+                        "lastCore=2 stage=hitsReached lastError=0x0"
+                    )
+                elif command[1] == "multitrace-read":
+                    response = (
+                        "OK seq=3 target=1 targetAddress=0000000000002000 "
+                        "thread=0000000000000088 core=2 tick=300 "
+                        "pc=0000000000002000 lr=0000000000002004 "
+                        "sp=0000000000003000 args=2 contextResult=0x0 "
+                        "coreResult=0x0 insnBytes=0 insn= snapshots=0 "
+                        "x0=0000000000000000 x1=0000000000000001"
+                    )
+                elif command[1] == "multitrace-stop":
+                    response = "OK state=stopped hitCount=3 ringCount=1"
                 else:
                     response = "ERR code=UNKNOWN_COMMAND"
             elif command[0] == "searchCapabilities":
@@ -569,6 +598,34 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(event["pc"], "0000002B00001000")
             self.assertNotIn("ok", event)
 
+    def test_debug_multitrace_cli_and_dump(self) -> None:
+        import json
+        import tempfile
+        from client.sysagent import main
+
+        base = ["--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1", "debug"]
+        self.assertEqual(main(base + [
+            "multitrace", "0x71", "main+0x10", "0x85", "0x2000",
+            "--ring", "8", "--duration", "30", "--args", "4"]), 0)
+        self.assertEqual(self.server.state.last_command, [
+            "debug", "multitrace", "0x71", "main+0x10", "0x85", "0x2000",
+            "ring", "8", "duration", "30", "args", "4"])
+        self.assertEqual(main(base + ["multitrace-status"]), 0)
+        self.assertEqual(main(base + ["multitrace-read", "0"]), 0)
+        self.assertEqual(main(base + ["multitrace-stop"]), 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "multitrace.jsonl")
+            self.assertEqual(main(base + [
+                "multitrace-dump", "--output", output]), 0)
+            with open(output, encoding="utf-8") as handle:
+                metadata = json.loads(handle.readline())
+                event = json.loads(handle.readline())
+            self.assertEqual(metadata["kind"], "multitrace")
+            self.assertEqual(len(metadata["targets"]), 2)
+            self.assertEqual(event["target"], "1")
+
     def test_trace_analyze_and_diff(self) -> None:
         import json
         import tempfile
@@ -643,6 +700,28 @@ class ClientTests(unittest.TestCase):
                 }) + "\n")
             with self.assertRaisesRegex(SysAgentProtocolError, "unsupported trace schema"):
                 load_trace_jsonl([invalid_path])
+
+            multi_path = os.path.join(directory, "multi.jsonl")
+            multi_meta = {
+                "record": "meta", "schemaVersion": 1, "sessionId": "multi",
+                "status": {},
+                "targets": [
+                    {"index": 0, "process": {"pid": "0000000000000071"}},
+                    {"index": 1, "process": {"pid": "0000000000000085"}},
+                ],
+            }
+            with open(multi_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(multi_meta) + "\n")
+                handle.write(json.dumps({
+                    "record": "event", "schemaVersion": 1, "seq": "1",
+                    "tick": "1", "thread": "AA", "target": "1",
+                    "pc": "0000000000002000",
+                    "targetAddress": "0000000000002000",
+                }) + "\n")
+            multi_report = analyze_trace_documents(load_trace_jsonl([multi_path]))
+            self.assertEqual(
+                multi_report["summary"]["processCounts"],
+                {"0000000000000085": 1})
 
     def test_peek_verified(self) -> None:
         with self.client() as client:

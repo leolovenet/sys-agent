@@ -21,7 +21,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.2.0"
+CLIENT_VERSION = "1.3.0"
 TRACE_SCHEMA_VERSION = 1
 
 # The console's default keySleepTime (25 ms) is fast enough for the home menu but too
@@ -321,6 +321,9 @@ ERROR_CODE_NOTES = {
     "DEBUG_BUSY": "an active watch/trace owns the process debug handle",
     "INVALID_SNAPSHOT": "snapshot must be REG[+/-OFFSET]:SIZE, with REG in x0..x30, sp, pc, or lr",
     "DUPLICATE_TARGET": "trace target addresses must be distinct",
+    "MULTITRACE_BUSY": "another watch/trace session is active or multitrace could not start",
+    "MULTITRACE_START_FAILED": "the dual-process trace could not attach and arm both targets",
+    "MULTITRACE_STOP_INCOMPLETE": "the dual-process trace did not release all debug state",
 }
 
 
@@ -1847,14 +1850,24 @@ def analyze_trace_documents(
         assert isinstance(metadata, dict)
         session_id = str(metadata.get("sessionId", document["path"]))
         status = metadata.get("status")
-        process_key = "unknown"
         process_info = metadata.get("process")
+        default_pid = "unknown"
         if isinstance(status, dict):
             pid = status.get("pid")
             if pid is not None:
-                process_key = str(pid)
+                default_pid = str(pid)
         if isinstance(process_info, dict):
-            process_identities[process_key] = process_info
+            process_identities[default_pid] = process_info
+        default_process_info = process_info if isinstance(process_info, dict) else None
+        target_processes: dict[str, dict[str, object]] = {}
+        targets = metadata.get("targets")
+        if isinstance(targets, list):
+            for target in targets:
+                if not isinstance(target, dict):
+                    continue
+                process = target.get("process")
+                if isinstance(process, dict):
+                    target_processes[str(target.get("index"))] = process
         document_events = document["events"]
         assert isinstance(document_events, list)
         sorted_events = sorted(
@@ -1864,9 +1877,17 @@ def analyze_trace_documents(
                 parse_int(str(event.get("seq", "0"))),
             ),
         )
-        process_counts[process_key] = (
-            process_counts.get(process_key, 0) + len(sorted_events))
         for event in sorted_events:
+            process_info = target_processes.get(
+                str(event.get("target", "0")), default_process_info)
+            process_key = default_pid
+            if (isinstance(process_info, dict)
+                    and process_info.get("pid") is not None):
+                process_key = str(process_info["pid"])
+            if isinstance(process_info, dict):
+                process_identities[process_key] = process_info
+            process_counts[process_key] = (
+                process_counts.get(process_key, 0) + 1)
             events.append((session_id, event))
             thread = str(event.get("thread", "0"))
             threads.add(thread)
@@ -2524,9 +2545,8 @@ def _cmd_debug_trace_stop(client: SysAgentClient, args: argparse.Namespace) -> N
 
 
 def _trace_process_metadata(client: SysAgentClient,
-                            status: dict[str, str]) -> dict[str, str]:
+                            pid_text: str) -> dict[str, str]:
     """Best-effort process identity for an exported trace session."""
-    pid_text = status.get("pid", "0")
     try:
         pid = int(pid_text, 16)
     except ValueError:
@@ -2568,6 +2588,19 @@ def _trace_process_metadata(client: SysAgentClient,
     return metadata
 
 
+def _write_versioned_trace(output: str, metadata: dict[str, object],
+                           events: Sequence[dict[str, object]]) -> None:
+    with open(output, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(metadata, sort_keys=True) + "\n")
+        for event in events:
+            record = {
+                "record": "event",
+                "schemaVersion": TRACE_SCHEMA_VERSION,
+                **event,
+            }
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
 def _cmd_debug_trace_dump(client: SysAgentClient, args: argparse.Namespace) -> None:
     client.timeout = max(client.timeout, 30.0)
     before = require_ok(client.command("debug trace-status", retry=True))
@@ -2593,24 +2626,124 @@ def _cmd_debug_trace_dump(client: SysAgentClient, args: argparse.Namespace) -> N
         f"{int(time.time() * 1000):x}-"
         f"{before.get('pid', '0')}-"
         f"{before.get('address', '0')}")
+    process = _trace_process_metadata(client, before.get("pid", "0"))
     metadata = {
         "record": "meta",
         "schemaVersion": TRACE_SCHEMA_VERSION,
         "sessionId": session_id,
+        "kind": "single",
         "exportedAt": datetime.now(timezone.utc).isoformat(),
         "host": client.host,
         "status": {key: value for key, value in before.items() if key != "ok"},
-        "process": _trace_process_metadata(client, before),
+        "process": process,
+        "targets": [{
+            "index": 0,
+            "address": before.get("address", "0"),
+            "process": process,
+        }],
     }
-    with open(output, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(metadata, sort_keys=True) + "\n")
-        for event in events:
-            record = {
-                "record": "event",
-                "schemaVersion": TRACE_SCHEMA_VERSION,
-                **event,
-            }
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    _write_versioned_trace(output, metadata, events)
+    print(f"{output} ({len(events)} events, session={session_id})")
+
+
+def _cmd_debug_multitrace(client: SysAgentClient, args: argparse.Namespace) -> None:
+    if args.pid1 == args.pid2:
+        raise ValueError("multitrace process IDs must differ")
+    if args.hits is not None and args.hits < 0:
+        raise ValueError("hits must be non-negative")
+    if args.hits == 0 and args.ring is None:
+        raise ValueError("hits 0 (unlimited) requires --ring")
+    if args.ring is not None and not 1 <= args.ring <= 64:
+        raise ValueError("ring must be in 1..64")
+    if args.duration is not None and args.duration < 0:
+        raise ValueError("duration must be non-negative")
+    if args.args is not None and not 0 <= args.args <= 8:
+        raise ValueError("args must be in 0..8")
+    client.timeout = max(client.timeout, 30.0)
+    parts = [
+        "debug", "multitrace",
+        f"0x{args.pid1:X}", args.target1,
+        f"0x{args.pid2:X}", args.target2,
+    ]
+    if args.hits is not None:
+        parts.extend(("hits", str(args.hits)))
+    if args.ring is not None:
+        parts.extend(("ring", str(args.ring)))
+    if args.duration is not None:
+        parts.extend(("duration", str(args.duration)))
+    if args.args is not None:
+        parts.extend(("args", str(args.args)))
+    _emit(require_ok(client.command(" ".join(parts))), args)
+
+
+def _cmd_debug_multitrace_status(client: SysAgentClient,
+                                 args: argparse.Namespace) -> None:
+    client.timeout = max(client.timeout, 30.0)
+    _emit(require_ok(client.command("debug multitrace-status", retry=True)), args)
+
+
+def _cmd_debug_multitrace_read(client: SysAgentClient,
+                               args: argparse.Namespace) -> None:
+    client.timeout = max(client.timeout, 30.0)
+    _emit(require_ok(client.command(
+        f"debug multitrace-read {args.index}", retry=True)), args)
+
+
+def _cmd_debug_multitrace_stop(client: SysAgentClient,
+                               args: argparse.Namespace) -> None:
+    client.timeout = max(client.timeout, 30.0)
+    _emit(require_ok(client.command("debug multitrace-stop")), args)
+
+
+def _cmd_debug_multitrace_dump(client: SysAgentClient,
+                               args: argparse.Namespace) -> None:
+    client.timeout = max(client.timeout, 30.0)
+    before = require_ok(client.command("debug multitrace-status", retry=True))
+    ring_count = parse_int(before.get("ringCount", "0"))
+    last_sequence = parse_int(before.get("lastSeq", "0"))
+    if ring_count == 0 and last_sequence == 0:
+        raise SysAgentProtocolError("the multitrace has no recorded event to dump")
+    event_count = ring_count if ring_count > 0 else 1
+    events = []
+    for index in range(event_count):
+        response = require_ok(client.command(
+            f"debug multitrace-read {index}", retry=True))
+        events.append({key: value for key, value in response.items() if key != "ok"})
+
+    after = require_ok(client.command("debug multitrace-status", retry=True))
+    if (after.get("ringCount") != before.get("ringCount")
+            or after.get("hitCount") != before.get("hitCount")):
+        raise SysAgentProtocolError(
+            "the multitrace ring changed during dump; stop the trace first and retry")
+
+    process0 = _trace_process_metadata(client, before.get("pid0", "0"))
+    process1 = _trace_process_metadata(client, before.get("pid1", "0"))
+    output = args.output or f"multitrace-{int(time.time())}.jsonl"
+    session_id = (
+        f"{int(time.time() * 1000):x}-"
+        f"{before.get('pid0', '0')}-{before.get('pid1', '0')}")
+    metadata = {
+        "record": "meta",
+        "schemaVersion": TRACE_SCHEMA_VERSION,
+        "sessionId": session_id,
+        "kind": "multitrace",
+        "exportedAt": datetime.now(timezone.utc).isoformat(),
+        "host": client.host,
+        "status": {key: value for key, value in before.items() if key != "ok"},
+        "targets": [
+            {
+                "index": 0,
+                "address": before.get("target0", "0"),
+                "process": process0,
+            },
+            {
+                "index": 1,
+                "address": before.get("target1", "0"),
+                "process": process1,
+            },
+        ],
+    }
+    _write_versioned_trace(output, metadata, events)
     print(f"{output} ({len(events)} events, session={session_id})")
 
 
@@ -3032,6 +3165,35 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      nargs="?", default=0), JSON_ARG, OUT_ARG)),
         Command("trace-stop", "Stop the active trace and release the debug handle",
                 _cmd_debug_trace_stop, (JSON_ARG, OUT_ARG)),
+        Command("multitrace", "Trace one instruction in each of two processes",
+                _cmd_debug_multitrace,
+                (Arg("pid1", "first process ID", type=parse_int),
+                 Arg("target1", "first instruction address or main+OFFSET"),
+                 Arg("pid2", "second process ID", type=parse_int),
+                 Arg("target2", "second instruction address or main+OFFSET"),
+                 Arg("hits", "shared total-hit safety limit; 0 means unlimited with --ring",
+                     type=parse_int, default=None, flags=("--hits",)),
+                 Arg("ring", "keep the most recent N events (1..64)",
+                     type=parse_int, default=None, flags=("--ring",)),
+                 Arg("duration", "failsafe duration in seconds; 0 means unlimited",
+                     type=parse_int, default=None, flags=("--duration",)),
+                 Arg("args", "capture x0 through x(N-1), N=0..8",
+                     type=parse_int, default=None, flags=("--args",)),
+                 JSON_ARG, OUT_ARG),
+                "Experimental: assigns one runtime-probed hardware slot to each process."),
+        Command("multitrace-status", "Show the experimental dual-process trace state",
+                _cmd_debug_multitrace_status, (JSON_ARG, OUT_ARG)),
+        Command("multitrace-read", "Read one dual-process trace event",
+                _cmd_debug_multitrace_read,
+                (Arg("index", "ring index (default 0)", type=parse_int,
+                     nargs="?", default=0), JSON_ARG, OUT_ARG)),
+        Command("multitrace-stop", "Stop the dual-process trace",
+                _cmd_debug_multitrace_stop, (JSON_ARG, OUT_ARG)),
+        Command("multitrace-dump", "Write dual-process trace events to versioned JSONL",
+                _cmd_debug_multitrace_dump,
+                (Arg("output", "output JSONL path "
+                               "(default: multitrace-<unix time>.jsonl)",
+                     flags=("--output",), default=None),)),
         Command("trace-dump", "Write retained trace events to a JSONL file",
                 _cmd_debug_trace_dump,
                 (Arg("output", "output JSONL path (default: trace-<unix time>.jsonl)",
