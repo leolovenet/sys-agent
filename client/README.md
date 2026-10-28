@@ -41,8 +41,8 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.12.0
-sys-agent 2.23.0  (switch:6000)
+client    1.1.0
+sys-agent 2.16.0  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
@@ -183,7 +183,7 @@ session and thread; the return event's `x0` is reported as the candidate Result.
 are directly comparable when captured in the same boot, because ordering uses the device system
 tick. `trace-diff` compares event, process, thread and target counts between an A/B pair.
 
-`debug multitrace` is the experimental two-process client for sysmodule `2.23.0+`. It assigns
+`debug multitrace` is the experimental two-process client for sysmodule `2.16.0+`. It assigns
 one instruction target to each explicitly supplied PID, using runtime-probed context and
 instruction slots. `--extra-target1` and `--extra-target2` add one more target to each side;
 use them together to observe client/server entry and caller-return sites in one session. The
@@ -224,7 +224,7 @@ A pair's `ipc.correlation` can instead extract a request/response key from event
 CMIF header/domain fields, IPC payload bytes or captured snapshot bytes; `thread: false` allows
 cross-thread completion and `fallback` controls whether unmatched keys may degrade to thread
 FIFO.
-Client 1.12.0 renames the old response `token`/`responseToken` fields to
+Client 1.1.0 renames the old response `token`/`responseToken` fields to
 `interfaceId`/`responseInterfaceId`; firmware 14.0.0+ defines that field as an InterfaceId.
 `ipc-decode` applies the same parser to one raw hex message. `trace-ipc --profile` can supply
 target IDs and consumer-defined service/interface/command labels for manually dumped traces.
