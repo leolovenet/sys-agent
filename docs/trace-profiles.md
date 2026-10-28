@@ -13,6 +13,7 @@ python3 client/sysagent.py --host switch debug trace-run profile.json \
 python3 client/sysagent.py --host switch debug trace-run profile.json \
   --wait --output trace.jsonl
 python3 client/sysagent.py debug trace-report trace.jsonl profile.json --json
+python3 client/sysagent.py --host switch debug read 0x71 main+0x1000 4
 ```
 
 `trace-plan` resolves the profile without arming a trace. `trace-run` resolves it again and
@@ -25,12 +26,18 @@ That export is annotated with the profile target IDs, process IDs and original m
 address layout. It verifies each target offset, correlates configured entry/return IDs, and
 marks each return-time `x0` as zero or non-zero.
 
-## Schema version 1
+## Schema version 2
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "name": "client-server-entry-return",
+  "symbols": {
+    "client_entry": "0x1000",
+    "client_return": "0x1010",
+    "server_entry": "0x2000",
+    "server_return": "0x2010"
+  },
   "processes": [
     {
       "id": "client",
@@ -50,10 +57,32 @@ marks each return-time `x0` as zero or non-zero.
     }
   ],
   "targets": [
-    {"id": "client-entry", "process": "client", "offset": "0x1000"},
-    {"id": "server-entry", "process": "server", "offset": "0x2000"},
-    {"id": "client-return", "process": "client", "offset": "0x1010"},
-    {"id": "server-return", "process": "server", "offset": "0x2010"}
+    {
+      "id": "client-entry",
+      "process": "client",
+      "symbol": "client_entry",
+      "expectBytes": "FD7BBFA9",
+      "snapshots": [
+        {"spec": "x1:0x100", "name": "request", "kind": "ipc"}
+      ]
+    },
+    {
+      "id": "server-entry",
+      "process": "server",
+      "symbol": "server_entry",
+      "snapshots": [
+        {"spec": "x1:0x100", "name": "request", "kind": "ipc"}
+      ]
+    },
+    {
+      "id": "client-return",
+      "process": "client",
+      "symbol": "client_return",
+      "snapshots": [
+        {"spec": "x1:0x100", "name": "response", "kind": "ipc"}
+      ]
+    },
+    {"id": "server-return", "process": "server", "symbol": "server_return"}
   ],
   "pairs": [
     {
@@ -74,11 +103,14 @@ marks each return-time `x0` as zero or non-zero.
     "hits": 64,
     "ring": 64,
     "duration": 30,
-    "args": 8,
-    "snapshots": ["x1:0x100"]
+    "args": 8
   }
 }
 ```
+
+Profile schema 1 remains readable. It uses global `trace.snapshots` strings and target `offset`.
+Schema 2 adds per-target named snapshots, a consumer-owned `symbols` offset table, and
+`expectBytes`. These symbols are not a symbol database bundled with sys-agent.
 
 ### Process selectors
 
@@ -101,6 +133,12 @@ prefixes. A mismatch stops the command before any hardware breakpoint is armed.
 - Target and process IDs must be unique.
 - `offset` is relative to the selected process's main module and must be
   `0x`-prefixed, non-negative and four-byte aligned.
+- Schema 2 targets use exactly one of `offset` or `symbol`; each symbol references the
+  top-level offsets map.
+- `expectBytes` is optional. Before arming, `debug read PID ADDRESS SIZE` validates the bytes
+  through a short-lived debug attach.
+- Schema 2 targets may declare zero to two snapshots. A snapshot is either an old-style string
+  or an object with `spec`, optional stable `name`, and optional `kind`.
 - When `debug maps` returns the complete mapping list, the resolved address must fall inside a
   readable executable mapping. If the console reports `truncated=1` before the module mapping is
   listed, the plan keeps the module-base validation and marks that target as
@@ -126,8 +164,8 @@ For a single process, profile declaration order is the trace target order.
 ### Trace options
 
 The optional `trace` object supplies defaults for `hits`, `ring`, `duration`, `args` and
-`snapshots`. Command-line options override them. The sysmodule's normal safety rules still
-apply:
+legacy global `snapshots`. Command-line options override them. The sysmodule's normal safety
+rules still apply:
 
 - `hits 0` requires a ring;
 - ring size is 1 through 64;
@@ -135,9 +173,9 @@ apply:
 - snapshot specifications use `REG[+/-OFFSET]:SIZE`, are limited to two entries and may read at
   most 0x100 bytes per snapshot.
 
-Snapshots are captured for every profile target with the same register-relative rule. For a
-typical HIPC boundary, `"snapshots": ["x1:0x100"]` captures the message buffer referenced by
-the first argument after the service object.
+Schema 1 global snapshots apply to every target. Schema 2 per-target snapshots override the
+global rule for that target. Wire protocol uses `snap=SPEC` for a global snapshot and
+`tsnap=TARGET_INDEX:SPEC` for a target-specific snapshot.
 
 ## Triggering while armed
 
@@ -187,6 +225,9 @@ Decoded request headers contain `commandId` and `token`; response headers contai
 `token`. `trace-ipc` scans all snapshot slots in one or more trace files and skips snapshots
 that do not contain a valid CMIF header. The decoder intentionally does not claim that a
 Command ID has a particular service-specific meaning.
+
+If target metadata marks a snapshot as `"kind": "ipc"`, `trace-ipc` scans only those slots.
+This avoids trying unrelated object/state snapshots first.
 
 For trace files produced by `trace-run --output`, the embedded profile pairs let `trace-ipc`
 combine matching request and response records into transactions. Each transaction reports the

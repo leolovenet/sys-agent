@@ -380,3 +380,20 @@ Result debugProcessResolveMainBase(u64 pid, u64* outMainBase)
     *outMainBase = modules[count > 1 ? 1 : 0].base_address;
     return 0;
 }
+
+Result debugProcessReadMemory(u64 pid, u64 address, void* out, u32 size)
+{
+    if (pid == 0 || address == 0 || out == NULL || size == 0)
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+    Handle debug = INVALID_HANDLE;
+    bool dmntClosed = false;
+    Result rc = debugProcessOpen(pid, &debug, &dmntClosed);
+    if (R_FAILED(rc))
+        return rc;
+    rc = debugProcessDrain(debug);
+    if (R_SUCCEEDED(rc))
+        rc = svcReadDebugProcessMemory(out, debug, address, size);
+    debugProcessClose(debug);
+    return rc;
+}

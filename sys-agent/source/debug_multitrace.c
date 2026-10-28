@@ -39,6 +39,9 @@ typedef struct {
     u32 argsCount;
     u32 snapshotCount;
     DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX];
+    u32 targetSnapshotCounts[DEBUG_MULTITRACE_TARGET_MAX];
+    DebugTraceSnapshotSpec targetSnapshots[DEBUG_MULTITRACE_TARGET_MAX]
+        [DEBUG_TRACE_SNAPSHOT_MAX];
     u32 ignoredHits;
     u64 lastSequence;
     u64 lastPc;
@@ -266,6 +269,9 @@ static void multiTraceThreadMain(void* arg)
     u32 argsCount = 0;
     u32 snapshotCount = 0;
     DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX];
+    u32 targetSnapshotCounts[DEBUG_MULTITRACE_TARGET_MAX];
+    DebugTraceSnapshotSpec targetSnapshots[DEBUG_MULTITRACE_TARGET_MAX]
+        [DEBUG_TRACE_SNAPSHOT_MAX];
     u32 context1 = 0;
     u32 context2 = 0;
     u32 slots[DEBUG_MULTITRACE_TARGET_MAX] = { 0, 0, 0, 0 };
@@ -279,6 +285,10 @@ static void multiTraceThreadMain(void* arg)
     argsCount = multiState.argsCount;
     snapshotCount = multiState.snapshotCount;
     memcpy(snapshots, multiState.snapshots, sizeof(snapshots));
+    memcpy(targetSnapshotCounts, multiState.targetSnapshotCounts,
+        sizeof(targetSnapshotCounts));
+    memcpy(targetSnapshots, multiState.targetSnapshots,
+        sizeof(targetSnapshots));
     mutexUnlock(&multiState.mutex);
 
     for (u32 i = 0; i < DEBUG_MULTITRACE_PROCESS_COUNT; i++)
@@ -409,9 +419,15 @@ static void multiTraceThreadMain(void* arg)
                 if (targetIndex != UINT32_MAX
                     && targetProcesses[targetIndex] == processIndex) {
                     DebugTraceEvent captured;
+                    const u32 eventSnapshotCount =
+                        targetSnapshotCounts[targetIndex]
+                        ? targetSnapshotCounts[targetIndex] : snapshotCount;
+                    const DebugTraceSnapshotSpec* eventSnapshots =
+                        targetSnapshotCounts[targetIndex]
+                        ? targetSnapshots[targetIndex] : snapshots;
                     captureEvent(handles[processIndex], &event, targetIndex,
-                        addresses[targetIndex], argsCount, snapshots,
-                        snapshotCount, &captured);
+                        addresses[targetIndex], argsCount, eventSnapshots,
+                        eventSnapshotCount, &captured);
                     recordEvent(&captured);
                     if (hitLimitReached()) {
                         mutexLock(&multiState.mutex);
@@ -516,6 +532,23 @@ bool debugMultiTraceStart(const DebugMultiTraceConfig* config)
             return false;
         }
     }
+    for (u32 target = 0; target < config->targetCount; target++) {
+        if (config->targetSnapshotCounts[target]
+                > DEBUG_TRACE_SNAPSHOT_MAX) {
+            setError("invalidSnapshot", MAKERESULT(Module_Libnx,
+                LibnxError_BadInput));
+            return false;
+        }
+        for (u32 snapshot = 0;
+            snapshot < config->targetSnapshotCounts[target]; snapshot++) {
+            if (!debugTraceSnapshotSpecIsValid(
+                    &config->targetSnapshots[target][snapshot])) {
+                setError("invalidSnapshot", MAKERESULT(Module_Libnx,
+                    LibnxError_BadInput));
+                return false;
+            }
+        }
+    }
     bool processRepresented[DEBUG_MULTITRACE_PROCESS_COUNT] = {
         false, false,
     };
@@ -584,6 +617,10 @@ bool debugMultiTraceStart(const DebugMultiTraceConfig* config)
     multiState.snapshotCount = config->snapshotCount;
     memcpy(multiState.snapshots, config->snapshots,
         sizeof(multiState.snapshots));
+    memcpy(multiState.targetSnapshotCounts, config->targetSnapshotCounts,
+        sizeof(multiState.targetSnapshotCounts));
+    memcpy(multiState.targetSnapshots, config->targetSnapshots,
+        sizeof(multiState.targetSnapshots));
     multiState.ignoredHits = 0;
     multiState.hasEvent = false;
     multiState.lastSequence = 0;
@@ -675,6 +712,10 @@ bool debugMultiTraceGetStatus(DebugMultiTraceStatus* out)
     out->snapshotCount = multiState.snapshotCount;
     memcpy(out->snapshots, multiState.snapshots,
         sizeof(out->snapshots));
+    memcpy(out->targetSnapshotCounts, multiState.targetSnapshotCounts,
+        sizeof(out->targetSnapshotCounts));
+    memcpy(out->targetSnapshots, multiState.targetSnapshots,
+        sizeof(out->targetSnapshots));
     out->ignoredHits = multiState.ignoredHits;
     out->lastSequence = multiState.lastSequence;
     out->lastPc = multiState.lastPc;

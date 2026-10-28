@@ -49,3 +49,6 @@ void debugProcessPrintModules(u64 pid, u32 limit);
 
 /* Resolve the main NSO base for any process through ldr:dmnt. */
 Result debugProcessResolveMainBase(u64 pid, u64* outMainBase);
+
+/* Transactionally attach, read up to `size` bytes, then release the process. */
+Result debugProcessReadMemory(u64 pid, u64 address, void* out, u32 size);

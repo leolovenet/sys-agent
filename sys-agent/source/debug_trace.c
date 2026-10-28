@@ -40,6 +40,9 @@ typedef struct {
     u32 ignoredHits;
     u32 snapshotCount;
     DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX];
+    u32 targetSnapshotCounts[DEBUG_TRACE_TARGET_MAX];
+    DebugTraceSnapshotSpec targetSnapshots[DEBUG_TRACE_TARGET_MAX]
+        [DEBUG_TRACE_SNAPSHOT_MAX];
     u64 lastPc;
     u64 lastLr;
     u64 lastSp;
@@ -302,12 +305,19 @@ static void traceThreadMain(void* arg)
     u64 targets[DEBUG_TRACE_TARGET_MAX];
     u32 instructionSlots[DEBUG_TRACE_TARGET_MAX];
     DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX];
+    u32 targetSnapshotCounts[DEBUG_TRACE_TARGET_MAX];
+    DebugTraceSnapshotSpec targetSnapshots[DEBUG_TRACE_TARGET_MAX]
+        [DEBUG_TRACE_SNAPSHOT_MAX];
 
     mutexLock(&traceState.mutex);
     pid = traceState.processId;
     argsCount = traceState.argsCount;
     targetCount = traceState.targetCount;
     snapshotCount = traceState.snapshotCount;
+    memcpy(targetSnapshotCounts, traceState.targetSnapshotCounts,
+        sizeof(targetSnapshotCounts));
+    memcpy(targetSnapshots, traceState.targetSnapshots,
+        sizeof(targetSnapshots));
     memcpy(targets, traceState.targetAddresses, sizeof(targets));
     memcpy(snapshots, traceState.snapshots, sizeof(snapshots));
     mutexUnlock(&traceState.mutex);
@@ -429,9 +439,14 @@ static void traceThreadMain(void* arg)
                     continue;
                 }
                 DebugTraceEvent captured;
+                const u32 eventSnapshotCount = targetSnapshotCounts[targetIndex]
+                    ? targetSnapshotCounts[targetIndex] : snapshotCount;
+                const DebugTraceSnapshotSpec* eventSnapshots =
+                    targetSnapshotCounts[targetIndex]
+                    ? targetSnapshots[targetIndex] : snapshots;
                 captureEvent(debugHandle, &event, targetIndex,
-                    targets[targetIndex], argsCount, snapshots,
-                    snapshotCount, &captured);
+                    targets[targetIndex], argsCount, eventSnapshots,
+                    eventSnapshotCount, &captured);
                 recordEvent(&captured);
                 if (hitLimitReached()) {
                     setStage("hitsReached");
@@ -561,6 +576,25 @@ bool debugTraceStart(const DebugTraceConfig* config)
         mutexUnlock(&traceState.mutex);
         return false;
     }
+    for (u32 target = 0; target < config->targetCount; target++) {
+        if (config->targetSnapshotCounts[target]
+                > DEBUG_TRACE_SNAPSHOT_MAX) {
+            traceState.lastError =
+                MAKERESULT(Module_Libnx, LibnxError_BadInput);
+            mutexUnlock(&traceState.mutex);
+            return false;
+        }
+        for (u32 snapshot = 0;
+            snapshot < config->targetSnapshotCounts[target]; snapshot++) {
+            if (!debugTraceSnapshotSpecIsValid(
+                    &config->targetSnapshots[target][snapshot])) {
+                traceState.lastError =
+                    MAKERESULT(Module_Libnx, LibnxError_BadInput);
+                mutexUnlock(&traceState.mutex);
+                return false;
+            }
+        }
+    }
 
     traceState.processId = config->processId;
     traceState.targetCount = config->targetCount;
@@ -584,6 +618,10 @@ bool debugTraceStart(const DebugTraceConfig* config)
     traceState.snapshotCount = config->snapshotCount;
     memcpy(traceState.snapshots, config->snapshots,
         sizeof(traceState.snapshots));
+    memcpy(traceState.targetSnapshotCounts, config->targetSnapshotCounts,
+        sizeof(traceState.targetSnapshotCounts));
+    memcpy(traceState.targetSnapshots, config->targetSnapshots,
+        sizeof(traceState.targetSnapshots));
     traceState.hasEvent = false;
     traceState.dmntClosed = false;
     traceState.lastPc = 0;
@@ -677,6 +715,10 @@ bool debugTraceGetStatus(DebugTraceStatus* out)
     out->snapshotCount = traceState.snapshotCount;
     memcpy(out->snapshots, traceState.snapshots,
         sizeof(out->snapshots));
+    memcpy(out->targetSnapshotCounts, traceState.targetSnapshotCounts,
+        sizeof(out->targetSnapshotCounts));
+    memcpy(out->targetSnapshots, traceState.targetSnapshots,
+        sizeof(out->targetSnapshots));
     out->lastSequence = traceState.hasEvent
         ? traceState.lastEvent.sequence : 0;
     out->lastPc = traceState.lastPc;

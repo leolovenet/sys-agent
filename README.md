@@ -64,6 +64,9 @@ commands should follow this rule:
   `trace-report` workflows without embedding game offsets in the sysmodule. The client decodes
   captured HIPC envelopes and CMIF request/response headers with `ipc-decode` / `trace-ipc`,
   pairing profile entry/return targets into transactions; see `docs/trace-profiles.md`.
+- Profile v2 adds per-target named snapshots, consumer-owned symbol offsets and exact
+  instruction-byte validation before arming. `debug read PID ADDRESS SIZE` is the generic,
+  transactional primitive used for those checks.
 - Experimental `debug multitrace` holds two debug handles simultaneously with independently
   probed context-IDR slots, allowing up to two instruction targets in each of two processes.
   The optional second target on each side can be the corresponding caller return address,
@@ -93,7 +96,7 @@ commands should follow this rule:
   resume guaranteed on every error path. It targets the foreground application by default
   or any process via `pid=`. Cache maintenance for the target is handled by the kernel's
   debug-write path; the primitive never issues cache ops on a target address.
-- Generic process inspection (`debug maps`, `debug threads`, `debug modules`) works on
+- Generic process inspection (`debug maps`, `debug threads`, `debug modules`, `debug read`) works on
   the foreground application or an explicit PID. It reports mapped regions, thread
   PC/LR/SP plus scheduler state, and module base/size/Build ID information supplied by
   `ldr:dmnt`; the latter is capped at the two-module request size this stack supports.

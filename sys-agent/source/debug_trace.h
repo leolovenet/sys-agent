@@ -14,6 +14,9 @@ typedef struct {
     u32 argsCount;
     DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX];
     u32 snapshotCount;
+    DebugTraceSnapshotSpec targetSnapshots[DEBUG_TRACE_TARGET_MAX]
+        [DEBUG_TRACE_SNAPSHOT_MAX];
+    u32 targetSnapshotCounts[DEBUG_TRACE_TARGET_MAX];
 } DebugTraceConfig;
 
 typedef struct {
@@ -41,6 +44,9 @@ typedef struct {
     u32 ignoredHits;
     u32 snapshotCount;
     DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX];
+    u32 targetSnapshotCounts[DEBUG_TRACE_TARGET_MAX];
+    DebugTraceSnapshotSpec targetSnapshots[DEBUG_TRACE_TARGET_MAX]
+        [DEBUG_TRACE_SNAPSHOT_MAX];
     u64 lastSequence;
     u64 lastPc;
     u64 lastLr;

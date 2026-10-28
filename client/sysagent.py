@@ -21,9 +21,9 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.6.0"
+CLIENT_VERSION = "1.7.0"
 TRACE_SCHEMA_VERSION = 1
-TRACE_PROFILE_SCHEMA_VERSION = 1
+TRACE_PROFILE_SCHEMA_VERSION = 2
 
 # The console's default keySleepTime (25 ms) is fast enough for the home menu but too
 # fast for the game's on-screen keyboard: measured in ACNH 3.0.3's chat field, 25/30 ms
@@ -747,6 +747,20 @@ class SysAgentClient:
         if offset < 0 or count < 1 or count > 64:
             raise ValueError("offset must be non-negative and count must be in 1..64")
         return require_ok(self.command(f"processList {offset} {count}", retry=True))
+
+    def debug_read(self, pid: int, address: int, size: int) -> bytes:
+        if pid <= 0 or address <= 0 or not 1 <= size <= 0x1000:
+            raise ValueError("debug read needs pid/address > 0 and size in 1..0x1000")
+        response = require_ok(self.command(
+            f"debug read 0x{pid:X} 0x{address:X} 0x{size:X}", retry=True))
+        try:
+            data = bytes.fromhex(response["data"])
+        except (KeyError, ValueError) as exc:
+            raise SysAgentProtocolError("invalid debug read response") from exc
+        if len(data) != size:
+            raise SysAgentProtocolError(
+                f"debug read returned {len(data)} bytes, expected {size}")
+        return data
 
     def system_action(self, action: str, unlock: bool = True) -> dict[str, str]:
         commands = {
@@ -1834,17 +1848,69 @@ def _validate_snapshot_spec(value: str, label: str) -> None:
         raise ValueError(f"{label} snapshot size must be in 1..0x100")
 
 
+def _profile_snapshot_entries(value: object,
+                              label: str) -> list[dict[str, str]]:
+    entries = _profile_list(value, label)
+    if len(entries) > 2:
+        raise ValueError(f"{label} supports at most two snapshots")
+    result: list[dict[str, str]] = []
+    names: set[str] = set()
+    for index, raw_entry in enumerate(entries):
+        if isinstance(raw_entry, str):
+            entry = {"spec": raw_entry}
+        else:
+            entry = _profile_object(raw_entry, f"{label}[{index}]")
+            spec = entry.get("spec")
+            if not isinstance(spec, str):
+                raise ValueError(f"{label}[{index}].spec must be a string")
+            entry = {key: value for key, value in entry.items()}
+        _validate_snapshot_spec(str(entry["spec"]), f"{label}[{index}]")
+        name = entry.get("name")
+        if name is not None:
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"{label}[{index}].name must be a non-empty string")
+            if name in names:
+                raise ValueError(f"{label} has duplicate snapshot name {name!r}")
+            names.add(name)
+        kind = entry.get("kind")
+        if kind is not None and not isinstance(kind, str):
+            raise ValueError(f"{label}[{index}].kind must be a string")
+        result.append({
+            "spec": str(entry["spec"]),
+            **({"name": name} if name is not None else {}),
+            **({"kind": kind} if kind is not None else {}),
+        })
+    return result
+
+
+def _profile_target_offset(profile: dict[str, object],
+                           target: dict[str, object], label: str) -> int:
+    if "offset" in target:
+        return _profile_offset(target["offset"], f"{label} offset")
+    symbol = target.get("symbol")
+    symbols = profile.get("symbols", {})
+    if isinstance(symbol, str) and isinstance(symbols, dict) and symbol in symbols:
+        return _profile_offset(symbols[symbol], f"symbols[{symbol}]")
+    raise ValueError(f"{label} needs an offset or a symbol present in symbols")
+
+
 def load_trace_profile(path: str) -> dict[str, object]:
     """Load and validate a versioned, game-independent execution-trace profile."""
     with open(path, encoding="utf-8") as handle:
         profile = json.load(handle)
     profile = _profile_object(profile, "trace profile")
     schema = parse_int(str(profile.get("schemaVersion", "0")))
-    if schema != TRACE_PROFILE_SCHEMA_VERSION:
+    if schema not in (1, TRACE_PROFILE_SCHEMA_VERSION):
         raise ValueError(f"unsupported trace profile schema {schema}")
     if "name" in profile and (
             not isinstance(profile["name"], str) or not profile["name"]):
         raise ValueError("profile name must be a non-empty string")
+    symbols = profile.get("symbols", {})
+    symbols = _profile_object(symbols, "symbols")
+    for symbol, offset in symbols.items():
+        if not isinstance(symbol, str) or not symbol:
+            raise ValueError("symbol names must be non-empty strings")
+        _profile_offset(offset, f"symbols[{symbol}]")
 
     processes = [
         _profile_object(value, f"processes[{index}]")
@@ -1911,7 +1977,31 @@ def load_trace_profile(path: str) -> dict[str, object]:
         if not isinstance(process_id, str) or process_id not in process_ids:
             raise ValueError(
                 f"target {target_id} references unknown process {process_id!r}")
-        _profile_offset(target.get("offset"), f"target {target_id} offset")
+        if schema == 1:
+            _profile_offset(target.get("offset"), f"target {target_id} offset")
+        else:
+            if ("offset" in target) == ("symbol" in target):
+                raise ValueError(
+                    f"target {target_id} needs exactly one of offset/symbol")
+            _profile_target_offset(profile, target, f"target {target_id}")
+            if "snapshots" in target:
+                target["_parsedSnapshots"] = _profile_snapshot_entries(
+                    target["snapshots"], f"target {target_id}.snapshots")
+            else:
+                target.pop("_parsedSnapshots", None)
+            expected_bytes = target.get("expectBytes")
+            if expected_bytes is not None:
+                if not isinstance(expected_bytes, str) or not expected_bytes:
+                    raise ValueError(
+                        f"target {target_id}.expectBytes must be a hex string")
+                try:
+                    parsed_bytes = bytes.fromhex(expected_bytes)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"target {target_id}.expectBytes must be a hex string") from exc
+                if not 1 <= len(parsed_bytes) <= 32:
+                    raise ValueError(
+                        f"target {target_id}.expectBytes must be 1..32 bytes")
         targets_per_process[process_id] += 1
         target_ids[target_id] = target
 
@@ -1972,15 +2062,8 @@ def load_trace_profile(path: str) -> dict[str, object]:
                     not isinstance(trace_options[name], int)
                     or trace_options[name] < 0):
                 raise ValueError(f"trace.{name} must be a non-negative integer")
-        snapshots = trace_options.get("snapshots", [])
-        snapshots = _profile_list(snapshots, "trace.snapshots")
-        if len(snapshots) > 2 or any(
-                not isinstance(value, str) or not value for value in snapshots):
-            raise ValueError(
-                "trace.snapshots must contain at most two non-empty strings")
-        for index, snapshot in enumerate(snapshots):
-            _validate_snapshot_spec(
-                str(snapshot), f"trace.snapshots[{index}]")
+        _profile_snapshot_entries(
+            trace_options.get("snapshots", []), "trace.snapshots")
     return profile
 
 
@@ -2108,6 +2191,11 @@ def resolve_trace_profile(client: SysAgentClient,
                           profile: dict[str, object]) -> dict[str, object]:
     """Resolve PIDs/modules/offsets in a validated profile into a trace plan."""
     game = client.game_status()
+    trace_config = profile.get("trace", {})
+    trace_config = trace_config if isinstance(trace_config, dict) else {}
+    global_snapshots = _profile_snapshot_entries(
+        trace_config.get("snapshots", []),
+        "trace.snapshots")
     resolved_processes: list[dict[str, object]] = []
     resolved_by_id: dict[str, dict[str, object]] = {}
     executable_maps_by_pid: dict[
@@ -2194,7 +2282,8 @@ def resolve_trace_profile(client: SysAgentClient,
         target = _profile_object(raw_target, "target")
         target_id = str(target["id"])
         process = resolved_by_id[str(target["process"])]
-        offset = _profile_offset(target.get("offset"), f"target {target_id} offset")
+        offset = _profile_target_offset(
+            profile, target, f"target {target_id}")
         address = int(str(process["moduleBase"]), 0) + offset
         if address in addresses:
             raise SysAgentProtocolError(
@@ -2210,6 +2299,18 @@ def resolve_trace_profile(client: SysAgentClient,
             raise SysAgentProtocolError(
                 f"target {target_id} address 0x{address:X} is not in an "
                 "executable mapping")
+        expected_bytes = target.get("expectBytes")
+        if expected_bytes is not None:
+            expected = bytes.fromhex(str(expected_bytes))
+            actual = client.debug_read(
+                int(process["pid"]), address, len(expected))
+            if actual != expected:
+                raise SysAgentProtocolError(
+                    f"target {target_id} instruction mismatch: expected "
+                    f"{expected.hex().upper()}, got {actual.hex().upper()}")
+        target_snapshots = target.get("_parsedSnapshots", global_snapshots)
+        if not isinstance(target_snapshots, list):
+            target_snapshots = global_snapshots
         addresses.add(address)
         resolved_targets.append({
             "id": target_id,
@@ -2220,6 +2321,8 @@ def resolve_trace_profile(client: SysAgentClient,
             "moduleIndex": process["moduleIndex"],
             "moduleBase": process["moduleBase"],
             "offset": f"0x{offset:X}",
+            "expectBytes": expected_bytes,
+            "snapshots": target_snapshots,
             "mapping": (
                 f"0x{int(mapping['base']):X}+0x{int(mapping['size']):X}"
                 f":p{int(mapping['permission'])}"
@@ -2515,6 +2618,10 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
             if isinstance(target, dict)
         } if isinstance(targets, list) else {}
         if profile is not None:
+            trace_config = profile.get("trace", {})
+            trace_config = trace_config if isinstance(trace_config, dict) else {}
+            default_snapshots = _profile_snapshot_entries(
+                trace_config.get("snapshots", []), "trace.snapshots")
             for index, raw_target in enumerate(_profile_target_order(profile)):
                 target = _profile_object(raw_target, "profile target")
                 trace_target = target_metadata.get(str(index))
@@ -2525,8 +2632,8 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
                     trace_target.get("process"), "trace target process")
                 module_base = _trace_address(process.get("moduleBase"))
                 trace_address = _trace_address(trace_target.get("address"))
-                offset = _profile_offset(
-                    target.get("offset"), f"target {target['id']} offset")
+                offset = _profile_target_offset(
+                    profile, target, f"target {target['id']}")
                 if (module_base is None or trace_address is None
                         or module_base + offset != trace_address):
                     raise SysAgentProtocolError(
@@ -2536,6 +2643,8 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
                     **trace_target,
                     "id": target["id"],
                     "processId": target["process"],
+                    "snapshots": target.get(
+                        "_parsedSnapshots", default_snapshots),
                 }
             profile_pairs = _profile_list(profile.get("pairs", []), "pairs")
         else:
@@ -2561,8 +2670,21 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
             if not isinstance(event, dict):
                 continue
             snapshot_count = parse_int(str(event.get("snapshots", "0")))
+            target_index = str(event.get("target", "0"))
+            target = target_metadata.get(target_index, {})
+            snapshot_metadata = (
+                target.get("snapshots", [])
+                if isinstance(target, dict) else [])
+            snapshot_metadata = (
+                snapshot_metadata
+                if isinstance(snapshot_metadata, list) else [])
+            ipc_indexes = [
+                index for index, entry in enumerate(snapshot_metadata)
+                if isinstance(entry, dict) and entry.get("kind") == "ipc"
+            ]
             indexes = (
                 (snapshot_index,) if snapshot_index is not None
+                else tuple(ipc_indexes) if ipc_indexes
                 else tuple(range(snapshot_count)))
             for index in indexes:
                 if not 0 <= index < 2:
@@ -2577,8 +2699,11 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
                 except (ValueError, SysAgentProtocolError):
                     skipped += 1
                     continue
-                target_index = str(event.get("target", "0"))
-                target = target_metadata.get(target_index, {})
+                snapshot_info = (
+                    snapshot_metadata[index]
+                    if index < len(snapshot_metadata)
+                    and isinstance(snapshot_metadata[index], dict)
+                    else {})
                 record = {
                     "sessionId": session_id,
                     "seq": event.get("seq"),
@@ -2588,6 +2713,8 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
                     "targetAddress": event.get("targetAddress"),
                     "targetId": target.get("id") if isinstance(target, dict) else None,
                     "snapshot": index,
+                    "snapshotName": snapshot_info.get("name"),
+                    "snapshotKind": snapshot_info.get("kind"),
                     "snapshotAddress": event.get(f"snap{index}Address"),
                     **decoded,
                 }
@@ -2846,7 +2973,8 @@ def report_trace_with_profile(document: dict[str, object],
         if module_base is None or trace_address is None:
             raise SysAgentProtocolError(
                 f"trace target {target_id} has no module/address metadata")
-        offset = _profile_offset(target.get("offset"), f"target {target_id} offset")
+        offset = _profile_target_offset(
+            profile, target, f"target {target_id}")
         expected_address = module_base + offset
         if trace_address != expected_address:
             raise SysAgentProtocolError(
@@ -2885,6 +3013,7 @@ def report_trace_with_profile(document: dict[str, object],
             "buildId": process.get("buildId"),
             "address": f"0x{trace_address:X}",
             "offset": f"0x{offset:X}",
+            "snapshots": target.get("_parsedSnapshots", []),
         })
 
     pairs: list[dict[str, object]] = []
@@ -3083,6 +3212,10 @@ def _cmd_system_query(client: SysAgentClient, args: argparse.Namespace) -> None:
 
 def _cmd_process_list(client: SysAgentClient, args: argparse.Namespace) -> None:
     print_fields(client.process_list(args.offset, args.count))
+
+
+def _cmd_debug_read(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(client.debug_read(args.pid, args.address, args.size).hex().upper())
 
 
 def _cmd_system_action(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -3582,6 +3715,7 @@ def _annotate_trace_with_plan(output: str, plan: dict[str, object]) -> None:
                 "processId": plan_target["processId"],
                 "offset": plan_target["offset"],
                 "mapping": plan_target["mapping"],
+                "snapshots": plan_target.get("snapshots", []),
             })
     metadata["profile"] = {
         "schemaVersion": plan["schemaVersion"],
@@ -3818,15 +3952,12 @@ def _trace_profile_options(profile: dict[str, object],
         name: (int(value) if value is not None else None)
         for name, value in options.items()
     }
-    snapshots = getattr(args, "snapshots", None)
-    if snapshots is None:
-        snapshots = configured.get("snapshots", [])
-    if not isinstance(snapshots, list) or len(snapshots) > 2 or any(
-            not isinstance(value, str) or not value for value in snapshots):
-        raise ValueError("snapshots must contain at most two non-empty strings")
-    for index, snapshot in enumerate(snapshots):
+    cli_snapshots = getattr(args, "snapshots", None) or []
+    if len(cli_snapshots) > 2:
+        raise ValueError("at most two --snapshot specifications are supported")
+    for index, snapshot in enumerate(cli_snapshots):
         _validate_snapshot_spec(str(snapshot), f"snapshots[{index}]")
-    parsed_options["snapshots"] = snapshots
+    parsed_options["globalSnapshots"] = cli_snapshots
     return parsed_options
 
 
@@ -3862,8 +3993,22 @@ def _start_plan_trace(client: SysAgentClient, plan: dict[str, object],
         value = options.get(name)
         if value is not None:
             parts.extend((name, str(value)))
-    for snapshot in options.get("snapshots", []):
+    for snapshot in options.get("globalSnapshots", []):
         parts.append(f"snap={snapshot}")
+    for raw_target in targets:
+        target = _profile_object(raw_target, "plan target")
+        target_snapshots = target.get("snapshots", [])
+        if not isinstance(target_snapshots, list):
+            continue
+        for snapshot in target_snapshots:
+            if isinstance(snapshot, str):
+                spec = snapshot
+            elif isinstance(snapshot, dict):
+                spec = snapshot.get("spec")
+            else:
+                continue
+            if isinstance(spec, str):
+                parts.append(f"tsnap={target['index']}:{spec}")
     client.timeout = max(client.timeout, 30.0)
     return require_ok(client.command(" ".join(parts)))
 
@@ -4602,6 +4747,11 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 (Arg("left", "baseline JSONL trace", metavar="LEFT"),
                  Arg("right", "candidate JSONL trace", metavar="RIGHT"),
                  JSON_ARG, OUT_ARG)),
+        Command("read", "Read bytes from an arbitrary process and address",
+                _cmd_debug_read,
+                (Arg("pid", "target process ID", type=parse_int),
+                 Arg("address", "absolute or main+OFFSET address"),
+                 Arg("size", "byte count (1..0x1000)", type=parse_int))),
     )),
 
     CommandGroup("memory", "Read or write process memory", (

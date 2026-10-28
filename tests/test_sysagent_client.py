@@ -96,6 +96,10 @@ class FakeHandler(socketserver.StreamRequestHandler):
                         f"OK pid=0x{pid:X} count=1 limit={command[3]} "
                         f"truncated=0 dmntClosed=0 "
                         f"maps=0=0x{base:X}+0x{size:X}:t3/p5")
+                elif command[1] == "read":
+                    response = (
+                        f"OK pid={command[2]} address={command[3]} "
+                        f"size={command[4]} data=FD7BBFA9")
                 elif command[1] == "trace":
                     if state.trace_busy:
                         response = "ERR code=TRACE_BUSY result=0x0 stage="
@@ -788,7 +792,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(self.server.state.last_command[:7], [
                 "debug", "multitrace", "0x1234", "0x290C1BC5C0",
                 "0x6C", "0x30162620", "also"])
-            self.assertIn("snap=x1:0x100", self.server.state.last_command)
+            self.assertIn("tsnap=0:x1:0x100", self.server.state.last_command)
             trace_output = os.path.join(directory, "profile-trace.jsonl")
             self.assertEqual(main(run_base + ["--output", trace_output]), 0)
             with open(trace_output, encoding="utf-8") as handle:
@@ -987,6 +991,72 @@ class ClientTests(unittest.TestCase):
                 "--host", "127.0.0.1", "--port",
                 str(self.server.server_address[1]), "--timeout", "1",
                 "debug", "trace-ipc", trace_path]), 0)
+
+    def test_trace_profile_v2_symbols_snapshots_and_expected_bytes(self) -> None:
+        import json
+        import tempfile
+        from client.sysagent import (load_trace_profile, main,
+                                     resolve_trace_profile)
+
+        profile_data = {
+            "schemaVersion": 2,
+            "name": "v2",
+            "symbols": {
+                "entry": "0x3DB65C0",
+                "second": "0x3DB65C4",
+            },
+            "processes": [{"id": "client", "foreground": True}],
+            "targets": [
+                {
+                    "id": "entry",
+                    "process": "client",
+                    "symbol": "entry",
+                    "expectBytes": "FD7BBFA9",
+                    "snapshots": [{
+                        "spec": "x1:0x100",
+                        "name": "request",
+                        "kind": "ipc",
+                    }],
+                },
+                {
+                    "id": "second",
+                    "process": "client",
+                    "symbol": "second",
+                    "expectBytes": "FD7BBFA9",
+                    "snapshots": [{
+                        "spec": "x2:0x40",
+                        "name": "state",
+                    }],
+                },
+            ],
+            "pairs": [{"entry": "entry", "return": "second"}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "v2.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(profile_data, handle)
+            profile = load_trace_profile(path)
+            with self.client() as client:
+                plan = resolve_trace_profile(client, profile)
+            self.assertEqual(plan["targets"][0]["snapshots"][0]["kind"], "ipc")
+            self.assertEqual(plan["targets"][0]["expectBytes"], "FD7BBFA9")
+            self.assertEqual(main([
+                "--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1",
+                "debug", "trace-run", path]), 0)
+            self.assertIn("tsnap=0:x1:0x100",
+                          self.server.state.last_command)
+            self.assertIn("tsnap=1:x2:0x40",
+                          self.server.state.last_command)
+
+            profile_data["targets"][0]["expectBytes"] = "AABBCCDD"
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(profile_data, handle)
+            profile = load_trace_profile(path)
+            with self.client() as client:
+                with self.assertRaisesRegex(
+                        SysAgentProtocolError, "instruction mismatch"):
+                    resolve_trace_profile(client, profile)
 
     def test_trace_analyze_and_diff(self) -> None:
         import json

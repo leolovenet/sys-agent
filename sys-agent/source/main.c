@@ -31,7 +31,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.19.0"
+#define VERSION_S "2.20.0"
 
 typedef enum {
     Active = 0,
@@ -709,6 +709,9 @@ int argmain(int argc, char** argv)
             config.durationSeconds = 60;
             config.argsCount = DEBUG_TRACE_ARGS_MAX;
             DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX] = { 0 };
+            DebugTraceSnapshotSpec targetSnapshots
+                [DEBUG_MULTITRACE_TARGET_MAX][DEBUG_TRACE_SNAPSHOT_MAX] = { 0 };
+            u32 targetSnapshotCounts[DEBUG_MULTITRACE_TARGET_MAX] = { 0 };
             u32 snapshotCount = 0;
             bool hitsSpecified = false;
             int index = 6;
@@ -786,6 +789,25 @@ int argmain(int argc, char** argv)
                     }
                     snapshotCount++;
                     index++;
+                } else if (!strncmp(argv[index], "tsnap=", 6)) {
+                    const char* value = argv[index] + 6;
+                    if (value[0] < '0' || value[0] > '3'
+                        || value[1] != ':' || value[2] == 0) {
+                        printf("ERR code=INVALID_SNAPSHOT\n");
+                        return 0;
+                    }
+                    const u32 target = (u32)(value[0] - '0');
+                    if (target >= DEBUG_MULTITRACE_TARGET_MAX
+                        || targetSnapshotCounts[target]
+                            >= DEBUG_TRACE_SNAPSHOT_MAX
+                        || !debugTraceParseSnapshotSpec(value + 2,
+                            &targetSnapshots[target]
+                                [targetSnapshotCounts[target]])) {
+                        printf("ERR code=INVALID_SNAPSHOT\n");
+                        return 0;
+                    }
+                    targetSnapshotCounts[target]++;
+                    index++;
                 } else {
                     printf("ERR code=INVALID_ARGUMENTS\n");
                     return 0;
@@ -798,8 +820,20 @@ int argmain(int argc, char** argv)
                     " detail=unlimited_requires_ring\n");
                 return 0;
             }
+            for (u32 target = config.targetCount;
+                target < DEBUG_MULTITRACE_TARGET_MAX; target++) {
+                if (targetSnapshotCounts[target] != 0) {
+                    printf("ERR code=INVALID_SNAPSHOT"
+                        " detail=target_out_of_range\n");
+                    return 0;
+                }
+            }
             config.snapshotCount = snapshotCount;
             memcpy(config.snapshots, snapshots, sizeof(snapshots));
+            memcpy(config.targetSnapshotCounts, targetSnapshotCounts,
+                sizeof(targetSnapshotCounts));
+            memcpy(config.targetSnapshots, targetSnapshots,
+                sizeof(targetSnapshots));
             if (!debugMultiTraceStart(&config)) {
                 DebugMultiTraceStatus status;
                 debugMultiTraceGetStatus(&status);
@@ -872,6 +906,26 @@ int argmain(int argc, char** argv)
                     printf(",");
                 printf("%u:", i);
                 printTraceSnapshotSpec(&status.snapshots[i]);
+            }
+            printf(" targetSnapCounts=");
+            for (u32 target = 0; target < status.targetCount; target++) {
+                if (target != 0)
+                    printf(",");
+                printf("%u", status.targetSnapshotCounts[target]);
+            }
+            printf(" targetSnapSpecs=");
+            bool firstTargetSnapshot = true;
+            for (u32 target = 0; target < status.targetCount; target++) {
+                for (u32 i = 0;
+                    i < status.targetSnapshotCounts[target]
+                    && i < DEBUG_TRACE_SNAPSHOT_MAX; i++) {
+                    if (!firstTargetSnapshot)
+                        printf(",");
+                    firstTargetSnapshot = false;
+                    printf("%u:%u:", target, i);
+                    printTraceSnapshotSpec(
+                        &status.targetSnapshots[target][i]);
+                }
             }
             printf(" ignoredHits=%u"
                 " ctx=%u,%u slots=%u,%u,%u,%u lastSeq=%lu"
@@ -947,6 +1001,9 @@ int argmain(int argc, char** argv)
             const char* targetTexts[DEBUG_TRACE_TARGET_MAX];
             u32 targetCount = 0;
             DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX];
+            DebugTraceSnapshotSpec targetSnapshots
+                [DEBUG_TRACE_TARGET_MAX][DEBUG_TRACE_SNAPSHOT_MAX] = { 0 };
+            u32 targetSnapshotCounts[DEBUG_TRACE_TARGET_MAX] = { 0 };
             u32 snapshotCount = 0;
             u64 pid = 0;
             u32 maxHits = 1;
@@ -1015,6 +1072,25 @@ int argmain(int argc, char** argv)
                     }
                     snapshotCount++;
                     index++;
+                } else if (!strncmp(argv[index], "tsnap=", 6)) {
+                    const char* value = argv[index] + 6;
+                    if (value[0] < '0' || value[0] > '3'
+                        || value[1] != ':' || value[2] == 0) {
+                        printf("ERR code=INVALID_SNAPSHOT\n");
+                        return 0;
+                    }
+                    const u32 target = (u32)(value[0] - '0');
+                    if (target >= DEBUG_TRACE_TARGET_MAX
+                        || targetSnapshotCounts[target]
+                            >= DEBUG_TRACE_SNAPSHOT_MAX
+                        || !debugTraceParseSnapshotSpec(value + 2,
+                            &targetSnapshots[target]
+                                [targetSnapshotCounts[target]])) {
+                        printf("ERR code=INVALID_SNAPSHOT\n");
+                        return 0;
+                    }
+                    targetSnapshotCounts[target]++;
+                    index++;
                 } else if (!strcmp(argv[index], "hits")
                     || !strcmp(argv[index], "ring")
                     || !strcmp(argv[index], "duration")
@@ -1034,6 +1110,14 @@ int argmain(int argc, char** argv)
             if (targetCount == 0) {
                 printf("ERR code=INVALID_ARGUMENTS\n");
                 return 0;
+            }
+            for (u32 target = targetCount;
+                target < DEBUG_TRACE_TARGET_MAX; target++) {
+                if (targetSnapshotCounts[target] != 0) {
+                    printf("ERR code=INVALID_SNAPSHOT"
+                        " detail=target_out_of_range\n");
+                    return 0;
+                }
             }
             if (ringSize > 0 && !hitsSpecified)
                 maxHits = DEBUG_TRACE_DEFAULT_RING_HITS;
@@ -1101,6 +1185,10 @@ int argmain(int argc, char** argv)
             config.argsCount = argsCount;
             config.snapshotCount = snapshotCount;
             memcpy(config.snapshots, snapshots, sizeof(config.snapshots));
+            memcpy(config.targetSnapshotCounts, targetSnapshotCounts,
+                sizeof(targetSnapshotCounts));
+            memcpy(config.targetSnapshots, targetSnapshots,
+                sizeof(targetSnapshots));
             if (!debugTraceStart(&config)) {
                 DebugTraceStatus status;
                 debugTraceGetStatus(&status);
@@ -1211,6 +1299,26 @@ int argmain(int argc, char** argv)
                     printf(",");
                 printf("%u:", i);
                 printTraceSnapshotSpec(&status.snapshots[i]);
+            }
+            printf(" targetSnapCounts=");
+            for (u32 target = 0; target < status.targetCount; target++) {
+                if (target != 0)
+                    printf(",");
+                printf("%u", status.targetSnapshotCounts[target]);
+            }
+            printf(" targetSnapSpecs=");
+            bool firstTargetSnapshot = true;
+            for (u32 target = 0; target < status.targetCount; target++) {
+                for (u32 i = 0;
+                    i < status.targetSnapshotCounts[target]
+                    && i < DEBUG_TRACE_SNAPSHOT_MAX; i++) {
+                    if (!firstTargetSnapshot)
+                        printf(",");
+                    firstTargetSnapshot = false;
+                    printf("%u:%u:", target, i);
+                    printTraceSnapshotSpec(
+                        &status.targetSnapshots[target][i]);
+                }
             }
             printf(" stage=%s lastError=0x%X hint=%s\n",
                 status.stage, status.lastError, status.hint);
@@ -1514,6 +1622,43 @@ int argmain(int argc, char** argv)
                 }
             }
             debugProcessPrintModules(pid, (u32)limit);
+            return 0;
+        }
+        if (!strcmp(argv[1], "read"))
+        {
+            /* debug read PID ADDRESS|main+OFFSET SIZE */
+            if (argc != 5) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            u64 pid = 0;
+            u64 address = 0;
+            u64 size = 0;
+            if (!tryParseStringToInt(argv[2], &pid) || pid == 0) {
+                printf("ERR code=INVALID_PID\n");
+                return 0;
+            }
+            Result rc = resolveAddressForProcess(pid, argv[3], &address);
+            if (R_FAILED(rc)) {
+                printf("ERR code=INVALID_ADDRESS result=0x%X\n", rc);
+                return 0;
+            }
+            if (!tryParseStringToInt(argv[4], &size)
+                || size == 0 || size > 0x1000) {
+                printf("ERR code=INVALID_SIZE max=0x1000\n");
+                return 0;
+            }
+            u8 data[0x1000];
+            rc = debugProcessReadMemory(pid, address, data, (u32)size);
+            if (R_FAILED(rc)) {
+                printf("ERR code=DEBUG_READ_FAILED result=0x%X\n", rc);
+                return 0;
+            }
+            printf("OK pid=%016lX address=%016lX size=%lu data=",
+                pid, address, size);
+            for (u32 i = 0; i < (u32)size; i++)
+                printf("%02X", data[i]);
+            printf("\n");
             return 0;
         }
         if (!strcmp(argv[1], "watch-last"))

@@ -41,8 +41,8 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.6.0
-sys-agent 2.19.0  (switch:6000)
+client    1.7.0
+sys-agent 2.20.0  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
@@ -150,6 +150,7 @@ python3 client/sysagent.py --host switch debug trace-plan profile.json
 python3 client/sysagent.py --host switch debug trace-run profile.json \
   --duration 30 --ring 64
 python3 client/sysagent.py debug trace-report trace.jsonl profile.json --json
+python3 client/sysagent.py --host switch debug read 0x71 main+0x1000 4
 ```
 
 `debug trace` arms one to four hardware execution breakpoints without patching target code. It
@@ -172,14 +173,15 @@ session and thread; the return event's `x0` is reported as the candidate Result.
 are directly comparable when captured in the same boot, because ordering uses the device system
 tick. `trace-diff` compares event, process, thread and target counts between an A/B pair.
 
-`debug multitrace` is the experimental two-process client for sysmodule `2.19.0+`. It assigns
+`debug multitrace` is the experimental two-process client for sysmodule `2.20.0+`. It assigns
 one instruction target to each explicitly supplied PID, using runtime-probed context and
 instruction slots. `--extra-target1` and `--extra-target2` add one more target to each side;
 use them together to observe client/server entry and caller-return sites in one session. The
 return event's `x0` is the actual function Result when the runtime function returns through
 that address.
 `--snapshot` may be repeated up to twice and captures memory relative to a register at every
-hit. A typical HIPC boundary uses `--snapshot x1:0x100`.
+hit. A typical HIPC boundary uses `--snapshot x1:0x100`. Profile v2 emits per-target
+`tsnap=TARGET_INDEX:SPEC` rules so different sites can capture different pointers.
 `multitrace-dump` writes the same versioned JSONL schema with a `targets[]` process table, so
 `trace-analyze` attributes each event to the correct PID by target index.
 
@@ -189,6 +191,9 @@ PID, verify title/Build IDs, resolve main-module offsets, and retain stable targ
 entry/return reporting. `trace-run --output FILE` waits for completion and exports JSONL;
 without that option it returns immediately after the breakpoints are armed so the caller can
 trigger the operation.
+
+Profile v2 adds a consumer-owned symbol-offset table, per-target named/typed snapshots and
+optional `expectBytes` validation through the generic `debug read PID ADDRESS SIZE` command.
 
 `trace-ipc` scans trace snapshots for HIPC envelopes containing CMIF `SFCI` or `SFCO`
 headers. It reports the target/thread/sequence, command ID for requests, Result for responses,
