@@ -64,6 +64,8 @@ commands should follow this rule:
   `trace-report` workflows without embedding game offsets in the sysmodule. The client decodes
   captured HIPC envelopes and CMIF request/response headers with `ipc-decode` / `trace-ipc`,
   pairing profile entry/return targets into transactions; see `docs/trace-profiles.md`.
+  `trace-timeline` merges multiple sessions from one boot into a single monotonic event and IPC
+  timeline.
 - Profile v2 adds per-target named snapshots, consumer-owned symbol offsets and exact
   instruction-byte validation before arming. `debug read PID ADDRESS SIZE` is the generic,
   transactional primitive used for those checks. `trace-run --wait-process` uses PM creation

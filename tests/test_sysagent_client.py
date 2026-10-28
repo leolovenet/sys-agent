@@ -902,8 +902,8 @@ class ClientTests(unittest.TestCase):
     def test_hipc_cmif_decode_and_trace_scan(self) -> None:
         import json
         import tempfile
-        from client.sysagent import (decode_hipc_cmif, decode_trace_ipc,
-                                     load_trace_jsonl, main)
+        from client.sysagent import (build_trace_timeline, decode_hipc_cmif,
+                                     decode_trace_ipc, load_trace_jsonl, main)
 
         request = bytearray(40)
         request[0:4] = (4).to_bytes(4, "little")
@@ -989,6 +989,12 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(report["transactions"][0]["service"], "test-service")
         self.assertEqual(report["transactions"][0]["interfaceHash"], "0x11223344")
         self.assertEqual(report["transactions"][0]["result"], "0x167B")
+        timeline = build_trace_timeline([{
+            "metadata": metadata,
+            "events": [request_event, response_event],
+            "path": "trace.jsonl",
+        }])
+        self.assertEqual(timeline["summary"]["transactionCount"], 1)
 
         with tempfile.TemporaryDirectory() as directory:
             trace_path = os.path.join(directory, "trace.jsonl")
@@ -1072,6 +1078,69 @@ class ClientTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                         SysAgentProtocolError, "instruction mismatch"):
                     resolve_trace_profile(client, profile)
+
+    def test_trace_timeline_merges_sessions_and_rejects_mixed_boots(self) -> None:
+        from client.sysagent import build_trace_timeline
+
+        first = {
+            "metadata": {
+                "record": "meta",
+                "schemaVersion": 1,
+                "sessionId": "first",
+                "clock": {"bootEpochUnixMs": 1000},
+                "targets": [{
+                    "index": 0,
+                    "id": "client-entry",
+                    "process": {
+                        "pid": "0000000000000010",
+                        "titleId": "0100000000000001",
+                        "buildId": "AA",
+                    },
+                }],
+            },
+            "events": [{
+                "record": "event", "schemaVersion": 1, "seq": "2",
+                "tick": "200", "thread": "B", "pc": "0x2000",
+                "target": "0", "targetAddress": "0x2000", "x0": "2",
+            }],
+            "path": "first.jsonl",
+        }
+        second = {
+            "metadata": {
+                "record": "meta",
+                "schemaVersion": 1,
+                "sessionId": "second",
+                "clock": {"bootEpochUnixMs": 1000},
+                "targets": [{
+                    "index": 0,
+                    "id": "server-entry",
+                    "process": {
+                        "pid": "0000000000000020",
+                        "titleId": "0100000000000002",
+                        "buildId": "BB",
+                    },
+                }],
+            },
+            "events": [{
+                "record": "event", "schemaVersion": 1, "seq": "1",
+                "tick": "100", "thread": "A", "pc": "0x1000",
+                "target": "0", "targetAddress": "0x1000", "x0": "1",
+            }],
+            "path": "second.jsonl",
+        }
+        timeline = build_trace_timeline([first, second])
+        self.assertEqual(timeline["bootEpochUnixMs"], 1000)
+        self.assertEqual(
+            [record["seq"] for record in timeline["timeline"]], ["1", "2"])
+        self.assertEqual(timeline["summary"]["processCounts"], {
+            "0000000000000010": 1,
+            "0000000000000020": 1,
+        })
+
+        second["metadata"]["clock"]["bootEpochUnixMs"] = 2000
+        with self.assertRaisesRegex(
+                SysAgentProtocolError, "different boots"):
+            build_trace_timeline([first, second])
 
     def test_trace_analyze_and_diff(self) -> None:
         import json

@@ -41,7 +41,7 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.7.0
+client    1.8.0
 sys-agent 2.20.0  (switch:6000)
 ```
 
@@ -153,6 +153,7 @@ python3 client/sysagent.py --host switch debug trace-run profile.json \
   --wait-process --output trace.jsonl
 python3 client/sysagent.py debug trace-report trace.jsonl profile.json --json
 python3 client/sysagent.py --host switch debug read 0x71 main+0x1000 4
+python3 client/sysagent.py debug trace-timeline first.jsonl second.jsonl --json
 ```
 
 `debug trace` arms one to four hardware execution breakpoints without patching target code. It
@@ -205,6 +206,10 @@ token, domain metadata and payload. When the trace metadata contains profile pai
 request/response records are also emitted as transactions. `ipc-decode` applies the same parser
 to one raw hex message. `trace-ipc --profile` can supply target IDs and consumer-defined
 service/interface/command labels for manually dumped traces.
+
+`trace-timeline` merges multiple sessions from the same boot into one monotonic timeline,
+including decoded IPC messages and transactions. New exports carry `bootEpochUnixMs`; mixing
+files from different boots is rejected.
 
 ## Controller
 

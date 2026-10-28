@@ -21,7 +21,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.7.0"
+CLIENT_VERSION = "1.8.0"
 TRACE_SCHEMA_VERSION = 1
 TRACE_PROFILE_SCHEMA_VERSION = 2
 
@@ -325,6 +325,9 @@ ERROR_CODE_NOTES = {
     "MULTITRACE_BUSY": "another watch/trace session is active or multitrace could not start",
     "MULTITRACE_START_FAILED": "the dual-process trace could not attach and arm its targets",
     "MULTITRACE_STOP_INCOMPLETE": "the dual-process trace did not release all debug state",
+    "DEBUG_READ_FAILED": "the target process memory read failed",
+    "WAIT_HOOK_FAILED": "the PM process-creation hook is unavailable or already in use",
+    "WAIT_TIMEOUT": "the requested process was not created before the timeout",
 }
 
 
@@ -2808,6 +2811,124 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
     }
 
 
+def build_trace_timeline(documents: Sequence[dict[str, object]]
+                         ) -> dict[str, object]:
+    """Merge multiple trace sessions into one monotonic boot timeline."""
+    boot_epochs: set[int] = set()
+    timeline: list[dict[str, object]] = []
+    process_counts: dict[str, int] = {}
+    ipc_count = 0
+    transaction_count = 0
+
+    for document in documents:
+        metadata = _profile_object(document.get("metadata"), "trace metadata")
+        clock = metadata.get("clock")
+        if isinstance(clock, dict):
+            boot_epoch = clock.get("bootEpochUnixMs")
+            if isinstance(boot_epoch, int):
+                boot_epochs.add(boot_epoch)
+        session_id = str(metadata.get("sessionId", document.get("path", "")))
+        targets = metadata.get("targets")
+        target_metadata = {
+            str(target.get("index")): target
+            for target in targets
+            if isinstance(target, dict)
+        } if isinstance(targets, list) else {}
+        ipc_report = decode_trace_ipc([document])
+        ipc_by_event: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for ipc_record in ipc_report["records"]:
+            assert isinstance(ipc_record, dict)
+            key = (str(ipc_record.get("sessionId", "")),
+                   str(ipc_record.get("seq", "")))
+            cmif = ipc_record.get("cmif")
+            assert isinstance(cmif, dict)
+            header = cmif.get("header")
+            assert isinstance(header, dict)
+            ipc_by_event.setdefault(key, []).append({
+                "mode": cmif.get("mode"),
+                "domain": cmif.get("domain"),
+                "commandId": header.get("commandId"),
+                "result": header.get("result"),
+                "token": header.get("token"),
+                "snapshot": ipc_record.get("snapshot"),
+                "snapshotName": ipc_record.get("snapshotName"),
+                "snapshotKind": ipc_record.get("snapshotKind"),
+            })
+        ipc_count += int(ipc_report["summary"]["ipcCount"])
+        for transaction in ipc_report["transactions"]:
+            assert isinstance(transaction, dict)
+            transaction_count += 1
+            timeline.append({
+                "type": "transaction",
+                "tick": transaction.get("requestTick"),
+                "sessionId": session_id,
+                **transaction,
+            })
+
+        events = document.get("events")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            target_index = str(event.get("target", "0"))
+            target = target_metadata.get(target_index, {})
+            process = (
+                target.get("process", {})
+                if isinstance(target, dict) else {})
+            process = process if isinstance(process, dict) else {}
+            pid = str(process.get("pid", "unknown"))
+            process_counts[pid] = process_counts.get(pid, 0) + 1
+            timeline.append({
+                "type": "event",
+                "sessionId": session_id,
+                "seq": event.get("seq"),
+                "tick": event.get("tick"),
+                "thread": event.get("thread"),
+                "pc": event.get("pc"),
+                "lr": event.get("lr"),
+                "sp": event.get("sp"),
+                "x0": event.get("x0"),
+                "target": target_index,
+                "targetId": target.get("id") if isinstance(target, dict) else None,
+                "targetAddress": event.get("targetAddress"),
+                "pid": pid,
+                "titleId": process.get("titleId"),
+                "buildId": process.get("buildId"),
+                "ipc": ipc_by_event.get((session_id, str(event.get("seq", ""))), []),
+            })
+
+    if len(boot_epochs) > 1:
+        raise SysAgentProtocolError(
+            "trace files come from different boots; system ticks are not comparable")
+    timeline.sort(key=lambda event: (
+        parse_int(str(event.get("tick", "0"))),
+        0 if event.get("type") == "event" else 1,
+        parse_int(str(event.get("seq", event.get("requestSeq", "0")))),
+        str(event.get("sessionId", "")),
+    ))
+    return {
+        "schemaVersion": TRACE_SCHEMA_VERSION,
+        "kind": "trace-timeline",
+        "bootEpochUnixMs": next(iter(boot_epochs), None),
+        "timeline": timeline,
+        "summary": {
+            "sessionCount": len(documents),
+            "eventCount": sum(
+                1 for event in timeline if event.get("type") == "event"),
+            "ipcCount": ipc_count,
+            "transactionCount": transaction_count,
+            "processCounts": process_counts,
+            "tickFirst": min(
+                (parse_int(str(event.get("tick", "0")))
+                 for event in timeline), default=None),
+            "tickLast": max(
+                (parse_int(str(event.get("tick", "0")))
+                 for event in timeline), default=None),
+        },
+    }
+
+
 def analyze_trace_documents(
         documents: Sequence[dict[str, object]],
         pairs: Sequence[tuple[int, int]] = ()) -> dict[str, object]:
@@ -3702,6 +3823,22 @@ def _trace_process_metadata(client: SysAgentClient,
     return metadata
 
 
+def _trace_clock_metadata(client: SysAgentClient) -> dict[str, int]:
+    """Best-effort identity for the current console boot timeline."""
+    try:
+        response = client.system_query("time")
+        uptime_ms = parse_int(response.get("uptimeMs", "0"))
+        unix_seconds = int(response.get("unix", "0"))
+        if uptime_ms <= 0 or unix_seconds <= 0:
+            return {}
+        return {
+            "uptimeMs": uptime_ms,
+            "bootEpochUnixMs": unix_seconds * 1000 - uptime_ms,
+        }
+    except (OSError, ValueError, SysAgentProtocolError):
+        return {}
+
+
 def _write_versioned_trace(output: str, metadata: dict[str, object],
                            events: Sequence[dict[str, object]]) -> None:
     with open(output, "w", encoding="utf-8") as handle:
@@ -3794,6 +3931,7 @@ def _export_single_trace(client: SysAgentClient,
         "kind": "single",
         "exportedAt": datetime.now(timezone.utc).isoformat(),
         "host": client.host,
+        "clock": _trace_clock_metadata(client),
         "status": {key: value for key, value in before.items() if key != "ok"},
         "process": process,
         "targets": [
@@ -3926,6 +4064,7 @@ def _export_multitrace(client: SysAgentClient,
         "kind": "multitrace",
         "exportedAt": datetime.now(timezone.utc).isoformat(),
         "host": client.host,
+        "clock": _trace_clock_metadata(client),
         "status": {key: value for key, value in before.items() if key != "ok"},
         "targets": [
             {
@@ -4237,6 +4376,47 @@ def _cmd_debug_trace_ipc(client: SysAgentClient,
             f"interface={transaction['interfaceHash']} "
             f"command={transaction['commandId']} "
             f"name={transaction['commandName']} result={transaction['result']}")
+
+
+def _cmd_debug_trace_timeline(client: SysAgentClient,
+                              args: argparse.Namespace) -> None:
+    del client
+    report = build_trace_timeline(load_trace_jsonl(args.traces))
+    if args.json or args.out:
+        _emit(report, args)
+        return
+    summary = report["summary"]
+    assert isinstance(summary, dict)
+    print(
+        f"sessions={summary['sessionCount']} events={summary['eventCount']} "
+        f"ipc={summary['ipcCount']} transactions={summary['transactionCount']} "
+        f"bootEpochUnixMs={report['bootEpochUnixMs']}")
+    for record in report["timeline"]:
+        assert isinstance(record, dict)
+        if record["type"] == "transaction":
+            print(
+                f"  tick={record['tick']} transaction={record['requestSeq']}->"
+                f"{record['returnSeq']} thread={record['thread']} "
+                f"service={record.get('service')} command={record.get('commandId')} "
+                f"name={record.get('commandName')} result={record.get('result')}")
+        else:
+            ipc = record.get("ipc")
+            ipc_text = ""
+            if isinstance(ipc, list) and ipc:
+                parts = []
+                for message in ipc:
+                    if not isinstance(message, dict):
+                        continue
+                    details = (
+                        f"{message.get('mode')}:{message.get('commandId')}"
+                        if message.get("commandId") is not None
+                        else f"{message.get('mode')}:{message.get('result')}")
+                    parts.append(details)
+                ipc_text = " ipc=" + ",".join(parts)
+            print(
+                f"  tick={record['tick']} event={record['seq']} "
+                f"pid={record['pid']} target={record.get('targetId')} "
+                f"thread={record['thread']} pc={record['pc']}{ipc_text}")
 
 
 def _cmd_debug_trace_analyze(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -4775,6 +4955,17 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 "\n".join((
                     "Scans captured snapshots and reports every CMIF request or",
                     "response with its trace seq/target/thread and decoded header.",
+                ))),
+        Command("trace-timeline", "Merge trace sessions into one boot timeline",
+                _cmd_debug_trace_timeline,
+                (Arg("traces", "versioned trace JSONL files from one boot",
+                     nargs="+", metavar="TRACE"),
+                 JSON_ARG, OUT_ARG),
+                "\n".join((
+                    "Sorts events from multiple sessions by console system tick,",
+                    "keeps PID/Title/Build/target identity and attaches decoded",
+                    "IPC request/response transactions. Files with different boot",
+                    "epochs are rejected.",
                 ))),
         Command("trace-dump", "Write retained trace events to a JSONL file",
                 _cmd_debug_trace_dump,

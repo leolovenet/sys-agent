@@ -16,6 +16,7 @@ python3 client/sysagent.py --host switch debug trace-run profile.json \
   --wait-process --wait-process-timeout 60000 --output trace.jsonl
 python3 client/sysagent.py debug trace-report trace.jsonl profile.json --json
 python3 client/sysagent.py --host switch debug read 0x71 main+0x1000 4
+python3 client/sysagent.py debug trace-timeline first.jsonl second.jsonl --json
 ```
 
 `trace-plan` resolves the profile without arming a trace. `trace-run` resolves it again and
@@ -23,6 +24,10 @@ starts the matching `debug trace` or `debug multitrace` command. Without `--wait
 `--output`, it returns as soon as the hardware breakpoints are armed, so the consumer can
 trigger the target operation. `--output` implies waiting and exports a versioned JSONL file.
 That export is annotated with the profile target IDs, process IDs and original module offsets.
+
+`trace-timeline` accepts multiple trace files and sorts raw events and decoded IPC transactions
+by the console's monotonic system tick. New exports record a best-effort `bootEpochUnixMs`;
+files from different boots are rejected because their tick domains are unrelated.
 
 `--wait-process` waits through the generic PM creation hooks before resolving process IDs and
 arming. Foreground selectors use `debug wait-application`; Title ID selectors use

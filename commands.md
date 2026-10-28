@@ -455,6 +455,7 @@ game-specific offsets.
 python3 client/sysagent.py debug ipc-decode HEX_BYTES --mode request
 python3 client/sysagent.py debug trace-ipc trace.jsonl --snapshot 0 \
   --profile profile.json --json
+python3 client/sysagent.py debug trace-timeline first.jsonl second.jsonl --json
 ```
 
 `ipc-decode` parses the HIPC header, special header, handles, static/buffer descriptors,
@@ -465,6 +466,10 @@ it also correlates request and response records into transactions. These command
 raw protocol bytes only and do not assign service-specific meanings to Command IDs.
 Optional profile `ipc` metadata can attach consumer-supplied service, interface-hash and
 Command-ID names to those transactions.
+
+`trace-timeline` normalizes one or more trace files into a single system-tick timeline,
+including raw events, IPC records and transactions. It rejects files whose recorded boot epochs
+differ.
 
 The same ownership rules as `debug watch` apply. For the foreground application, an existing
 `dmnt:cht` handle is closed when necessary and later memory commands reattach it. A trace of a
