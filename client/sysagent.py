@@ -13,6 +13,7 @@ import sys
 import textwrap
 import time
 from collections.abc import Iterator, Sequence
+from datetime import datetime, timezone
 
 
 TERMINAL_STATES = {"done", "cancelled", "error"}
@@ -20,7 +21,8 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.1.0"
+CLIENT_VERSION = "1.2.0"
+TRACE_SCHEMA_VERSION = 1
 
 # The console's default keySleepTime (25 ms) is fast enough for the home menu but too
 # fast for the game's on-screen keyboard: measured in ACNH 3.0.3's chat field, 25/30 ms
@@ -1751,6 +1753,244 @@ def parse_pointer_chains(tokens: Sequence[str]) -> list[tuple[int, list[int], in
     return chains
 
 
+def parse_trace_pair_spec(value: str) -> tuple[int, int]:
+    """Parse an ``ENTRY:RETURN`` trace correlation rule."""
+    if value.count(":") != 1:
+        raise ValueError("trace pair must be ENTRY:RETURN")
+    entry_text, return_text = value.split(":", 1)
+    entry = parse_int(entry_text)
+    return_address = parse_int(return_text)
+    if entry == return_address:
+        raise ValueError("trace pair entry and return addresses must differ")
+    return entry, return_address
+
+
+def load_trace_jsonl(paths: Sequence[str]) -> list[dict[str, object]]:
+    """Load versioned JSONL trace exports, accepting old event-only dumps."""
+    documents: list[dict[str, object]] = []
+    for path in paths:
+        metadata: dict[str, object] | None = None
+        events: list[dict[str, object]] = []
+        legacy = False
+        with open(path, encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, 1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise SysAgentProtocolError(
+                        f"{path}:{line_number}: invalid JSON: {error}") from error
+                if not isinstance(record, dict):
+                    raise SysAgentProtocolError(
+                        f"{path}:{line_number}: trace record must be an object")
+                kind = record.get("record")
+                if kind == "meta":
+                    if metadata is not None:
+                        raise SysAgentProtocolError(
+                            f"{path}:{line_number}: duplicate trace metadata")
+                    schema = parse_int(str(record.get("schemaVersion", "0")))
+                    if schema != TRACE_SCHEMA_VERSION:
+                        raise SysAgentProtocolError(
+                            f"{path}:{line_number}: unsupported trace schema {schema}")
+                    metadata = record
+                elif kind == "event" or (kind is None and "seq" in record):
+                    if kind is None:
+                        legacy = True
+                    if "seq" not in record:
+                        raise SysAgentProtocolError(
+                            f"{path}:{line_number}: trace event has no seq")
+                    events.append(record)
+                else:
+                    raise SysAgentProtocolError(
+                        f"{path}:{line_number}: unknown trace record type {kind!r}")
+        if metadata is None:
+            metadata = {
+                "record": "meta",
+                "schemaVersion": 0 if legacy else TRACE_SCHEMA_VERSION,
+                "sessionId": os.path.basename(path),
+                "legacy": True,
+            }
+        metadata.setdefault("sessionId", os.path.basename(path))
+        documents.append({
+            "path": path,
+            "metadata": metadata,
+            "events": events,
+        })
+    return documents
+
+
+def _trace_address(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(str(value), 16)
+    except ValueError:
+        return None
+
+
+def analyze_trace_documents(
+        documents: Sequence[dict[str, object]],
+        pairs: Sequence[tuple[int, int]] = ()) -> dict[str, object]:
+    """Summarize traces and correlate explicitly configured entry/return sites."""
+    sessions: list[dict[str, object]] = []
+    events: list[tuple[str, dict[str, object]]] = []
+    process_counts: dict[str, int] = {}
+    process_identities: dict[str, dict[str, object]] = {}
+    target_counts: dict[str, int] = {}
+    threads: set[str] = set()
+    snapshot_errors = 0
+
+    for document in documents:
+        metadata = document["metadata"]
+        assert isinstance(metadata, dict)
+        session_id = str(metadata.get("sessionId", document["path"]))
+        status = metadata.get("status")
+        process_key = "unknown"
+        process_info = metadata.get("process")
+        if isinstance(status, dict):
+            pid = status.get("pid")
+            if pid is not None:
+                process_key = str(pid)
+        if isinstance(process_info, dict):
+            process_identities[process_key] = process_info
+        document_events = document["events"]
+        assert isinstance(document_events, list)
+        sorted_events = sorted(
+            (event for event in document_events if isinstance(event, dict)),
+            key=lambda event: (
+                parse_int(str(event.get("tick", "0"))),
+                parse_int(str(event.get("seq", "0"))),
+            ),
+        )
+        process_counts[process_key] = (
+            process_counts.get(process_key, 0) + len(sorted_events))
+        for event in sorted_events:
+            events.append((session_id, event))
+            thread = str(event.get("thread", "0"))
+            threads.add(thread)
+            target = str(event.get("targetAddress", "unknown"))
+            target_key = f"{process_key}:{target}"
+            target_counts[target_key] = target_counts.get(target_key, 0) + 1
+            for key, value in event.items():
+                if (key.startswith("snap") and key.endswith("Result")
+                        and value not in (None, "0x0", "0")):
+                    snapshot_errors += 1
+        sessions.append({
+            "sessionId": session_id,
+            "path": document["path"],
+            "metadata": metadata,
+            "eventCount": len(sorted_events),
+        })
+
+    events.sort(key=lambda item: (
+        parse_int(str(item[1].get("tick", "0"))),
+        parse_int(str(item[1].get("seq", "0"))),
+    ))
+
+    pair_reports: list[dict[str, object]] = []
+    for entry_address, return_address in pairs:
+        pending: dict[tuple[str, str], list[dict[str, object]]] = {}
+        matched: list[dict[str, object]] = []
+        unmatched = 0
+        for session_id, event in events:
+            pc = _trace_address(event.get("pc"))
+            if pc is None:
+                continue
+            thread = str(event.get("thread", "0"))
+            key = (session_id, thread)
+            if pc == entry_address:
+                pending.setdefault(key, []).append(event)
+            elif pc == return_address:
+                stack = pending.get(key)
+                if not stack:
+                    continue
+                entry = stack.pop()
+                matched.append({
+                    "sessionId": session_id,
+                    "thread": thread,
+                    "entrySeq": entry.get("seq"),
+                    "returnSeq": event.get("seq"),
+                    "entryTick": entry.get("tick"),
+                    "returnTick": event.get("tick"),
+                    "x0": event.get("x0"),
+                    "pc": event.get("pc"),
+                })
+        unmatched = sum(len(stack) for stack in pending.values())
+        pair_reports.append({
+            "entry": f"0x{entry_address:X}",
+            "return": f"0x{return_address:X}",
+            "matched": len(matched),
+            "unmatchedEntries": unmatched,
+            "calls": matched,
+        })
+
+    return {
+        "schemaVersion": TRACE_SCHEMA_VERSION,
+        "sessions": sessions,
+        "summary": {
+            "sessionCount": len(sessions),
+            "eventCount": len(events),
+            "threadCount": len(threads),
+            "snapshotErrors": snapshot_errors,
+            "processCounts": process_counts,
+            "processIdentities": process_identities,
+            "targetCounts": target_counts,
+            "tickFirst": min(
+                (parse_int(str(event.get("tick", "0"))) for _, event in events),
+                default=None),
+            "tickLast": max(
+                (parse_int(str(event.get("tick", "0"))) for _, event in events),
+                default=None),
+        },
+        "pairs": pair_reports,
+    }
+
+
+def diff_trace_summaries(left: dict[str, object],
+                         right: dict[str, object]) -> dict[str, object]:
+    """Compare trace summaries while preserving the complete inputs."""
+    left_summary = left["summary"]
+    right_summary = right["summary"]
+    assert isinstance(left_summary, dict) and isinstance(right_summary, dict)
+
+    def counts(key: str) -> tuple[dict[str, int], dict[str, int]]:
+        a = left_summary.get(key, {})
+        b = right_summary.get(key, {})
+        assert isinstance(a, dict) and isinstance(b, dict)
+        return ({str(k): int(v) for k, v in a.items()},
+                {str(k): int(v) for k, v in b.items()})
+
+    def delta(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
+        return {
+            key: b.get(key, 0) - a.get(key, 0)
+            for key in sorted(set(a) | set(b))
+            if b.get(key, 0) != a.get(key, 0)
+        }
+
+    left_processes, right_processes = counts("processCounts")
+    left_targets, right_targets = counts("targetCounts")
+    return {
+        "schemaVersion": TRACE_SCHEMA_VERSION,
+        "left": left,
+        "right": right,
+        "delta": {
+            "eventCount": (
+                int(right_summary.get("eventCount", 0))
+                - int(left_summary.get("eventCount", 0))),
+            "threadCount": (
+                int(right_summary.get("threadCount", 0))
+                - int(left_summary.get("threadCount", 0))),
+            "snapshotErrors": (
+                int(right_summary.get("snapshotErrors", 0))
+                - int(left_summary.get("snapshotErrors", 0))),
+            "processCounts": delta(left_processes, right_processes),
+            "targetCounts": delta(left_targets, right_targets),
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Declarative CLI: one Command per sys-agent command
 # ---------------------------------------------------------------------------
@@ -2283,6 +2523,51 @@ def _cmd_debug_trace_stop(client: SysAgentClient, args: argparse.Namespace) -> N
     _emit(require_ok(client.command("debug trace-stop")), args)
 
 
+def _trace_process_metadata(client: SysAgentClient,
+                            status: dict[str, str]) -> dict[str, str]:
+    """Best-effort process identity for an exported trace session."""
+    pid_text = status.get("pid", "0")
+    try:
+        pid = int(pid_text, 16)
+    except ValueError:
+        return {"pid": pid_text}
+    metadata = {"pid": pid_text, "titleId": "NA"}
+
+    try:
+        listing = client.process_list(0, 64)
+        entries = listing.get("processes", "")
+        for entry in entries.split(","):
+            process_text, _, title_text = entry.partition(":")
+            if process_text and int(process_text, 16) == pid:
+                metadata["titleId"] = title_text
+                break
+    except (OSError, ValueError, SysAgentProtocolError):
+        pass
+
+    try:
+        modules = client.command(f"debug modules 0x{pid:X} 2", retry=True)
+        if modules.get("ok") != "OK":
+            return metadata
+        module_entries = {
+            entry.split("=", 1)[0]: entry.split("=", 1)[1]
+            for entry in modules.get("modules", "").split(",")
+            if "=" in entry
+        }
+        entry = module_entries.get("1", module_entries.get("0", ""))
+        if not entry:
+            return metadata
+        address_size, _, build_id = entry.partition(":build=")
+        base_text, _, size_text = address_size.partition("+")
+        metadata.update({
+            "moduleBase": base_text,
+            "moduleSize": size_text,
+            "buildId": build_id,
+        })
+    except (OSError, ValueError, SysAgentProtocolError):
+        pass
+    return metadata
+
+
 def _cmd_debug_trace_dump(client: SysAgentClient, args: argparse.Namespace) -> None:
     client.timeout = max(client.timeout, 30.0)
     before = require_ok(client.command("debug trace-status", retry=True))
@@ -2304,10 +2589,74 @@ def _cmd_debug_trace_dump(client: SysAgentClient, args: argparse.Namespace) -> N
             "the trace ring changed during dump; stop the trace first and retry")
 
     output = args.output or f"trace-{int(time.time())}.jsonl"
+    session_id = (
+        f"{int(time.time() * 1000):x}-"
+        f"{before.get('pid', '0')}-"
+        f"{before.get('address', '0')}")
+    metadata = {
+        "record": "meta",
+        "schemaVersion": TRACE_SCHEMA_VERSION,
+        "sessionId": session_id,
+        "exportedAt": datetime.now(timezone.utc).isoformat(),
+        "host": client.host,
+        "status": {key: value for key, value in before.items() if key != "ok"},
+        "process": _trace_process_metadata(client, before),
+    }
     with open(output, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(metadata, sort_keys=True) + "\n")
         for event in events:
-            handle.write(json.dumps(event, sort_keys=True) + "\n")
-    print(f"{output} ({len(events)} events)")
+            record = {
+                "record": "event",
+                "schemaVersion": TRACE_SCHEMA_VERSION,
+                **event,
+            }
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    print(f"{output} ({len(events)} events, session={session_id})")
+
+
+def _cmd_debug_trace_analyze(client: SysAgentClient, args: argparse.Namespace) -> None:
+    del client
+    pairs = [parse_trace_pair_spec(value) for value in (args.pairs or [])]
+    documents = load_trace_jsonl(args.traces)
+    report = analyze_trace_documents(documents, pairs)
+    if args.json or args.out:
+        _emit(report, args)
+        return
+    summary = report["summary"]
+    assert isinstance(summary, dict)
+    print(
+        f"sessions={summary['sessionCount']} events={summary['eventCount']} "
+        f"threads={summary['threadCount']} snapshotErrors={summary['snapshotErrors']} "
+        f"tickFirst={summary['tickFirst']} tickLast={summary['tickLast']}")
+    for pair in report["pairs"]:
+        assert isinstance(pair, dict)
+        print(
+            f"pair entry={pair['entry']} return={pair['return']} "
+            f"matched={pair['matched']} unmatchedEntries={pair['unmatchedEntries']}")
+        calls = pair["calls"]
+        assert isinstance(calls, list)
+        for call in calls:
+            assert isinstance(call, dict)
+            print(
+                f"  thread={call['thread']} entrySeq={call['entrySeq']} "
+                f"returnSeq={call['returnSeq']} x0={call['x0']}")
+
+
+def _cmd_debug_trace_diff(client: SysAgentClient, args: argparse.Namespace) -> None:
+    del client
+    left = analyze_trace_documents(load_trace_jsonl([args.left]))
+    right = analyze_trace_documents(load_trace_jsonl([args.right]))
+    report = diff_trace_summaries(left, right)
+    if args.json or args.out:
+        _emit(report, args)
+        return
+    delta = report["delta"]
+    assert isinstance(delta, dict)
+    print(
+        f"events={delta['eventCount']} threads={delta['threadCount']} "
+        f"snapshotErrors={delta['snapshotErrors']} "
+        f"processCounts={delta['processCounts']} "
+        f"targetCounts={delta['targetCounts']}")
 
 
 def _cmd_start(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -2687,6 +3036,23 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 _cmd_debug_trace_dump,
                 (Arg("output", "output JSONL path (default: trace-<unix time>.jsonl)",
                      flags=("--output",), default=None),)),
+        Command("trace-analyze", "Summarize and correlate versioned trace files",
+                _cmd_debug_trace_analyze,
+                (Arg("traces", "JSONL trace files", nargs="+", metavar="TRACE"),
+                 Arg("pairs", "ENTRY:RETURN address pair to correlate by session and thread",
+                     action="append", default=None, flags=("--pair",)),
+                 JSON_ARG, OUT_ARG),
+                "\n".join((
+                    "Events are ordered by the sysmodule's system tick. Entry/return",
+                    "pairs are matched per session and thread; each return reports x0",
+                    "at the return-site event. Multiple trace files can be combined when",
+                    "they came from the same boot.",
+                ))),
+        Command("trace-diff", "Compare two trace files by event and target counts",
+                _cmd_debug_trace_diff,
+                (Arg("left", "baseline JSONL trace", metavar="LEFT"),
+                 Arg("right", "candidate JSONL trace", metavar="RIGHT"),
+                 JSON_ARG, OUT_ARG)),
     )),
 
     CommandGroup("memory", "Read or write process memory", (

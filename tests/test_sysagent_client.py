@@ -560,9 +560,89 @@ class ClientTests(unittest.TestCase):
             ])
             self.assertEqual(code, 0)
             with open(output, encoding="utf-8") as handle:
+                metadata = json.loads(handle.readline())
                 event = json.loads(handle.readline())
+            self.assertEqual(metadata["record"], "meta")
+            self.assertEqual(metadata["schemaVersion"], 1)
+            self.assertIn("sessionId", metadata)
+            self.assertEqual(event["record"], "event")
             self.assertEqual(event["pc"], "0000002B00001000")
             self.assertNotIn("ok", event)
+
+    def test_trace_analyze_and_diff(self) -> None:
+        import json
+        import tempfile
+        from client.sysagent import (analyze_trace_documents, diff_trace_summaries,
+                                     load_trace_jsonl, main)
+
+        with tempfile.TemporaryDirectory() as directory:
+            left_path = os.path.join(directory, "left.jsonl")
+            right_path = os.path.join(directory, "right.jsonl")
+            metadata = {
+                "record": "meta", "schemaVersion": 1, "sessionId": "left",
+                "status": {"pid": "0000000000000088"},
+                "process": {"pid": "0000000000000088",
+                            "titleId": "01006F8002326000",
+                            "buildId": "AABB"},
+            }
+            events = [
+                {"record": "event", "schemaVersion": 1, "seq": "1",
+                 "tick": "100", "thread": "AA", "pc": "0000000000001000",
+                 "targetAddress": "0000000000001000", "x0": "1",
+                 "contextResult": "0x1"},
+                {"record": "event", "schemaVersion": 1, "seq": "2",
+                 "tick": "200", "thread": "AA", "pc": "0000000000002000",
+                 "targetAddress": "0000000000002000", "x0": "0000000000000123"},
+                {"record": "event", "schemaVersion": 1, "seq": "3",
+                 "tick": "300", "thread": "AA", "pc": "0000000000001000",
+                 "targetAddress": "0000000000001000", "x0": "2"},
+            ]
+            with open(left_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(metadata) + "\n")
+                for event in events:
+                    handle.write(json.dumps(event) + "\n")
+            with open(right_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({**metadata, "sessionId": "right"}) + "\n")
+                handle.write(json.dumps(events[0]) + "\n")
+
+            report = analyze_trace_documents(
+                load_trace_jsonl([left_path]), [(0x1000, 0x2000)])
+            pair = report["pairs"][0]
+            self.assertEqual(pair["matched"], 1)
+            self.assertEqual(pair["unmatchedEntries"], 1)
+            self.assertEqual(pair["calls"][0]["x0"], "0000000000000123")
+            self.assertEqual(
+                report["summary"]["processIdentities"]["0000000000000088"]["buildId"],
+                "AABB")
+            self.assertEqual(report["summary"]["snapshotErrors"], 0)
+
+            diff = diff_trace_summaries(report, analyze_trace_documents(
+                load_trace_jsonl([right_path])))
+            self.assertEqual(diff["delta"]["eventCount"], -2)
+
+            self.assertEqual(main([
+                "debug", "trace-analyze", left_path,
+                "--pair", "0x1000:0x2000", "--json"]), 0)
+            self.assertEqual(main([
+                "debug", "trace-diff", left_path, right_path, "--json"]), 0)
+
+            legacy_path = os.path.join(directory, "legacy.jsonl")
+            with open(legacy_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "seq": "1", "tick": "1", "thread": "AA",
+                    "pc": "0000000000001000",
+                }) + "\n")
+            legacy = load_trace_jsonl([legacy_path])[0]["metadata"]
+            self.assertTrue(legacy["legacy"])
+
+            invalid_path = os.path.join(directory, "invalid.jsonl")
+            with open(invalid_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "record": "meta", "schemaVersion": 2,
+                    "sessionId": "invalid",
+                }) + "\n")
+            with self.assertRaisesRegex(SysAgentProtocolError, "unsupported trace schema"):
+                load_trace_jsonl([invalid_path])
 
     def test_peek_verified(self) -> None:
         with self.client() as client:

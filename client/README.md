@@ -41,7 +41,7 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.1.0
+client    1.2.0
 sys-agent 2.16.0  (switch:6000)
 ```
 
@@ -135,6 +135,9 @@ python3 client/sysagent.py --host switch debug trace \
 python3 client/sysagent.py --host switch debug trace-status
 python3 client/sysagent.py --host switch debug trace-read 0
 python3 client/sysagent.py --host switch debug trace-dump --output trace.jsonl
+python3 client/sysagent.py debug trace-analyze trace.jsonl \
+  --pair 0x...:0x... --json
+python3 client/sysagent.py debug trace-diff before.jsonl after.jsonl
 ```
 
 `debug trace` arms one to four hardware execution breakpoints without patching target code. It
@@ -146,7 +149,13 @@ target is stopped and records its own Result; two snapshots are supported. The s
 defaults to the foreground application; `main+OFFSET` is resolved against that process. The
 record is an entry-event trace, not a return-value or call-stack tracer. `debug trace-stop`
 releases the debug handle, after which memory commands can attach normally again. `trace-dump`
-writes the retained ring as JSONL and rejects a ring that changed during the dump.
+writes the retained ring as versioned JSONL (`schemaVersion=1`, one metadata record and event
+records, including best-effort PID/Title ID/main-module/Build ID identity) and rejects a ring
+that changed during the dump. `trace-analyze` combines one or more
+exports, summarizes processes/threads/targets and pairs explicit entry/return addresses per
+session and thread; the return event's `x0` is reported as the candidate Result. Multiple files
+are directly comparable when captured in the same boot, because ordering uses the device system
+tick. `trace-diff` compares event, process, thread and target counts between an A/B pair.
 
 ## Controller
 

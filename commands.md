@@ -347,8 +347,23 @@ observation points.
 |debug trace-stop|Requests detach, waits for the trace thread, clears every configured breakpoint on every core, and releases the debug handle|none|`debug trace-stop`|
 
 The Python client adds `debug trace-dump --output FILE`, which paginates the retained ring into
-one JSON object per line. It refuses a result whose ring changed during the dump; stop the trace
-first when every event must come from one coherent window.
+versioned JSONL: one metadata record (`schemaVersion=1`, session ID, host, export time and the
+full trace status) followed by event records. The metadata also makes a best-effort process
+identity query for PID, Title ID, main module base/size and Build ID. It refuses a result whose
+ring changed during the dump; stop the trace first when every event must come from one coherent
+window.
+
+Two experimental offline tools consume that format:
+
+- `debug trace-analyze TRACE... --pair ENTRY:RETURN` summarizes sessions, processes, threads,
+  targets and snapshot failures. Pair rules are matched per session and thread with stack
+  behavior, and each matched return reports its `x0` as the candidate Result.
+- `debug trace-diff LEFT RIGHT` compares event, process, thread, target and snapshot-error
+  counts.
+
+Device system ticks make multiple exports directly orderable only when they came from the same
+boot. The metadata retains host export time for cross-boot approximate ordering, but that is
+not a substitute for a shared device clock.
 
 The same ownership rules as `debug watch` apply. For the foreground application, an existing
 `dmnt:cht` handle is closed when necessary and later memory commands reattach it. A trace of a

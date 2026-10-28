@@ -8,6 +8,7 @@
 - `debug patch-code` 是通用事务性代码补丁原语:任意进程(经 `pid=`),载荷 ≤ 1 KiB,pause/verify/write/readback/resume,保证恢复。普通数据 poke 保持不暂停。
 - `debug maps` / `debug threads` / `debug modules` 是通用的任意进程检查原语(内存区域、线程 PC/LR/SP、模块列表);保持与游戏/具体系统服务无关,不要为单一调查加特例。
 - `debug trace` 是通用的任意 PID 硬件执行入口 tracer:不修改目标代码,单会话最多 4 个目标,记录目标/线程/core/PC/LR/SP/参数/指令、命中时最多 2 个寄存器指针内存快照与固定 ring。ring 仍受默认 64 次总命中安全上限约束,只有显式 `hits 0` 才解除;实机表明 4096 次快速命中已足以触发 ACNH watchdog。它只承诺入口命中,不要在未实现可靠线程关联前把它描述成 call/return tracer;游戏偏移仍由消费方提供。
+- `trace-dump` 的版本化 JSONL、`trace-analyze` 与 `trace-diff` 属于客户端离线关联层:只能对已显式记录的站点做同 session/thread 配对,不代表已实现跨进程 IPC 自动追踪。
 
 ## 仓库边界
 

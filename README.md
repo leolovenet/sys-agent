@@ -55,7 +55,8 @@ commands should follow this rule:
   pointers with offsets. It uses a fixed-size ring (up to 64 events) or a one-shot hit limit,
   defaults ring sessions to a 64-hit safety cap so a hot instruction cannot starve the target,
   exposes `trace-status` / `trace-read` / `trace-stop`, and never modifies target instructions.
-  The client `trace-dump` writes retained events as JSONL.
+  The client `trace-dump` writes versioned JSONL with session metadata; `trace-analyze` and
+  `trace-diff` summarize, pair explicit entry/return sites and compare A/B captures.
 - Verified memory access: `poke*Verified` writes and reads the range back, reporting
   `WRITE_FAILED`, `READBACK_FAILED`, or `WRITE_VERIFY_FAILED` distinctly; `peek*Verified`
   reads twice and retries until two reads agree, so zero data and a failed read are
