@@ -21,7 +21,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.9.0"
+CLIENT_VERSION = "1.12.0"
 TRACE_SCHEMA_VERSION = 1
 TRACE_PROFILE_SCHEMA_VERSION = 2
 
@@ -327,6 +327,7 @@ ERROR_CODE_NOTES = {
     "MULTITRACE_STOP_INCOMPLETE": "the dual-process trace did not release all debug state",
     "DEBUG_READ_FAILED": "the target process memory read failed",
     "WAIT_HOOK_FAILED": "the PM process-creation hook is unavailable or already in use",
+    "PROCESS_START_FAILED": "PM could not release the suspended process",
     "WAIT_TIMEOUT": "the requested process was not created before the timeout",
 }
 
@@ -768,16 +769,44 @@ class SysAgentClient:
     def debug_wait_process(self, title_id: int, timeout_ms: int = 60000) -> dict[str, str]:
         if title_id <= 0 or timeout_ms <= 0:
             raise ValueError("title ID and timeout must be positive")
-        self.timeout = max(self.timeout, timeout_ms / 1000 + 10)
-        return require_ok(self.command(
-            f"debug wait-title 0x{title_id:X} {timeout_ms}", retry=True))
+        response = require_ok(self.command(
+            f"debug wait-title 0x{title_id:X} {timeout_ms}", retry=False))
+        return self._wait_for_debug_wait_result(response, timeout_ms)
 
     def debug_wait_application(self, timeout_ms: int = 60000) -> dict[str, str]:
         if timeout_ms <= 0:
             raise ValueError("timeout must be positive")
-        self.timeout = max(self.timeout, timeout_ms / 1000 + 10)
+        response = require_ok(self.command(
+            f"debug wait-application {timeout_ms}", retry=False))
+        return self._wait_for_debug_wait_result(response, timeout_ms)
+
+    def debug_wait_status(self) -> dict[str, str]:
+        return require_ok(self.command("debug wait-status", retry=True))
+
+    def _wait_for_debug_wait_result(self, response: dict[str, str],
+                                    timeout_ms: int) -> dict[str, str]:
+        deadline = time.monotonic() + timeout_ms / 1000 + 10
+        while response.get("active") == "1":
+            if time.monotonic() >= deadline:
+                raise SysAgentProtocolError(
+                    f"process wait did not finish within {timeout_ms} ms")
+            time.sleep(0.05)
+            response = self.debug_wait_status()
+        state = response.get("state", "")
+        if state in {"parked", "exists"}:
+            return response
+        if state == "timeout":
+            raise SysAgentProtocolError(
+                f"WAIT_TIMEOUT result={response.get('lastError', '0x0')}")
+        raise SysAgentProtocolError(
+            f"process wait failed in stage {response.get('stage', '')}: "
+            f"result={response.get('lastError', '0x0')}")
+
+    def debug_start_process(self, pid: int) -> dict[str, str]:
+        if pid <= 0:
+            raise ValueError("pid must be positive")
         return require_ok(self.command(
-            f"debug wait-application {timeout_ms}", retry=True))
+            f"debug start-process 0x{pid:X}"))
 
     def system_action(self, action: str, unlock: bool = True) -> dict[str, str]:
         commands = {
@@ -1994,12 +2023,19 @@ def load_trace_profile(path: str) -> dict[str, object]:
         if not isinstance(process_id, str) or process_id not in process_ids:
             raise ValueError(
                 f"target {target_id} references unknown process {process_id!r}")
+        target_base = target.get("base", "main")
+        if target_base not in {"main", "code"}:
+            raise ValueError(
+                f"target {target_id} base must be main or code")
         if schema == 1:
             _profile_offset(target.get("offset"), f"target {target_id} offset")
         else:
             if ("offset" in target) == ("symbol" in target):
                 raise ValueError(
                     f"target {target_id} needs exactly one of offset/symbol")
+            if target_base == "code" and "symbol" in target:
+                raise ValueError(
+                    f"target {target_id} base=code cannot use a symbol")
             _profile_target_offset(profile, target, f"target {target_id}")
             if "snapshots" in target:
                 target["_parsedSnapshots"] = _profile_snapshot_entries(
@@ -2070,6 +2106,26 @@ def load_trace_profile(path: str) -> dict[str, object]:
                     raise ValueError(
                         f"pairs[{index}].ipc.commands[{command_id}] "
                         "must be a non-empty string")
+            if "correlation" in ipc:
+                correlation = _profile_object(
+                    ipc["correlation"],
+                    f"pairs[{index}].ipc.correlation")
+                request_key = _validate_correlation_expression(
+                    correlation.get("request"),
+                    f"pairs[{index}].ipc.correlation.request")
+                response_key = correlation.get("response", request_key)
+                _validate_correlation_expression(
+                    response_key,
+                    f"pairs[{index}].ipc.correlation.response")
+                if "thread" in correlation and not isinstance(
+                        correlation["thread"], bool):
+                    raise ValueError(
+                        f"pairs[{index}].ipc.correlation.thread must be boolean")
+                fallback = correlation.get("fallback", "none")
+                if fallback not in {"none", "thread-fifo"}:
+                    raise ValueError(
+                        f"pairs[{index}].ipc.correlation.fallback "
+                        "must be none or thread-fifo")
 
     trace_options = profile.get("trace", {})
     if trace_options is not None:
@@ -2079,6 +2135,9 @@ def load_trace_profile(path: str) -> dict[str, object]:
                     not isinstance(trace_options[name], int)
                     or trace_options[name] < 0):
                 raise ValueError(f"trace.{name} must be a non-negative integer")
+        duration_from = trace_options.get("durationFrom", "arm")
+        if duration_from not in {"arm", "first-hit"}:
+            raise ValueError("trace.durationFrom must be arm or first-hit")
         _profile_snapshot_entries(
             trace_options.get("snapshots", []), "trace.snapshots")
     return profile
@@ -2258,6 +2317,11 @@ def resolve_trace_profile(client: SysAgentClient,
         executable_maps_by_pid[pid] = _parse_executable_maps(
             require_ok(client.command(
                 f"debug maps 0x{pid:X} 256", retry=True)))
+        executable_maps, _ = executable_maps_by_pid[pid]
+        if not executable_maps:
+            raise SysAgentProtocolError(
+                f"process {process_id} has no executable mapping")
+        code_base = min(int(entry["base"]) for entry in executable_maps)
 
         expected = process.get("expect", {})
         if expected:
@@ -2284,6 +2348,7 @@ def resolve_trace_profile(client: SysAgentClient,
             "moduleIndex": module_index,
             "moduleBase": f"0x{int(module['base']):X}",
             "moduleSize": f"0x{int(module['size']):X}",
+            "codeBase": f"0x{code_base:X}",
             "buildId": module["buildId"],
         }
         resolved_processes.append(resolved)
@@ -2301,7 +2366,11 @@ def resolve_trace_profile(client: SysAgentClient,
         process = resolved_by_id[str(target["process"])]
         offset = _profile_target_offset(
             profile, target, f"target {target_id}")
-        address = int(str(process["moduleBase"]), 0) + offset
+        base_kind = str(target.get("base", "main"))
+        base_address = int(str(
+            process["codeBase"] if base_kind == "code"
+            else process["moduleBase"]), 0)
+        address = base_address + offset
         if address in addresses:
             raise SysAgentProtocolError(
                 f"trace profile resolves duplicate target address 0x{address:X}")
@@ -2337,6 +2406,8 @@ def resolve_trace_profile(client: SysAgentClient,
             "address": f"0x{address:X}",
             "moduleIndex": process["moduleIndex"],
             "moduleBase": process["moduleBase"],
+            "codeBase": process["codeBase"],
+            "base": base_kind,
             "offset": f"0x{offset:X}",
             "expectBytes": expected_bytes,
             "snapshots": target_snapshots,
@@ -2425,6 +2496,17 @@ def _trace_address(value: object) -> int | None:
 
 CMIF_IN_HEADER_MAGIC = 0x49434653
 CMIF_OUT_HEADER_MAGIC = 0x4F434653
+CMIF_CONTROL_OPERATIONS = {
+    0: "convert-current-object-to-domain",
+    1: "copy-from-current-domain",
+    2: "clone-current-object",
+    3: "query-pointer-buffer-size",
+    4: "clone-current-object-ex",
+}
+TRACE_CORRELATION_EVENT_FIELDS = {
+    "thread", "pc", "lr", "sp", "target", "targetAddress",
+    *(f"x{index}" for index in range(8)),
+}
 
 
 def _read_u32(data: bytes, offset: int, label: str) -> int:
@@ -2437,6 +2519,131 @@ def _read_u64(data: bytes, offset: int, label: str) -> int:
     if offset < 0 or offset + 8 > len(data):
         raise SysAgentProtocolError(f"{label} is truncated at offset 0x{offset:X}")
     return int.from_bytes(data[offset:offset + 8], "little")
+
+
+def _validate_correlation_expression(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    parts = value.split(":")
+    if len(parts) == 2 and parts[0] == "event":
+        if parts[1] not in TRACE_CORRELATION_EVENT_FIELDS:
+            raise ValueError(f"{label} has unsupported event field {parts[1]!r}")
+        return value
+    if len(parts) == 3 and parts[0] == "ipc" and parts[1] in {
+            "header", "domain"}:
+        field = parts[2]
+        allowed = (
+            {"commandId", "token", "result", "interfaceId"}
+            if parts[1] == "header" else {"type", "objectId", "token"})
+        if field not in allowed:
+            raise ValueError(
+                f"{label} has unsupported ipc.{parts[1]} field {field!r}")
+        return value
+    if len(parts) == 4 and parts[0] in {"ipc", "snapshot"}:
+        try:
+            offset = parse_int(parts[2])
+            size = parse_int(parts[3])
+        except ValueError as exc:
+            raise ValueError(
+                f"{label} offset and size must be integers") from exc
+        if offset < 0 or not 1 <= size <= 64:
+            raise ValueError(f"{label} needs offset >= 0 and size 1..64")
+        if parts[0] == "ipc" and parts[1] != "payload":
+            raise ValueError(f"{label} ipc bytes must use ipc:payload")
+        if parts[0] == "snapshot" and parts[1] not in {"0", "1"}:
+            raise ValueError(f"{label} snapshot index must be 0 or 1")
+        return value
+    raise ValueError(
+        f"{label} must be event:FIELD, ipc:header:FIELD, "
+        "ipc:domain:FIELD, ipc:payload:OFFSET:SIZE, or "
+        "snapshot:INDEX:OFFSET:SIZE")
+
+
+def _correlation_scalar(value: object) -> str:
+    if isinstance(value, int):
+        return f"{value:X}"
+    text = str(value)
+    try:
+        return f"{int(text, 16):X}"
+    except ValueError:
+        return text.upper()
+
+
+def _correlation_value(event: dict[str, object],
+                       decoded: dict[str, object],
+                       expression: str) -> str | None:
+    parts = expression.split(":")
+    if parts[0] == "event":
+        value = event.get(parts[1])
+        if value is None:
+            return None
+        return _correlation_scalar(value)
+    if parts[0] == "snapshot":
+        encoded = event.get(f"snap{parts[1]}Data")
+        if not isinstance(encoded, str):
+            return None
+        try:
+            data = bytes.fromhex(encoded)
+        except ValueError:
+            return None
+        offset = parse_int(parts[2])
+        size = parse_int(parts[3])
+        if offset + size > len(data):
+            return None
+        return data[offset:offset + size].hex().upper()
+    cmif = decoded.get("cmif")
+    if not isinstance(cmif, dict):
+        return None
+    if parts[1] == "payload":
+        encoded = cmif.get("payloadHex")
+        if not isinstance(encoded, str):
+            return None
+        try:
+            data = bytes.fromhex(encoded)
+        except ValueError:
+            return None
+        offset = parse_int(parts[2])
+        size = parse_int(parts[3])
+        if offset + size > len(data):
+            return None
+        return data[offset:offset + size].hex().upper()
+    container = cmif.get(
+        "header" if parts[1] == "header" else "domainHeader")
+    if not isinstance(container, dict):
+        return None
+    value = container.get(parts[2])
+    return None if value is None else _correlation_scalar(value)
+
+
+def _pair_correlation(pair: dict[str, object]) -> dict[str, object] | None:
+    ipc = pair.get("ipc")
+    if not isinstance(ipc, dict):
+        return None
+    correlation = ipc.get("correlation")
+    if correlation is None:
+        return None
+    if not isinstance(correlation, dict):
+        raise ValueError("pair ipc.correlation must be an object")
+    request_key = _validate_correlation_expression(
+        correlation.get("request"), "pair ipc.correlation.request")
+    _validate_correlation_expression(
+        correlation.get("response", request_key),
+        "pair ipc.correlation.response")
+    if "thread" in correlation and not isinstance(correlation["thread"], bool):
+        raise ValueError("pair ipc.correlation.thread must be boolean")
+    fallback = correlation.get("fallback", "none")
+    if fallback not in {"none", "thread-fifo"}:
+        raise ValueError(
+            "pair ipc.correlation.fallback must be none or thread-fifo")
+    return correlation
+
+
+def _remove_pending_request(requests: list[dict[str, object]],
+                            request: dict[str, object]) -> None:
+    for index, candidate in enumerate(requests):
+        if candidate is request:
+            requests.pop(index)
+            return
 
 
 def _hipc_static_descriptor(data: bytes, offset: int) -> dict[str, int]:
@@ -2466,6 +2673,27 @@ def _hipc_buffer_descriptor(data: bytes, offset: int) -> dict[str, int]:
         ),
         "size": size_low | (((attributes >> 24) & 0xF) << 32),
     }
+
+
+def _cmif_operation(command_type: object, cmif: dict[str, object]) -> str | None:
+    """Classify generic CMIF request mechanics without assigning service semantics."""
+    if cmif.get("mode") != "request":
+        return None
+    domain_header = cmif.get("domainHeader")
+    if cmif.get("domain") and isinstance(domain_header, dict):
+        if domain_header.get("type") == 2:
+            return "close-domain-object"
+        if domain_header.get("type") == 1:
+            return "invoke-method"
+        return "unknown-domain-operation"
+    header = cmif.get("header")
+    if not isinstance(header, dict):
+        return None
+    if command_type in {3, 5, 7}:
+        command_id = header.get("commandId")
+        if isinstance(command_id, int) and command_id in CMIF_CONTROL_OPERATIONS:
+            return CMIF_CONTROL_OPERATIONS[command_id]
+    return "invoke-method"
 
 
 def decode_hipc_cmif(data: bytes, mode: str = "auto") -> dict[str, object]:
@@ -2505,7 +2733,19 @@ def decode_hipc_cmif(data: bytes, mode: str = "auto") -> dict[str, object]:
             int(metadata["copyHandles"]) + int(metadata["moveHandles"]))
         if offset + handle_bytes > len(data):
             raise SysAgentProtocolError("HIPC handle area is truncated")
-        offset += handle_bytes
+        handles: list[dict[str, object]] = []
+        for kind, count in (
+                ("copy", int(metadata["copyHandles"])),
+                ("move", int(metadata["moveHandles"]))):
+            for handle_index in range(count):
+                value = _read_u32(data, offset, "HIPC handle")
+                handles.append({
+                    "kind": kind,
+                    "index": handle_index,
+                    "value": value,
+                    "valueHex": f"0x{value:08X}",
+                })
+                offset += 4
 
         descriptors: list[dict[str, object]] = []
         if selected_mode == "request":
@@ -2536,7 +2776,34 @@ def decode_hipc_cmif(data: bytes, mode: str = "auto") -> dict[str, object]:
             raise SysAgentProtocolError("HIPC data-word area is truncated")
         cmif_offset = (data_words_offset + 15) & ~15
         cmif = None
+        if (selected_mode == "request"
+                and metadata["type"] == 4
+                and cmif_offset + 16 <= data_words_end
+                and data[cmif_offset] == 2):
+            domain = {
+                "type": data[cmif_offset],
+                "numInObjects": data[cmif_offset + 1],
+                "dataSize": int.from_bytes(
+                    data[cmif_offset + 2:cmif_offset + 4], "little"),
+                "objectId": _read_u32(
+                    data, cmif_offset + 4, "CMIF domain header"),
+                "token": _read_u32(
+                    data, cmif_offset + 12, "CMIF domain header"),
+            }
+            if (domain["numInObjects"] == 0 and domain["dataSize"] == 0
+                    and domain["objectId"] != 0):
+                cmif = {
+                    "mode": selected_mode,
+                    "domain": True,
+                    "domainHeader": domain,
+                    "header": None,
+                    "payloadOffset": cmif_offset + 16,
+                    "payloadHex": data[
+                        cmif_offset + 16:data_words_end].hex().upper(),
+                }
         for is_domain in (False, True):
+            if cmif is not None:
+                break
             candidate = cmif_offset + (16 if is_domain else 0)
             if candidate + 16 > data_words_end:
                 continue
@@ -2579,7 +2846,7 @@ def decode_hipc_cmif(data: bytes, mode: str = "auto") -> dict[str, object]:
                     data, candidate + 12, "CMIF header")
             else:
                 header["result"] = f"0x{_read_u32(data, candidate + 8, 'CMIF header'):X}"
-                header["token"] = _read_u32(
+                header["interfaceId"] = _read_u32(
                     data, candidate + 12, "CMIF header")
             cmif = {
                 "mode": selected_mode,
@@ -2593,14 +2860,17 @@ def decode_hipc_cmif(data: bytes, mode: str = "auto") -> dict[str, object]:
         if cmif is None:
             raise SysAgentProtocolError(
                 f"HIPC data does not contain a CMIF {selected_mode} header")
+        cmif["operation"] = _cmif_operation(metadata["type"], cmif)
+        hipc = {
+            **metadata,
+            "dataWordsOffset": data_words_offset,
+            "dataWordsHex": data[
+                data_words_offset:data_words_end].hex().upper(),
+            "handles": handles,
+            "descriptors": descriptors,
+        }
         return {
-            "hipc": {
-                **metadata,
-                "dataWordsOffset": data_words_offset,
-                "dataWordsHex": data[
-                    data_words_offset:data_words_end].hex().upper(),
-                "descriptors": descriptors,
-            },
+            "hipc": hipc,
             "cmif": cmif,
         }
 
@@ -2614,6 +2884,24 @@ def decode_hipc_cmif(data: bytes, mode: str = "auto") -> dict[str, object]:
     raise SysAgentProtocolError("; ".join(errors))
 
 
+def _domain_object_record(domain_objects: dict[str, dict[str, object]],
+                          object_id: object, tick: object) -> dict[str, object]:
+    object_key = str(object_id)
+    return domain_objects.setdefault(object_key, {
+        "objectId": object_id,
+        "firstTick": tick,
+        "lastTick": tick,
+        "createCount": 0,
+        "closeCount": 0,
+        "requestCount": 0,
+        "responseCount": 0,
+        "commands": {},
+        "results": {},
+        "createdTick": None,
+        "closedTick": None,
+    })
+
+
 def decode_trace_ipc(documents: Sequence[dict[str, object]],
                      snapshot_index: int | None = None,
                      profile: dict[str, object] | None = None
@@ -2622,9 +2910,11 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
     records: list[dict[str, object]] = []
     transactions: list[dict[str, object]] = []
     domain_objects: dict[str, dict[str, object]] = {}
+    domain_events: list[dict[str, object]] = []
     skipped = 0
     pending_requests: dict[
         tuple[str, str, str, str], list[dict[str, object]]] = {}
+    pending_keyed: dict[tuple[object, ...], list[dict[str, object]]] = {}
     unmatched_responses = 0
     for document in documents:
         metadata = _profile_object(document.get("metadata"), "trace metadata")
@@ -2652,8 +2942,11 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
                 trace_address = _trace_address(trace_target.get("address"))
                 offset = _profile_target_offset(
                     profile, target, f"target {target['id']}")
-                if (module_base is None or trace_address is None
-                        or module_base + offset != trace_address):
+                base_kind = str(target.get("base", "main"))
+                code_base = _trace_address(trace_target.get("codeBase"))
+                base_address = code_base if base_kind == "code" else module_base
+                if (base_address is None or trace_address is None
+                        or base_address + offset != trace_address):
                     raise SysAgentProtocolError(
                         f"trace target index {index} does not match profile "
                         f"target {target['id']}")
@@ -2739,53 +3032,138 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
                 records.append(record)
                 cmif = decoded["cmif"]
                 assert isinstance(cmif, dict)
+                operation = cmif.get("operation")
                 domain_header = cmif.get("domainHeader")
                 if (cmif.get("domain") and isinstance(domain_header, dict)
-                        and domain_header.get("objectId") is not None):
-                    object_id = str(domain_header["objectId"])
-                    object_record = domain_objects.setdefault(object_id, {
-                        "objectId": domain_header["objectId"],
-                        "firstTick": record.get("tick"),
-                        "lastTick": record.get("tick"),
-                        "requestCount": 0,
-                        "responseCount": 0,
-                        "commands": {},
-                        "results": {},
-                    })
+                        and domain_header.get("objectId")):
+                    object_id = domain_header["objectId"]
+                    object_record = _domain_object_record(
+                        domain_objects, object_id, record.get("tick"))
                     object_record["lastTick"] = record.get("tick")
                     if cmif.get("mode") == "request":
-                        object_record["requestCount"] = (
-                            int(object_record["requestCount"]) + 1)
-                        header = cmif.get("header")
-                        if isinstance(header, dict) and "commandId" in header:
-                            command_key = str(header["commandId"])
-                            commands = object_record["commands"]
-                            assert isinstance(commands, dict)
-                            commands[command_key] = commands.get(command_key, 0) + 1
+                        if operation == "close-domain-object":
+                            object_record["closeCount"] = (
+                                int(object_record["closeCount"]) + 1)
+                            object_record["closedTick"] = record.get("tick")
+                            domain_events.append({
+                                "type": "close-domain-object",
+                                "sessionId": session_id,
+                                "seq": record.get("seq"),
+                                "tick": record.get("tick"),
+                                "thread": record.get("thread"),
+                                "targetId": record.get("targetId"),
+                                "objectId": object_id,
+                            })
+                        else:
+                            object_record["requestCount"] = (
+                                int(object_record["requestCount"]) + 1)
+                            header = cmif.get("header")
+                            if isinstance(header, dict) and "commandId" in header:
+                                command_key = str(header["commandId"])
+                                commands = object_record["commands"]
+                                assert isinstance(commands, dict)
+                                commands[command_key] = (
+                                    commands.get(command_key, 0) + 1)
                 target_id = record.get("targetId")
                 pair = pair_for_target.get(str(target_id))
                 if pair is not None:
                     entry_id = str(pair["entry"])
                     return_id = str(pair["return"])
-                    key = (session_id, str(event.get("thread", "0")),
+                    thread = str(event.get("thread", "0"))
+                    correlation = _pair_correlation(pair)
+                    key = (session_id, thread,
                         entry_id, return_id)
-                    if target_id == entry_id and cmif["mode"] == "request":
-                        pending_requests.setdefault(key, []).append(record)
+                    if (target_id == entry_id and cmif["mode"] == "request"
+                            and operation != "close-domain-object"):
+                        requests = pending_requests.setdefault(key, [])
+                        outstanding_at_request = len(requests) + 1
+                        request_correlation_key = None
+                        if correlation is not None:
+                            request_correlation_key = _correlation_value(
+                                event, decoded,
+                                str(correlation["request"]))
+                            record["correlationKey"] = request_correlation_key
+                            if request_correlation_key is not None:
+                                correlation_key: tuple[object, ...] = (
+                                    session_id, entry_id, return_id)
+                                if correlation.get("thread", True):
+                                    correlation_key += (thread,)
+                                correlation_key += (request_correlation_key,)
+                                keyed_requests = pending_keyed.setdefault(
+                                    correlation_key, [])
+                                outstanding_at_request = len(
+                                    keyed_requests) + 1
+                                keyed_requests.append(record)
+                        record["outstandingAtRequest"] = outstanding_at_request
+                        requests.append(record)
                     elif target_id == return_id and cmif["mode"] == "response":
-                        requests = pending_requests.get(key)
-                        if requests:
+                        request = None
+                        outstanding_at_response = 0
+                        correlation_kind = "thread-fifo"
+                        response_correlation_key = None
+                        if correlation is not None:
+                            response_correlation_key = _correlation_value(
+                                event, decoded,
+                                str(correlation.get("response",
+                                    correlation["request"])))
+                            if response_correlation_key is not None:
+                                correlation_key = (
+                                    session_id, entry_id, return_id)
+                                if correlation.get("thread", True):
+                                    correlation_key += (thread,)
+                                correlation_key += (response_correlation_key,)
+                                keyed_requests = pending_keyed.get(
+                                    correlation_key)
+                                if keyed_requests:
+                                    outstanding_at_response = len(keyed_requests)
+                                    request = keyed_requests.pop(0)
+                                    if not keyed_requests:
+                                        pending_keyed.pop(correlation_key, None)
+                                    request_thread = str(
+                                        request.get("thread", "0"))
+                                    request_fifo_key = (
+                                        session_id, request_thread,
+                                        entry_id, return_id)
+                                    _remove_pending_request(
+                                        pending_requests.get(
+                                            request_fifo_key, []), request)
+                                    correlation_kind = (
+                                        "profile-key"
+                                        if outstanding_at_response == 1
+                                        else "ambiguous-profile-key")
+                        if request is None:
+                            requests = pending_requests.get(key)
+                            fallback = (
+                                correlation is None
+                                or correlation.get("fallback") == "thread-fifo")
+                            if not fallback or not requests:
+                                unmatched_responses += 1
+                                continue
+                            outstanding_at_response = len(requests)
                             request = requests.pop(0)
+                            correlation_kind = (
+                                "thread-fifo"
+                                if outstanding_at_response == 1
+                                else "ambiguous-thread-fifo")
+                            if correlation is not None:
+                                correlation_kind = (
+                                    "thread-fifo-fallback"
+                                    if outstanding_at_response == 1
+                                    else "ambiguous-thread-fifo-fallback")
+                        if request is not None:
                             request_cmif = request["cmif"]
                             assert isinstance(request_cmif, dict)
-                            request_header = request_cmif["header"]
+                            request_header = request_cmif.get("header")
                             response_header = cmif["header"]
-                            assert isinstance(request_header, dict)
                             assert isinstance(response_header, dict)
+                            request_operation = request_cmif.get("operation")
                             ipc_metadata = pair.get("ipc", {})
                             ipc_metadata = (
                                 ipc_metadata
                                 if isinstance(ipc_metadata, dict) else {})
-                            command_id = request_header.get("commandId")
+                            command_id = (
+                                request_header.get("commandId")
+                                if isinstance(request_header, dict) else None)
                             command_name = None
                             commands = ipc_metadata.get("commands", {})
                             if isinstance(commands, dict):
@@ -2797,61 +3175,122 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
                             if interface_hash is not None:
                                 interface_hash = (
                                     f"0x{_profile_hex_id(interface_hash, 'interfaceHash'):X}")
-                            transactions.append({
+                            response_result = response_header.get("result")
+                            response_interface_id = response_header.get(
+                                "interfaceId")
+                            interface_matches = None
+                            if (interface_hash is not None
+                                    and isinstance(response_interface_id, int)
+                                    and response_interface_id != 0):
+                                interface_matches = (
+                                    response_interface_id
+                                    == int(interface_hash, 16))
+                            created_object_id = None
+                            response_payload = cmif.get("payloadHex")
+                            if (request_operation == "convert-current-object-to-domain"
+                                    and str(response_result) in {"0x0", "0"}
+                                    and isinstance(response_payload, str)
+                                    and len(response_payload) >= 8):
+                                created_object_id = int.from_bytes(
+                                    bytes.fromhex(response_payload[:8]), "little")
+                                if created_object_id == 0:
+                                    created_object_id = None
+                            transaction = {
                                 "sessionId": session_id,
                                 "thread": event.get("thread"),
+                                "requestThread": request.get("thread"),
+                                "responseThread": event.get("thread"),
                                 "entryTarget": entry_id,
                                 "returnTarget": return_id,
                                 "requestSeq": request.get("seq"),
                                 "returnSeq": record.get("seq"),
                                 "requestTick": request.get("tick"),
                                 "returnTick": record.get("tick"),
+                                "operation": request_operation,
                                 "commandId": command_id,
                                 "commandName": command_name,
                                 "service": ipc_metadata.get("service"),
                                 "interfaceHash": interface_hash,
-                                "requestToken": request_header.get("token"),
-                                "responseToken": response_header.get("token"),
-                                "result": response_header.get("result"),
+                                "requestToken": (
+                                    request_header.get("token")
+                                    if isinstance(request_header, dict) else None),
+                                "responseInterfaceId": response_interface_id,
+                                "interfaceMatchesProfile": interface_matches,
+                                "result": response_result,
                                 "objectId": (
                                     request_cmif.get("domainHeader", {}).get(
                                         "objectId")
                                     if isinstance(
                                         request_cmif.get("domainHeader"), dict)
                                     else None),
+                                "createdObjectId": created_object_id,
+                                "requestHandles": request["hipc"].get(
+                                    "handles", []),
+                                "responseHandles": record["hipc"].get(
+                                    "handles", []),
                                 "requestSnapshot": request.get("snapshot"),
                                 "responseSnapshot": record.get("snapshot"),
-                            })
+                                "requestCorrelationKey":
+                                    request.get("correlationKey"),
+                                "responseCorrelationKey":
+                                    response_correlation_key,
+                                "outstandingAtResponse": outstanding_at_response,
+                                "correlation": correlation_kind,
+                                "correlationAmbiguous":
+                                    outstanding_at_response > 1,
+                            }
+                            transactions.append(transaction)
+                            if created_object_id is not None:
+                                created_record = _domain_object_record(
+                                    domain_objects, created_object_id,
+                                    record.get("tick"))
+                                created_record["createCount"] = (
+                                    int(created_record["createCount"]) + 1)
+                                created_record["createdTick"] = record.get("tick")
+                                domain_events.append({
+                                    "type": "create-domain-object",
+                                    "sessionId": session_id,
+                                    "seq": record.get("seq"),
+                                    "tick": record.get("tick"),
+                                    "thread": record.get("thread"),
+                                    "targetId": record.get("targetId"),
+                                    "objectId": created_object_id,
+                                })
                             if transaction_object_id := transactions[-1].get(
                                     "objectId"):
-                                object_record = domain_objects.setdefault(
-                                    str(transaction_object_id), {
-                                        "objectId": transaction_object_id,
-                                        "firstTick": record.get("tick"),
-                                        "lastTick": record.get("tick"),
-                                        "requestCount": 0,
-                                        "responseCount": 0,
-                                        "commands": {},
-                                        "results": {},
-                                    })
+                                object_record = _domain_object_record(
+                                    domain_objects, transaction_object_id,
+                                    record.get("tick"))
                                 object_record["lastTick"] = record.get("tick")
                                 object_record["responseCount"] = (
                                     int(object_record["responseCount"]) + 1)
-                                result = str(response_header.get("result"))
+                                result = str(response_result)
                                 results = object_record["results"]
                                 assert isinstance(results, dict)
                                 results[result] = results.get(result, 0) + 1
-                        else:
-                            unmatched_responses += 1
     unmatched_requests = sum(
         len(requests) for requests in pending_requests.values())
     domain_objects_out = sorted(
-        domain_objects.values(),
+        (record for record in domain_objects.values()
+         if int(record["closeCount"]) != 0
+         or int(record["createCount"]) != 0
+         or int(record["requestCount"]) != 0),
         key=lambda item: int(item["objectId"]))
+    domain_events.sort(key=lambda item: (
+        parse_int(str(item.get("tick", "0"))),
+        parse_int(str(item.get("seq", "0")))))
+    ambiguous_transactions = sum(
+        1 for transaction in transactions
+        if transaction.get("correlationAmbiguous"))
+    correlation_counts: dict[str, int] = {}
+    for transaction in transactions:
+        method = str(transaction.get("correlation", "unknown"))
+        correlation_counts[method] = correlation_counts.get(method, 0) + 1
     return {
         "schemaVersion": TRACE_SCHEMA_VERSION,
         "records": records,
         "transactions": transactions,
+        "domainEvents": domain_events,
         "domainObjects": domain_objects_out,
         "summary": {
             "traceCount": len(documents),
@@ -2859,20 +3298,27 @@ def decode_trace_ipc(documents: Sequence[dict[str, object]],
             "transactionCount": len(transactions),
             "unmatchedRequests": unmatched_requests,
             "unmatchedResponses": unmatched_responses,
+            "ambiguousTransactions": ambiguous_transactions,
+            "correlationMethods": correlation_counts,
+            "domainEventCount": len(domain_events),
             "domainObjectCount": len(domain_objects_out),
             "skippedSnapshots": skipped,
         },
     }
 
 
-def build_trace_timeline(documents: Sequence[dict[str, object]]
-                         ) -> dict[str, object]:
+def build_trace_timeline(
+        documents: Sequence[dict[str, object]],
+        profile: dict[str, object] | None = None) -> dict[str, object]:
     """Merge multiple trace sessions into one monotonic boot timeline."""
     boot_epochs: set[int] = set()
     timeline: list[dict[str, object]] = []
     process_counts: dict[str, int] = {}
     ipc_count = 0
     transaction_count = 0
+    ambiguous_transactions = 0
+    correlation_counts: dict[str, int] = {}
+    domain_event_count = 0
 
     for document in documents:
         metadata = _profile_object(document.get("metadata"), "trace metadata")
@@ -2888,7 +3334,17 @@ def build_trace_timeline(documents: Sequence[dict[str, object]]
             for target in targets
             if isinstance(target, dict)
         } if isinstance(targets, list) else {}
-        ipc_report = decode_trace_ipc([document])
+        ipc_report = decode_trace_ipc([document], profile=profile)
+        if profile is not None:
+            for index, raw_target in enumerate(_profile_target_order(profile)):
+                target = _profile_object(raw_target, "profile target")
+                trace_target = target_metadata.get(str(index))
+                if isinstance(trace_target, dict):
+                    target_metadata[str(index)] = {
+                        **trace_target,
+                        "id": target["id"],
+                        "processId": target["process"],
+                    }
         ipc_by_event: dict[tuple[str, str], list[dict[str, object]]] = {}
         for ipc_record in ipc_report["records"]:
             assert isinstance(ipc_record, dict)
@@ -2897,27 +3353,38 @@ def build_trace_timeline(documents: Sequence[dict[str, object]]
             cmif = ipc_record.get("cmif")
             assert isinstance(cmif, dict)
             header = cmif.get("header")
-            assert isinstance(header, dict)
+            header = header if isinstance(header, dict) else {}
             ipc_by_event.setdefault(key, []).append({
                 "mode": cmif.get("mode"),
                 "domain": cmif.get("domain"),
+                "operation": cmif.get("operation"),
                 "commandId": header.get("commandId"),
                 "result": header.get("result"),
                 "token": header.get("token"),
+                "interfaceId": header.get("interfaceId"),
                 "snapshot": ipc_record.get("snapshot"),
                 "snapshotName": ipc_record.get("snapshotName"),
                 "snapshotKind": ipc_record.get("snapshotKind"),
+                "handles": ipc_record["hipc"].get("handles", []),
             })
         ipc_count += int(ipc_report["summary"]["ipcCount"])
         for transaction in ipc_report["transactions"]:
             assert isinstance(transaction, dict)
             transaction_count += 1
+            if transaction.get("correlationAmbiguous"):
+                ambiguous_transactions += 1
+            method = str(transaction.get("correlation", "unknown"))
+            correlation_counts[method] = correlation_counts.get(method, 0) + 1
             timeline.append({
                 "type": "transaction",
                 "tick": transaction.get("requestTick"),
                 "sessionId": session_id,
                 **transaction,
             })
+        for domain_event in ipc_report["domainEvents"]:
+            assert isinstance(domain_event, dict)
+            domain_event_count += 1
+            timeline.append(domain_event)
 
         events = document.get("events")
         if not isinstance(events, list):
@@ -2972,6 +3439,9 @@ def build_trace_timeline(documents: Sequence[dict[str, object]]
                 1 for event in timeline if event.get("type") == "event"),
             "ipcCount": ipc_count,
             "transactionCount": transaction_count,
+            "ambiguousTransactions": ambiguous_transactions,
+            "correlationMethods": correlation_counts,
+            "domainEventCount": domain_event_count,
             "processCounts": process_counts,
             "tickFirst": min(
                 (parse_int(str(event.get("tick", "0")))
@@ -3159,12 +3629,15 @@ def report_trace_with_profile(document: dict[str, object],
             trace_target.get("process"), f"target {target_id} process")
         module_base = _trace_address(process.get("moduleBase"))
         trace_address = _trace_address(trace_target.get("address"))
-        if module_base is None or trace_address is None:
+        base_kind = str(target.get("base", "main"))
+        code_base = _trace_address(trace_target.get("codeBase"))
+        base_address = code_base if base_kind == "code" else module_base
+        if base_address is None or trace_address is None:
             raise SysAgentProtocolError(
                 f"trace target {target_id} has no module/address metadata")
         offset = _profile_target_offset(
             profile, target, f"target {target_id}")
-        expected_address = module_base + offset
+        expected_address = base_address + offset
         if trace_address != expected_address:
             raise SysAgentProtocolError(
                 f"trace target {target_id} address mismatch: "
@@ -3201,6 +3674,9 @@ def report_trace_with_profile(document: dict[str, object],
             "titleId": process.get("titleId"),
             "buildId": process.get("buildId"),
             "address": f"0x{trace_address:X}",
+            "base": base_kind,
+            "moduleBase": process.get("moduleBase"),
+            "codeBase": trace_target.get("codeBase"),
             "offset": f"0x{offset:X}",
             "snapshots": target.get("_parsedSnapshots", []),
         })
@@ -3414,6 +3890,16 @@ def _cmd_debug_wait_title(client: SysAgentClient, args: argparse.Namespace) -> N
 def _cmd_debug_wait_application(client: SysAgentClient,
                                 args: argparse.Namespace) -> None:
     _emit(client.debug_wait_application(args.timeout_ms), args)
+
+
+def _cmd_debug_wait_status(client: SysAgentClient,
+                           args: argparse.Namespace) -> None:
+    _emit(client.debug_wait_status(), args)
+
+
+def _cmd_debug_start_process(client: SysAgentClient,
+                             args: argparse.Namespace) -> None:
+    _emit(client.debug_start_process(args.pid), args)
 
 
 def _cmd_system_action(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -3811,6 +4297,8 @@ def _cmd_debug_trace(client: SysAgentClient, args: argparse.Namespace) -> None:
         parts.extend(("ring", str(args.ring)))
     if args.duration is not None:
         parts.extend(("duration", str(args.duration)))
+    if args.duration_from == "first-hit":
+        parts.append("durationFrom=first-hit")
     if args.args is not None:
         parts.extend(("args", str(args.args)))
     for snapshot in snapshots:
@@ -3874,6 +4362,13 @@ def _trace_process_metadata(client: SysAgentClient,
         })
     except (OSError, ValueError, SysAgentProtocolError):
         pass
+    try:
+        maps, _ = _parse_executable_maps(require_ok(
+            client.command(f"debug maps 0x{pid:X} 256", retry=True)))
+        if maps:
+            metadata["codeBase"] = f"0x{min(entry['base'] for entry in maps):X}"
+    except (OSError, ValueError, SysAgentProtocolError):
+        pass
     return metadata
 
 
@@ -3927,6 +4422,9 @@ def _annotate_trace_with_plan(output: str, plan: dict[str, object]) -> None:
             raw_target.update({
                 "id": plan_target["id"],
                 "processId": plan_target["processId"],
+                "moduleBase": plan_target["moduleBase"],
+                "codeBase": plan_target["codeBase"],
+                "base": plan_target["base"],
                 "offset": plan_target["offset"],
                 "mapping": plan_target["mapping"],
                 "snapshots": plan_target.get("snapshots", []),
@@ -4040,6 +4538,8 @@ def _cmd_debug_multitrace(client: SysAgentClient, args: argparse.Namespace) -> N
         parts.extend(("ring", str(args.ring)))
     if args.duration is not None:
         parts.extend(("duration", str(args.duration)))
+    if args.duration_from == "first-hit":
+        parts.append("durationFrom=first-hit")
     if args.args is not None:
         parts.extend(("args", str(args.args)))
     for snapshot in snapshots:
@@ -4168,6 +4668,11 @@ def _trace_profile_options(profile: dict[str, object],
         name: (int(value) if value is not None else None)
         for name, value in options.items()
     }
+    configured_duration_from = configured.get("durationFrom", "arm")
+    duration_from = (args.duration_from
+                     if args.duration_from is not None
+                     else configured_duration_from)
+    parsed_options["durationFromFirstHit"] = duration_from == "first-hit"
     cli_snapshots = getattr(args, "snapshots", None) or []
     if len(cli_snapshots) > 2:
         raise ValueError("at most two --snapshot specifications are supported")
@@ -4209,6 +4714,8 @@ def _start_plan_trace(client: SysAgentClient, plan: dict[str, object],
         value = options.get(name)
         if value is not None:
             parts.extend((name, str(value)))
+        if name == "duration" and options.get("durationFromFirstHit"):
+            parts.append("durationFrom=first-hit")
     for snapshot in options.get("globalSnapshots", []):
         parts.append(f"snap={snapshot}")
     for raw_target in targets:
@@ -4229,27 +4736,119 @@ def _start_plan_trace(client: SysAgentClient, plan: dict[str, object],
     return require_ok(client.command(" ".join(parts)))
 
 
+def _start_waited_processes(client: SysAgentClient,
+                            waited: dict[str, int]) -> list[dict[str, str]]:
+    started: list[dict[str, str]] = []
+    errors: list[str] = []
+    for process_id, pid in waited.items():
+        try:
+            started.append(client.debug_start_process(pid))
+        except (OSError, SysAgentProtocolError) as error:
+            errors.append(f"{process_id} pid=0x{pid:X}: {error}")
+    if errors:
+        raise SysAgentProtocolError(
+            "could not release PM-suspended process(es): "
+            + "; ".join(errors))
+    return started
+
+
+def _release_waited_processes_best_effort(client: SysAgentClient,
+                                          waited: dict[str, int]) -> None:
+    for pid in waited.values():
+        try:
+            client.debug_start_process(pid)
+        except (OSError, SysAgentProtocolError):
+            pass
+
+
 def _wait_for_profile_processes(client: SysAgentClient,
                                 profile: dict[str, object],
-                                timeout_ms: int) -> None:
-    for raw_process in _profile_list(profile["processes"], "processes"):
-        process = _profile_object(raw_process, "process")
-        if "foreground" in process:
-            if not client.game_status().running:
-                client.debug_wait_application(timeout_ms)
-        elif "titleId" in process:
-            title_id = _profile_hex_id(
-                process["titleId"], "process titleId")
-            try:
-                _find_profile_pid(client, title_id)
-            except SysAgentProtocolError:
-                client.debug_wait_process(title_id, timeout_ms)
+                                timeout_ms: int) -> dict[str, int]:
+    waited: dict[str, int] = {}
+    try:
+        for raw_process in _profile_list(profile["processes"], "processes"):
+            process = _profile_object(raw_process, "process")
+            process_id = str(process["id"])
+            response: dict[str, str] | None = None
+            if "foreground" in process:
+                if not client.game_status().running:
+                    try:
+                        response = client.debug_wait_application(timeout_ms)
+                    except SysAgentProtocolError as error:
+                        expected = process.get("expect")
+                        expected = (
+                            expected if isinstance(expected, dict) else {})
+                        fallback_title = expected.get("titleId")
+                        if ("WAIT_HOOK_FAILED" not in str(error)
+                                or fallback_title is None):
+                            raise
+                        response = client.debug_wait_process(
+                            _profile_hex_id(
+                                fallback_title,
+                                f"process {process_id} expect.titleId"),
+                            timeout_ms)
+            elif "titleId" in process:
+                title_id = _profile_hex_id(
+                    process["titleId"], "process titleId")
+                try:
+                    _find_profile_pid(client, title_id)
+                except SysAgentProtocolError:
+                    response = client.debug_wait_process(title_id, timeout_ms)
+            if response is not None and response.get("waited", "1") == "1":
+                try:
+                    pid = int(response["pid"], 16)
+                except (KeyError, ValueError) as exc:
+                    raise SysAgentProtocolError(
+                        f"process {process_id} wait response has no valid PID") from exc
+                waited[process_id] = pid
+    except Exception:
+        _release_waited_processes_best_effort(client, waited)
+        raise
+    return waited
 
 
 def _wait_for_plan_trace(client: SysAgentClient, mode: str,
-                         timeout_seconds: float) -> dict[str, str]:
+                         timeout_seconds: float,
+                         start_timeout_at_first_hit: bool = False
+                         ) -> dict[str, str]:
     if timeout_seconds <= 0:
         raise ValueError("wait timeout must be positive")
+    command = (
+        "debug trace-status" if mode == "single"
+        else "debug multitrace-status")
+    deadline = (
+        None if start_timeout_at_first_hit
+        else time.monotonic() + timeout_seconds)
+    client.timeout = max(client.timeout, 30.0)
+    while True:
+        status = require_ok(client.command(command, retry=True))
+        last_error = parse_int(status.get("lastError", "0"))
+        if last_error:
+            raise SysAgentProtocolError(
+                f"trace failed in stage {status.get('stage', '')}: "
+                f"result=0x{last_error:X}")
+        if status.get("active") != "1":
+            return status
+        if (start_timeout_at_first_hit and deadline is None
+                and parse_int(status.get("hitCount", "0")) > 0):
+            deadline = time.monotonic() + timeout_seconds
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    stop_command = (
+        "debug trace-stop" if mode == "single"
+        else "debug multitrace-stop")
+    try:
+        client.command(stop_command)
+    except (OSError, SysAgentProtocolError):
+        pass
+    raise SysAgentProtocolError(
+        f"trace did not finish within {timeout_seconds:g} seconds")
+
+
+def _wait_for_plan_trace_armed(client: SysAgentClient, mode: str,
+                               timeout_seconds: float = 30.0
+                               ) -> dict[str, str]:
     command = (
         "debug trace-status" if mode == "single"
         else "debug multitrace-status")
@@ -4262,18 +4861,24 @@ def _wait_for_plan_trace(client: SysAgentClient, mode: str,
             raise SysAgentProtocolError(
                 f"trace failed in stage {status.get('stage', '')}: "
                 f"result=0x{last_error:X}")
-        if status.get("active") != "1":
+        if status.get("armed") == "1":
             return status
-        time.sleep(0.25)
-    stop_command = (
+        if status.get("active") != "1":
+            raise SysAgentProtocolError(
+                f"trace ended before arming in stage {status.get('stage', '')}")
+        time.sleep(0.1)
+    raise SysAgentProtocolError(
+        f"trace was not armed within {timeout_seconds:g} seconds")
+
+
+def _stop_plan_trace(client: SysAgentClient, mode: str) -> None:
+    command = (
         "debug trace-stop" if mode == "single"
         else "debug multitrace-stop")
     try:
-        client.command(stop_command)
+        client.command(command)
     except (OSError, SysAgentProtocolError):
         pass
-    raise SysAgentProtocolError(
-        f"trace did not finish within {timeout_seconds:g} seconds")
 
 
 def _cmd_debug_trace_plan(client: SysAgentClient,
@@ -4292,49 +4897,74 @@ def _cmd_debug_trace_plan(client: SysAgentClient,
 def _cmd_debug_trace_run(client: SysAgentClient,
                          args: argparse.Namespace) -> None:
     profile = load_trace_profile(args.profile)
-    if args.wait_process:
-        _wait_for_profile_processes(
-            client, profile, args.wait_process_timeout)
-    plan = resolve_trace_profile(client, profile)
-    options = _trace_profile_options(profile, args)
-    started = _start_plan_trace(client, plan, options)
-    if not args.wait and not args.output:
-        _emit(started, args)
-        return
+    waited: dict[str, int] = {}
+    trace_started = False
+    plan: dict[str, object] | None = None
+    process_start_results: list[dict[str, str]] = []
+    try:
+        if args.wait_process:
+            waited = _wait_for_profile_processes(
+                client, profile, args.wait_process_timeout)
+        plan = resolve_trace_profile(client, profile)
+        options = _trace_profile_options(profile, args)
+        started = _start_plan_trace(client, plan, options)
+        trace_started = True
+        if waited:
+            _wait_for_plan_trace_armed(client, str(plan["mode"]))
+            process_start_results = _start_waited_processes(client, waited)
+            waited.clear()
+        started["processesStarted"] = str(len(process_start_results))
+        if not args.wait and not args.output:
+            _emit(started, args)
+            return
 
-    duration = options.get("duration")
-    default_wait = (
-        90.0 if duration is None else max(30.0, float(duration) + 15.0))
-    wait_timeout = args.wait_timeout if args.wait_timeout is not None else default_wait
-    status = _wait_for_plan_trace(client, str(plan["mode"]), wait_timeout)
-    output_path = args.output
-    if output_path:
-        if plan["mode"] == "single":
-            event_count, session_id = _export_single_trace(client, output_path)
+        duration = options.get("duration")
+        default_wait = (
+            90.0 if duration is None else max(30.0, float(duration) + 15.0))
+        wait_timeout = args.wait_timeout if args.wait_timeout is not None else default_wait
+        wait_from_first_hit = (
+            bool(options.get("durationFromFirstHit"))
+            and args.wait_timeout is None)
+        status = _wait_for_plan_trace(
+            client, str(plan["mode"]), wait_timeout,
+            start_timeout_at_first_hit=wait_from_first_hit)
+        output_path = args.output
+        if output_path:
+            if plan["mode"] == "single":
+                event_count, session_id = _export_single_trace(client, output_path)
+            else:
+                event_count, session_id = _export_multitrace(client, output_path)
+            _annotate_trace_with_plan(output_path, plan)
         else:
-            event_count, session_id = _export_multitrace(client, output_path)
-        _annotate_trace_with_plan(output_path, plan)
-    else:
-        event_count = parse_int(status.get("hitCount", "0"))
-        session_id = ""
-    result = {
-        "ok": "OK",
-        "mode": str(plan["mode"]),
-        "started": started.get("state", started.get("active", "started")),
-        "events": str(event_count),
-        "session": session_id,
-        "output": output_path or "",
-        "plan": plan,
-        "status": status,
-    }
-    if args.json or args.out:
-        _emit(result, args)
-    else:
-        print(
-            f"ok=OK mode={result['mode']} started={result['started']} "
-            f"events={result['events']} output={result['output']} "
-            f"stage={status.get('stage', '')} "
-            f"lastError={status.get('lastError', '0x0')}")
+            event_count = parse_int(status.get("hitCount", "0"))
+            session_id = ""
+        result = {
+            "ok": "OK",
+            "mode": str(plan["mode"]),
+            "started": started.get("state", started.get("active", "started")),
+            "processesStarted": str(len(process_start_results)),
+            "events": str(event_count),
+            "session": session_id,
+            "output": output_path or "",
+            "plan": plan,
+            "status": status,
+        }
+        if args.json or args.out:
+            _emit(result, args)
+        else:
+            print(
+                f"ok=OK mode={result['mode']} started={result['started']} "
+                f"processesStarted={result['processesStarted']} "
+                f"events={result['events']} output={result['output']} "
+                f"stage={status.get('stage', '')} "
+                f"lastError={status.get('lastError', '0x0')}")
+    except Exception:
+        if trace_started and plan is not None:
+            _stop_plan_trace(client, str(plan["mode"]))
+        raise
+    finally:
+        if waited:
+            _release_waited_processes_best_effort(client, waited)
 
 
 def _cmd_debug_trace_report(client: SysAgentClient,
@@ -4374,18 +5004,29 @@ def _cmd_debug_ipc_decode(client: SysAgentClient,
     decoded = decode_hipc_cmif(args.data, args.mode)
     cmif = decoded["cmif"]
     assert isinstance(cmif, dict)
-    header = cmif["header"]
-    assert isinstance(header, dict)
     if args.json or args.out:
         _emit(decoded, args)
         return
+    header = cmif.get("header")
+    header = header if isinstance(header, dict) else {}
+    header_detail = (
+        f"magic={header['magic']} token={header['token']}"
+        if "token" in header else
+        f"magic={header['magic']} interfaceId={header['interfaceId']}"
+        if "interfaceId" in header else "header=none")
     print(
         f"mode={cmif['mode']} domain={int(bool(cmif['domain']))} "
-        f"magic={header['magic']} token={header['token']}")
+        f"{header_detail} operation={cmif.get('operation')}")
     if "commandId" in header:
         print(f"command={header['commandId']}")
-    else:
+    elif "result" in header:
         print(f"result={header['result']}")
+    else:
+        domain_header = cmif.get("domainHeader")
+        object_id = (
+            domain_header.get("objectId")
+            if isinstance(domain_header, dict) else None)
+        print(f"object={object_id}")
     print(f"payload={cmif['payloadHex']}")
 
 
@@ -4404,37 +5045,52 @@ def _cmd_debug_trace_ipc(client: SysAgentClient,
     assert isinstance(summary, dict)
     print(
         f"ipc={summary['ipcCount']} transactions={summary['transactionCount']} "
+        f"ambiguous={summary['ambiguousTransactions']} "
+        f"domainEvents={summary['domainEventCount']} "
         f"domainObjects={summary['domainObjectCount']} "
         f"skippedSnapshots={summary['skippedSnapshots']}")
     for record in report["records"]:
         assert isinstance(record, dict)
         cmif = record["cmif"]
         assert isinstance(cmif, dict)
-        header = cmif["header"]
-        assert isinstance(header, dict)
-        detail = (
-            f"command={header['commandId']}"
-            if "commandId" in header else f"result={header['result']}")
+        header = cmif.get("header")
+        header = header if isinstance(header, dict) else {}
+        if "commandId" in header:
+            detail = f"command={header['commandId']}"
+        elif "result" in header:
+            detail = f"result={header['result']}"
+        else:
+            detail = f"operation={cmif.get('operation')}"
+        header_detail = (
+            f"token={header['token']}"
+            if "token" in header else
+            f"interfaceId={header['interfaceId']}"
+            if "interfaceId" in header else "header=none")
         print(
             f"  seq={record['seq']} target={record['target']} "
             f"targetId={record['targetId']} "
             f"thread={record['thread']} snapshot={record['snapshot']} "
             f"mode={cmif['mode']} domain={int(bool(cmif['domain']))} "
-            f"token={header['token']} {detail}")
+            f"{header_detail} operation={cmif.get('operation')} {detail}")
     for transaction in report["transactions"]:
         assert isinstance(transaction, dict)
         print(
             f"  transaction seq={transaction['requestSeq']}->{transaction['returnSeq']} "
-            f"thread={transaction['thread']} "
+            f"thread={transaction['requestThread']}->"
+            f"{transaction['responseThread']} "
             f"target={transaction['entryTarget']}->{transaction['returnTarget']} "
             f"service={transaction['service']} "
             f"interface={transaction['interfaceHash']} "
+            f"interfaceMatch={transaction['interfaceMatchesProfile']} "
             f"command={transaction['commandId']} "
-            f"name={transaction['commandName']} result={transaction['result']}")
+            f"name={transaction['commandName']} result={transaction['result']} "
+            f"correlation={transaction['correlation']}")
     for domain_object in report["domainObjects"]:
         assert isinstance(domain_object, dict)
         print(
             f"  object id={domain_object['objectId']} "
+            f"creates={domain_object['createCount']} "
+            f"closes={domain_object['closeCount']} "
             f"requests={domain_object['requestCount']} "
             f"responses={domain_object['responseCount']} "
             f"commands={domain_object['commands']} "
@@ -4445,7 +5101,8 @@ def _cmd_debug_trace_ipc(client: SysAgentClient,
 def _cmd_debug_trace_timeline(client: SysAgentClient,
                               args: argparse.Namespace) -> None:
     del client
-    report = build_trace_timeline(load_trace_jsonl(args.traces))
+    profile = load_trace_profile(args.profile) if args.profile else None
+    report = build_trace_timeline(load_trace_jsonl(args.traces), profile)
     if args.json or args.out:
         _emit(report, args)
         return
@@ -4454,15 +5111,25 @@ def _cmd_debug_trace_timeline(client: SysAgentClient,
     print(
         f"sessions={summary['sessionCount']} events={summary['eventCount']} "
         f"ipc={summary['ipcCount']} transactions={summary['transactionCount']} "
+        f"ambiguous={summary['ambiguousTransactions']} "
+        f"domainEvents={summary['domainEventCount']} "
         f"bootEpochUnixMs={report['bootEpochUnixMs']}")
     for record in report["timeline"]:
         assert isinstance(record, dict)
         if record["type"] == "transaction":
             print(
                 f"  tick={record['tick']} transaction={record['requestSeq']}->"
-                f"{record['returnSeq']} thread={record['thread']} "
+                f"{record['returnSeq']} thread={record['requestThread']}->"
+                f"{record['responseThread']} "
                 f"service={record.get('service')} command={record.get('commandId')} "
-                f"name={record.get('commandName')} result={record.get('result')}")
+                f"name={record.get('commandName')} result={record.get('result')} "
+                f"interfaceMatch={record.get('interfaceMatchesProfile')} "
+                f"correlation={record.get('correlation')}")
+        elif record["type"] in {"create-domain-object", "close-domain-object"}:
+            print(
+                f"  tick={record['tick']} {record['type']} "
+                f"object={record['objectId']} thread={record.get('thread')} "
+                f"target={record.get('targetId')}")
         else:
             ipc = record.get("ipc")
             ipc_text = ""
@@ -4868,6 +5535,10 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      type=parse_int, default=None, flags=("--ring",)),
                  Arg("duration", "failsafe duration in seconds; 0 means unlimited",
                      type=parse_int, default=None, flags=("--duration",)),
+                 Arg("duration_from",
+                     "start duration when armed or at the first matching hit",
+                     choices=("arm", "first-hit"), default=None,
+                     flags=("--duration-from",)),
                  Arg("args", "capture x0 through x(N-1), N=0..8",
                      type=parse_int, default=None, flags=("--args",)),
                  Arg("snapshots", "capture REG[+/-OFFSET]:SIZE at each hit "
@@ -4884,7 +5555,8 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                     "returns the last hit. With --ring, the session keeps the most recent N",
                     "and also stops at --hits (default 64) to protect a hot instruction;",
                     "--hits 0 removes that cap. --duration (default 60) and `trace stop`",
-                    "remain independent lifetime bounds.",
+                    "remain independent lifetime bounds. --duration-from first-hit starts",
+                    "the duration clock at the first matching hit instead of at arming.",
                     "",
                     "While the trace owns the target debug handle, memory commands are",
                     "rejected. Trace records are opt-in: no unsolicited data is written.",
@@ -4919,6 +5591,10 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      type=parse_int, default=None, flags=("--ring",)),
                  Arg("duration", "failsafe duration in seconds; 0 means unlimited",
                      type=parse_int, default=None, flags=("--duration",)),
+                 Arg("duration_from",
+                     "start duration when armed or at the first matching hit",
+                     choices=("arm", "first-hit"), default=None,
+                     flags=("--duration-from",)),
                  Arg("args", "capture x0 through x(N-1), N=0..8",
                      type=parse_int, default=None, flags=("--args",)),
                  Arg("snapshots", "capture REG[+/-OFFSET]:SIZE at each hit "
@@ -4962,12 +5638,17 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      type=parse_int, default=None, flags=("--ring",)),
                  Arg("duration", "failsafe duration in seconds; 0 means unlimited",
                      type=parse_int, default=None, flags=("--duration",)),
+                 Arg("duration_from",
+                     "override profile duration clock start",
+                     choices=("arm", "first-hit"), default=None,
+                     flags=("--duration-from",)),
                  Arg("args", "capture x0 through x(N-1), N=0..8",
                      type=parse_int, default=None, flags=("--args",)),
                  Arg("snapshots", "capture REG[+/-OFFSET]:SIZE at each hit "
                                   "(for example x1:0x100; max 2)",
                      action="append", default=None, flags=("--snapshot",)),
-                 Arg("wait_process", "wait for profile-selected processes before arming",
+                 Arg("wait_process",
+                     "park missing profile processes, arm, then release them",
                      action="store_true", default=False,
                      flags=("--wait-process",)),
                  Arg("wait_process_timeout",
@@ -5005,7 +5686,8 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                  JSON_ARG, OUT_ARG),
                 "\n".join((
                     "Parses HIPC metadata, descriptors, CMIF SFCI/SFCO headers,",
-                    "domain headers, token, command ID or response Result, and payload.",
+                    "domain headers, request token, response InterfaceId,",
+                    "command ID or response Result, handles, and payload.",
                 ))),
         Command("trace-ipc", "Decode CMIF/HIPC snapshots in trace JSONL",
                 _cmd_debug_trace_ipc,
@@ -5024,6 +5706,8 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 _cmd_debug_trace_timeline,
                 (Arg("traces", "versioned trace JSONL files from one boot",
                      nargs="+", metavar="TRACE"),
+                 Arg("profile", "optional profile for target IDs and IPC pairs",
+                     default=None, flags=("--profile",)),
                  JSON_ARG, OUT_ARG),
                 "\n".join((
                     "Sorts events from multiple sessions by console system tick,",
@@ -5057,16 +5741,24 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 (Arg("pid", "target process ID", type=parse_int),
                  Arg("address", "absolute or main+OFFSET address"),
                  Arg("size", "byte count (1..0x1000)", type=parse_int))),
-        Command("wait-title", "Wait for a title process to be created",
+        Command("wait-title", "Park a title process before its main thread starts",
                 _cmd_debug_wait_title,
                 (Arg("title_id", "title ID", type=parse_int),
                  Arg("timeout_ms", "failure timeout in milliseconds",
                      type=parse_int, nargs="?", default=60000),
                  JSON_ARG, OUT_ARG)),
-        Command("wait-application", "Wait for an application process to be created",
+        Command("wait-application",
+                "Park an application process before its main thread starts",
                 _cmd_debug_wait_application,
                 (Arg("timeout_ms", "failure timeout in milliseconds",
                      type=parse_int, nargs="?", default=60000),
+                 JSON_ARG, OUT_ARG)),
+        Command("wait-status", "Show the asynchronous PM process wait state",
+                _cmd_debug_wait_status, (JSON_ARG, OUT_ARG)),
+        Command("start-process",
+                "Release a process parked by a PM create-process hook",
+                _cmd_debug_start_process,
+                (Arg("pid", "suspended process ID", type=parse_int),
                  JSON_ARG, OUT_ARG)),
     )),
 

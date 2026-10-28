@@ -41,8 +41,8 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.9.0
-sys-agent 2.20.0  (switch:6000)
+client    1.12.0
+sys-agent 2.23.0  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
@@ -128,6 +128,10 @@ the titlekey travels to the console; `prod.keys` never leaves the host. See
 
 ## Debug trace
 
+Start with [`docs/debug-workbench.md`](../docs/debug-workbench.md) for the complete,
+task-oriented workflow. The examples below are the command reference; the workbench guide
+explains which path to choose and how to interpret the exported evidence.
+
 ```bash
 python3 client/sysagent.py --host switch debug trace main+0x123456 --pid 0x71
 python3 client/sysagent.py --host switch debug trace \
@@ -160,6 +164,9 @@ python3 client/sysagent.py debug trace-timeline first.jsonl second.jsonl --json
 records target index/address, thread/core/PC/LR/SP, `x0`–`x7`, and instruction bytes. Use
 `--ring 64 --duration 300` to keep recent hits, or `--hits N` for a one-shot hit limit. Ring
 mode defaults to a 64-hit safety cap; `--hits 0 --ring 64` explicitly removes it. Each
+`--duration-from first-hit` starts the duration clock at the first matching hit, which is useful
+when the trace must stay armed while a person reaches the operation. The default, `arm`, starts
+the clock as soon as the breakpoints are armed. Each
 `--snapshot REG[+/-OFFSET]:SIZE` reads memory through `x0`–`x30`, `sp`, `pc`, or `lr` while the
 target is stopped and records its own Result; two snapshots are supported. On each retained hit
 the tracer clears that execution slot, single-steps the stopped thread once, restores the slot,
@@ -176,7 +183,7 @@ session and thread; the return event's `x0` is reported as the candidate Result.
 are directly comparable when captured in the same boot, because ordering uses the device system
 tick. `trace-diff` compares event, process, thread and target counts between an A/B pair.
 
-`debug multitrace` is the experimental two-process client for sysmodule `2.20.0+`. It assigns
+`debug multitrace` is the experimental two-process client for sysmodule `2.23.0+`. It assigns
 one instruction target to each explicitly supplied PID, using runtime-probed context and
 instruction slots. `--extra-target1` and `--extra-target2` add one more target to each side;
 use them together to observe client/server entry and caller-return sites in one session. The
@@ -193,25 +200,41 @@ hit. A typical HIPC boundary uses `--snapshot x1:0x100`. Profile v2 emits per-ta
 PID, verify title/Build IDs, resolve main-module offsets, and retain stable target IDs for
 entry/return reporting. `trace-run --output FILE` waits for completion and exports JSONL;
 without that option it returns immediately after the breakpoints are armed so the caller can
-trigger the operation.
+trigger the operation. A profile can set `trace.durationFrom` to `first-hit`; the explicit
+`--duration-from arm|first-hit` option overrides it.
 
 Profile v2 adds a consumer-owned symbol-offset table, per-target named/typed snapshots and
 optional `expectBytes` validation through the generic `debug read PID ADDRESS SIZE` command.
-`--wait-process` waits on PM creation hooks before PID/module resolution and arming;
-`debug wait-title` / `debug wait-application` expose the underlying primitives directly.
+Targets default to `base: "main"`; `base: "code"` resolves against the process's lowest
+executable mapping, allowing an instruction-zero target such as `code + 0x0`.
+`--wait-process` uses PM creation hooks to park a title before its main thread starts, attaches
+and arms while it is suspended, then releases it after `armed=1`.
+The client-side `debug wait-title` / `debug wait-application` commands poll the background
+session until it is parked and then print the PID. `debug wait-status` observes that underlying
+session directly; `debug start-process PID` releases it. The sysmodule's raw wait command returns
+immediately with `active=1`.
 
 `trace-ipc` scans trace snapshots for HIPC envelopes containing CMIF `SFCI` or `SFCO`
 headers. It reports the target/thread/sequence, command ID for requests, Result for responses,
-token, domain metadata and payload. When the trace metadata contains profile pairs, matching
-request/response records are also emitted as transactions. `ipc-decode` applies the same parser
-to one raw hex message. `trace-ipc --profile` can supply target IDs and consumer-defined
-service/interface/command labels for manually dumped traces.
-CMIF domain object IDs are summarized with their observed time range, command/result counts,
-and request/response totals.
+request token, response InterfaceId, domain metadata, handle values and payload. When the trace
+metadata contains profile pairs, matching request/response records are also emitted as
+transactions. If several requests are outstanding on the same thread/pair, the current
+thread-FIFO correlation is explicitly marked ambiguous instead of being presented as proof.
+A pair's `ipc.correlation` can instead extract a request/response key from event fields,
+CMIF header/domain fields, IPC payload bytes or captured snapshot bytes; `thread: false` allows
+cross-thread completion and `fallback` controls whether unmatched keys may degrade to thread
+FIFO.
+Client 1.12.0 renames the old response `token`/`responseToken` fields to
+`interfaceId`/`responseInterfaceId`; firmware 14.0.0+ defines that field as an InterfaceId.
+`ipc-decode` applies the same parser to one raw hex message. `trace-ipc --profile` can supply
+target IDs and consumer-defined service/interface/command labels for manually dumped traces.
+CMIF domain object IDs are summarized with their observed time range, request/response totals,
+explicit convert-response `createCount` and domain-close `closeCount`.
 
 `trace-timeline` merges multiple sessions from the same boot into one monotonic timeline,
-including decoded IPC messages and transactions. New exports carry `bootEpochUnixMs`; mixing
-files from different boots is rejected.
+including decoded IPC messages, transactions and domain create/close events. New exports carry
+`bootEpochUnixMs`; mixing files from different boots is rejected. Use
+`--profile FILE` for plain `multitrace-dump` inputs that do not embed target IDs or IPC pairs.
 
 ## Controller
 

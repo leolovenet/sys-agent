@@ -6,6 +6,11 @@ This fork is an independently maintained sys-agent build based on upstream v2.5.
 the original TCP protocol compatible while adding Switch-side memory search and a unified
 process-memory backend that can coexist with Atmosphère cheats.
 
+**New debugging sessions start with
+[docs/debug-workbench.md](docs/debug-workbench.md).** It is the task-oriented entry point for
+process inspection, execution traces, versioned profiles, instruction-zero startup tracing,
+cross-process IPC correlation, and timeline analysis.
+
 > **Custom-build warning:** this is not an official upstream release. It can read and write
 > game-process memory and runs as an Atmosphère sysmodule. Back up the existing
 > `atmosphere/contents/43000000000000A6` directory before installing, and use it only on a
@@ -57,20 +62,28 @@ commands should follow this rule:
   uses a fixed-size ring (up to 64 events) or a one-shot hit limit,
   defaults ring sessions to a 64-hit safety cap so a hot instruction cannot starve the target,
   exposes `trace-status` / `trace-read` / `trace-stop`, and never modifies target instructions.
+  The duration failsafe starts at arming by default; `--duration-from first-hit` waits until
+  the first matching target executes before starting that clock.
   The client `trace-dump` writes versioned JSONL with session metadata; `trace-analyze` and
   `trace-diff` summarize, pair explicit entry/return sites and compare A/B captures.
   Versioned trace profiles resolve foreground/title-ID process selectors, verify Build ID,
   capture optional register-pointer snapshots and emit `trace-plan` / `trace-run` /
   `trace-report` workflows without embedding game offsets in the sysmodule. The client decodes
   captured HIPC envelopes and CMIF request/response headers with `ipc-decode` / `trace-ipc`,
-  pairing profile entry/return targets into transactions; see `docs/trace-profiles.md`.
+  retaining copy/move handle values, pairing profile entry/return targets into transactions,
+  supporting profile-defined correlation keys for concurrent/cross-thread requests, marking
+  unproven matches as ambiguous, and recording observed domain object create/close events; see
+  `docs/trace-profiles.md`.
   `trace-timeline` merges multiple sessions from one boot into a single monotonic event and IPC
-  timeline.
+  timeline, with an optional `--profile` for manually dumped traces.
 - Profile v2 adds per-target named snapshots, consumer-owned symbol offsets and exact
   instruction-byte validation before arming. `debug read PID ADDRESS SIZE` is the generic,
   transactional primitive used for those checks. `trace-run --wait-process` uses PM creation
-  hooks to resolve and arm a profile after the selected title appears; the underlying
-  `debug wait-title` and `debug wait-application` commands are available independently.
+  hooks to park the title before its main thread starts, attach and arm while it is suspended,
+  then release it with `debug start-process` only after every breakpoint is armed. The underlying
+  `debug wait-title` and `debug wait-application` commands run their wait in a worker thread,
+  expose progress through `debug wait-status`, and return the parked PID; callers that use them
+  directly must release it themselves.
 - Experimental `debug multitrace` holds two debug handles simultaneously with independently
   probed context-IDR slots, allowing up to two instruction targets in each of two processes.
   The optional second target on each side can be the corresponding caller return address,

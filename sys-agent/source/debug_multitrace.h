@@ -14,6 +14,7 @@ typedef struct {
     u32 targetCount;
     u32 maxHits;
     u64 durationSeconds;
+    bool durationFromFirstHit;
     u32 ringSize;
     u32 argsCount;
     DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX];
@@ -39,6 +40,8 @@ typedef struct {
     u64 hitCount;
     u64 durationSeconds;
     u64 startedTick;
+    u64 durationStartTick;
+    bool durationFromFirstHit;
     u32 maxHits;
     u32 ringSize;
     u32 ringCount;

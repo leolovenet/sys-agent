@@ -33,6 +33,8 @@ typedef struct {
     u64 hitCount;
     u64 durationSeconds;
     u64 startedTick;
+    u64 durationStartTick;
+    bool durationFromFirstHit;
     u32 ringSize;
     u32 ringCount;
     u32 ringNext;
@@ -78,9 +80,14 @@ static bool durationExpired(void)
 {
     mutexLock(&multiState.mutex);
     const u64 duration = multiState.durationSeconds;
-    const u64 started = multiState.startedTick;
+    const u64 started = multiState.durationFromFirstHit
+        ? multiState.durationStartTick : multiState.startedTick;
+    const bool hasStarted = !multiState.durationFromFirstHit
+        || multiState.durationStartTick != 0;
     mutexUnlock(&multiState.mutex);
     if (duration == 0)
+        return false;
+    if (!hasStarted)
         return false;
     return (armGetSystemTick() - started)
         >= (u64)armGetSystemTickFreq() * duration;
@@ -221,6 +228,9 @@ static void recordEvent(DebugTraceEvent* event)
 {
     mutexLock(&multiState.mutex);
     multiState.hitCount++;
+    if (multiState.durationFromFirstHit
+        && multiState.durationStartTick == 0)
+        multiState.durationStartTick = event->tick;
     event->sequence = multiState.hitCount;
     if (event->targetIndex < multiState.targetCount)
         multiState.targetHits[event->targetIndex]++;
@@ -376,7 +386,15 @@ static void multiTraceThreadMain(void* arg)
     multiState.stage[0] = 0;
     mutexUnlock(&multiState.mutex);
 
-    while (!stopRequested() && !durationExpired()) {
+    while (!stopRequested()) {
+        if (durationExpired()) {
+            mutexLock(&multiState.mutex);
+            strncpy(multiState.stage, "durationReached",
+                sizeof(multiState.stage) - 1);
+            multiState.stage[sizeof(multiState.stage) - 1] = 0;
+            mutexUnlock(&multiState.mutex);
+            break;
+        }
         s32 signaled = -1;
         rc = svcWaitSynchronization(&signaled, handles,
             DEBUG_MULTITRACE_PROCESS_COUNT, DEBUG_MULTITRACE_EVENT_TIMEOUT_NS);
@@ -609,6 +627,8 @@ bool debugMultiTraceStart(const DebugMultiTraceConfig* config)
     multiState.targetCount = config->targetCount;
     multiState.maxHits = config->maxHits;
     multiState.durationSeconds = config->durationSeconds;
+    multiState.durationFromFirstHit = config->durationFromFirstHit;
+    multiState.durationStartTick = 0;
     multiState.hitCount = 0;
     multiState.ringSize = config->ringSize;
     multiState.ringCount = 0;
@@ -705,6 +725,8 @@ bool debugMultiTraceGetStatus(DebugMultiTraceStatus* out)
     out->hitCount = multiState.hitCount;
     out->durationSeconds = multiState.durationSeconds;
     out->startedTick = multiState.startedTick;
+    out->durationStartTick = multiState.durationStartTick;
+    out->durationFromFirstHit = multiState.durationFromFirstHit;
     out->maxHits = multiState.maxHits;
     out->ringSize = multiState.ringSize;
     out->ringCount = multiState.ringCount;

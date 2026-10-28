@@ -19,6 +19,7 @@
 #include "debug_trace.h"
 #include "debug_watch.h"
 #include "debug_process.h"
+#include "debug_wait.h"
 #include "patch_code.h"
 #include "sequence_repeat.h"
 #include "dmnt_client.h"
@@ -31,7 +32,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.20.0"
+#define VERSION_S "2.23.0"
 
 typedef enum {
     Active = 0,
@@ -707,6 +708,7 @@ int argmain(int argc, char** argv)
 
             config.maxHits = 1;
             config.durationSeconds = 60;
+            bool durationFromFirstHit = false;
             config.argsCount = DEBUG_TRACE_ARGS_MAX;
             DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX] = { 0 };
             DebugTraceSnapshotSpec targetSnapshots
@@ -770,6 +772,17 @@ int argmain(int argc, char** argv)
                     }
                     config.durationSeconds = parsed;
                     index += 2;
+                } else if (!strncmp(argv[index], "durationFrom=", 13)) {
+                    const char* value = argv[index] + 13;
+                    if (!strcmp(value, "first-hit"))
+                        durationFromFirstHit = true;
+                    else if (!strcmp(value, "arm"))
+                        durationFromFirstHit = false;
+                    else {
+                        printf("ERR code=INVALID_ARGUMENTS\n");
+                        return 0;
+                    }
+                    index++;
                 } else if (!strcmp(argv[index], "args")
                     && index + 1 < argc) {
                     u64 parsed = 0;
@@ -820,6 +833,7 @@ int argmain(int argc, char** argv)
                     " detail=unlimited_requires_ring\n");
                 return 0;
             }
+            config.durationFromFirstHit = durationFromFirstHit;
             for (u32 target = config.targetCount;
                 target < DEBUG_MULTITRACE_TARGET_MAX; target++) {
                 if (targetSnapshotCounts[target] != 0) {
@@ -860,13 +874,15 @@ int argmain(int argc, char** argv)
                 " targetCount=%u"
                 " target2=%016lX target3=%016lX"
                 " targetProcesses=0,1,0,1"
-                " hits=%u ring=%u duration=%lu args=%u snapshots=%u"
+                " hits=%u ring=%u duration=%lu durationFrom=%s "
+                "args=%u snapshots=%u"
                 " ctx=%u,%u slots=%u,%u,%u,%u\n",
                 status.active, status.processIds[0], status.addresses[0],
                 status.processIds[1], status.addresses[1],
                 status.targetCount, status.addresses[2],
                 status.addresses[3],
                 config.maxHits, config.ringSize, config.durationSeconds,
+                durationFromFirstHit ? "first-hit" : "arm",
                 config.argsCount, status.snapshotCount, status.contextSlots[0],
                 status.contextSlots[1], status.instructionSlots[0],
                 status.instructionSlots[1], status.instructionSlots[2],
@@ -888,7 +904,8 @@ int argmain(int argc, char** argv)
                 " target2=%016lX target3=%016lX"
                 " targetProcesses=0,1,0,1 hits2=%u,%u"
                 " hitCount=%lu maxHits=%u ring=%u ringCount=%u"
-                " duration=%lu startedTick=%lu args=%u snapshots=%u snapSpecs=",
+                " duration=%lu durationFrom=%s startedTick=%lu"
+                " durationStartTick=%lu args=%u snapshots=%u snapSpecs=",
                 status.active, status.armed, status.everArmed,
                 status.stale, status.memoryBlocked,
                 status.processIds[0], status.addresses[0],
@@ -899,7 +916,9 @@ int argmain(int argc, char** argv)
                 status.targetHits[2], status.targetHits[3],
                 status.hitCount, status.maxHits, status.ringSize,
                 status.ringCount, status.durationSeconds,
-                status.startedTick, status.argsCount, status.snapshotCount);
+                status.durationFromFirstHit ? "first-hit" : "arm",
+                status.startedTick, status.durationStartTick,
+                status.argsCount, status.snapshotCount);
             for (u32 i = 0; i < status.snapshotCount
                 && i < DEBUG_TRACE_SNAPSHOT_MAX; i++) {
                 if (i != 0)
@@ -1009,6 +1028,7 @@ int argmain(int argc, char** argv)
             u32 maxHits = 1;
             bool hitsSpecified = false;
             u64 duration = 60;
+            bool durationFromFirstHit = false;
             u32 ringSize = 0;
             u32 argsCount = DEBUG_TRACE_ARGS_MAX;
 
@@ -1052,6 +1072,17 @@ int argmain(int argc, char** argv)
                     }
                     duration = parsed;
                     index += 2;
+                } else if (!strncmp(argv[index], "durationFrom=", 13)) {
+                    const char* value = argv[index] + 13;
+                    if (!strcmp(value, "first-hit"))
+                        durationFromFirstHit = true;
+                    else if (!strcmp(value, "arm"))
+                        durationFromFirstHit = false;
+                    else {
+                        printf("ERR code=INVALID_ARGUMENTS\n");
+                        return 0;
+                    }
+                    index++;
                 } else if (!strcmp(argv[index], "args")
                     && index + 1 < argc) {
                     u64 parsed = 0;
@@ -1181,6 +1212,7 @@ int argmain(int argc, char** argv)
             memcpy(config.addresses, addresses, sizeof(config.addresses));
             config.maxHits = maxHits;
             config.durationSeconds = duration;
+            config.durationFromFirstHit = durationFromFirstHit;
             config.ringSize = ringSize;
             config.argsCount = argsCount;
             config.snapshotCount = snapshotCount;
@@ -1233,9 +1265,10 @@ int argmain(int argc, char** argv)
                     printf(",");
                 printf("%u:0x%lX", i, status.targetAddresses[i]);
             }
-            printf(" args=%u hits=%u ring=%u duration=%lu"
+            printf(" args=%u hits=%u ring=%u duration=%lu durationFrom=%s"
                 " ctxSlot=%u insnSlot=%u slots=",
                 argsCount, maxHits, ringSize, duration,
+                durationFromFirstHit ? "first-hit" : "arm",
                 status.contextSlot, status.instructionSlot);
             for (u32 i = 0; i < status.targetCount; i++) {
                 if (i != 0)
@@ -1273,13 +1306,16 @@ int argmain(int argc, char** argv)
                     printf(",");
                 printf("%u:%u", i, status.targetHits[i]);
             }
-            printf(" maxHits=%u hitCount=%lu duration=%lu startedTick=%lu"
+            printf(" maxHits=%u hitCount=%lu duration=%lu durationFrom=%s"
+                " startedTick=%lu durationStartTick=%lu"
                 " ring=%u ringCount=%u overwritten=%lu args=%u"
                 " ctxSlot=%u insnSlot=%u lastSeq=%lu"
                 " lastPc=%016lX lastLr=%016lX lastSp=%016lX"
                 " lastThread=%016lX lastCore=%u slots=",
                 status.maxHits, status.hitCount,
-                status.durationSeconds, status.startedTick,
+                status.durationSeconds,
+                status.durationFromFirstHit ? "first-hit" : "arm",
+                status.startedTick, status.durationStartTick,
                 status.ringSize, status.ringCount,
                 debugTraceOverwrittenCount(status.hitCount,
                     status.ringCount),
@@ -1683,39 +1719,68 @@ int argmain(int argc, char** argv)
             if (!tryParseStringToInt(
                     argv[application ? firstArg : firstArg + 1],
                     &timeoutMs)
-                || timeoutMs > 0x7FFFFFFFULL) {
+                || timeoutMs == 0 || timeoutMs > 0x7FFFFFFFULL) {
                 printf("ERR code=INVALID_TIMEOUT\n");
                 return 0;
             }
 
-            Event event;
-            memset(&event, 0, sizeof(event));
-            Result rc = application
-                ? pmdmntHookToCreateApplicationProcess(&event)
-                : pmdmntHookToCreateProcess(&event, titleId);
-            if (R_FAILED(rc)) {
-                printf("ERR code=WAIT_HOOK_FAILED result=0x%X\n", rc);
+            const bool started = application
+                ? debugWaitStartApplication(timeoutMs)
+                : debugWaitStartTitle(titleId, timeoutMs);
+            if (!started) {
+                DebugWaitStatus status;
+                debugWaitGetStatus(&status);
+                printf("ERR code=WAIT_HOOK_FAILED result=0x%X stage=%s\n",
+                    status.lastError, status.stage);
                 return 0;
             }
-
+            DebugWaitStatus status;
+            debugWaitGetStatus(&status);
+            const bool suspended = status.waited
+                && status.state == DEBUG_WAIT_STATE_PARKED;
+            printf("OK state=%s active=%d pid=%016lX titleId=%016lX"
+                " waited=%d suspended=%d lastError=0x%X stage=%s\n",
+                debugWaitStateName(status.state), status.active ? 1 : 0,
+                status.processId, status.titleId, status.waited ? 1 : 0,
+                suspended ? 1 : 0, status.lastError, status.stage);
+            return 0;
+        }
+        if (!strcmp(argv[1], "wait-status"))
+        {
+            if (argc != 2) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            DebugWaitStatus status;
+            debugWaitGetStatus(&status);
+            const bool suspended = status.waited
+                && status.state == DEBUG_WAIT_STATE_PARKED;
+            printf("OK state=%s active=%d pid=%016lX titleId=%016lX"
+                " waited=%d suspended=%d lastError=0x%X stage=%s\n",
+                debugWaitStateName(status.state), status.active ? 1 : 0,
+                status.processId, status.titleId, status.waited ? 1 : 0,
+                suspended ? 1 : 0, status.lastError, status.stage);
+            return 0;
+        }
+        if (!strcmp(argv[1], "start-process"))
+        {
+            if (argc != 3) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
             u64 pid = 0;
-            rc = application
-                ? pmdmntGetApplicationProcessId(&pid)
-                : pmdmntGetProcessId(&pid, titleId);
-            if (R_FAILED(rc) || pid == 0)
-                rc = eventWait(&event, timeoutMs * 1000000ULL);
-            if (R_SUCCEEDED(rc)) {
-                rc = application
-                    ? pmdmntGetApplicationProcessId(&pid)
-                    : pmdmntGetProcessId(&pid, titleId);
-            }
-            pmdmntClearHook(application ? 2 : 1);
-            eventClose(&event);
-            if (R_FAILED(rc) || pid == 0) {
-                printf("ERR code=WAIT_TIMEOUT result=0x%X\n", rc);
+            if (!tryParseStringToInt(argv[2], &pid) || pid == 0) {
+                printf("ERR code=INVALID_PID\n");
                 return 0;
             }
-            printf("OK pid=%016lX titleId=%016lX waited=1\n", pid, titleId);
+            Result rc = pmdmntStartProcess(pid);
+            if (R_FAILED(rc)) {
+                printf("ERR code=PROCESS_START_FAILED pid=%016lX"
+                    " result=0x%X\n", pid, rc);
+                return 0;
+            }
+            debugWaitMarkStarted(pid);
+            printf("OK pid=%016lX started=1\n", pid);
             return 0;
         }
         if (!strcmp(argv[1], "watch-last"))
@@ -3346,6 +3411,7 @@ int main()
     debugMultiTraceInitialize();
     debugTraceInitialize();
     debugWatchInitialize();
+    debugWaitInitialize();
     searchInitialize(searchSdMounted);
     ftpServerInitialize(searchSdMounted);
 

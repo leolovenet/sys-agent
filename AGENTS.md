@@ -5,13 +5,14 @@
 ## 范围与哲学
 
 - sys-agent 是**通用 Switch 工具箱**(见 README "Project scope and philosophy")。命令保持进程与游戏无关;游戏专属偏移、hook 布局与签名属于消费方项目。
+- **新会话先读 `docs/debug-workbench.md`**：它给出进程检查、已运行 trace、profile、instruction-zero、双进程 IPC、时间线和结果解读的统一工作流；只有修改 trace profile schema 时才需要继续深入 `docs/trace-profiles.md`。
 - `debug patch-code` 是通用事务性代码补丁原语:任意进程(经 `pid=`),载荷 ≤ 1 KiB,pause/verify/write/readback/resume,保证恢复。普通数据 poke 保持不暂停。
-- `debug maps` / `debug threads` / `debug modules` / `debug read` / `debug wait-title` / `debug wait-application` 是通用的任意进程检查与生命周期原语;保持与游戏/具体系统服务无关,不要为单一调查加特例。
-- `debug trace` 是通用的任意 PID 硬件执行 tracer:不修改目标代码,单会话最多 4 个目标,记录目标/线程/core/PC/LR/SP/参数/指令、命中时最多 2 个寄存器指针内存快照与固定 ring。命中后必须清除当前执行槽、对命中的线程硬件单步一条指令、恢复执行槽,再继续整个进程;省略这一步会让同一断点原地反复触发,永远到不了后续目标。ring 仍受默认 64 次总命中安全上限约束,只有显式 `hits 0` 才解除;实机表明 4096 次快速命中已足以触发 ACNH watchdog。它只记录显式配置的站点;客户端配对 entry/return 仍是离线分析,不是自动调用栈追踪。游戏偏移仍由消费方提供。
-- `trace-dump` 的版本化 JSONL、`trace-analyze`、`trace-diff`、`trace-ipc` 与 `trace-timeline` 属于客户端离线关联层:只能对已显式记录的站点/快照做关联,不代表已实现自动 CMIF 语义发现。`trace-ipc` 汇总可见 domain object 生命周期,`trace-timeline` 仅在同一 boot epoch 内按系统 tick 合并多个会话。
-- `trace-plan` / `trace-run` / `trace-report` 的 profile 层只做通用进程选择、Title/Build ID 校验、消费方符号表/主模块 offset 解析、每 target 可选命中时内存快照、`expectBytes` 校验和稳定 target ID 映射。`ipc-decode` / `trace-ipc` 只解析 HIPC/CMIF 字节，并按 profile pair 把 request/response 配成 transaction，不内置具体 interface 语义。ACNH、Account、SSL 等具体 offset/profile 必须由消费方提供,不得写入 sysmodule;schema 与限制见 `docs/trace-profiles.md`。
+- `debug maps` / `debug threads` / `debug modules` / `debug read` / `debug wait-title` / `debug wait-application` / `debug wait-status` / `debug start-process` 是通用的任意进程检查与生命周期原语;保持与游戏/具体系统服务无关,不要为单一调查加特例。PM 的 create-process hook 命中后会故意不调用 `StartProcess`,因此被等到的进程停在主线程启动前;wait 命令由后台线程等待并立即返回 `active=1`,调用方轮询 `debug wait-status`,避免阻塞 sysmodule 主命令循环。`debug start-process PID` 是唯一明确释放步骤。`trace-run --wait-process` 必须在 trace 报告 `armed=1` 后才自动释放它等到的进程。
+- `debug trace` 是通用的任意 PID 硬件执行 tracer:不修改目标代码,单会话最多 4 个目标,记录目标/线程/core/PC/LR/SP/参数/指令、命中时最多 2 个寄存器指针内存快照与固定 ring。命中后必须清除当前执行槽、对命中的线程硬件单步一条指令、恢复执行槽,再继续整个进程;省略这一步会让同一断点原地反复触发,永远到不了后续目标。`duration` 默认从 arm 完成时开始计时;`durationFrom=first-hit` 改为从首个匹配目标命中开始,用于长时间等待用户触发。ring 仍受默认 64 次总命中安全上限约束,只有显式 `hits 0` 才解除;实机表明 4096 次快速命中已足以触发 ACNH watchdog。它只记录显式配置的站点;客户端配对 entry/return 仍是离线分析,不是自动调用栈追踪。游戏偏移仍由消费方提供。
+- `trace-dump` 的版本化 JSONL、`trace-analyze`、`trace-diff`、`trace-ipc` 与 `trace-timeline` 属于客户端离线关联层:只能对已显式记录的站点/快照做关联,不代表已实现自动 CMIF 语义发现。`trace-ipc` 保留 HIPC copy/move handle 值;默认按线程+entry/return 配对同步 transaction,同时有多个 outstanding request 时标记 `correlationAmbiguous`。消费方 profile 可为 pair 配置通用 correlation 表达式(事件寄存器、CMIF header/domain、IPC payload 或原始 snapshot 字节),显式支持跨线程键匹配及可选的 thread-FIFO fallback;键冲突仍会标歧义,不会冒充确定关联。它识别通用 CMIF control/domain request 类型,从 convert 响应证明 domain object 创建、从 domain close 记录销毁,但对象“未再出现”不等于已销毁。`trace-timeline` 仅在同一 boot epoch 内按系统 tick 合并多个会话,并可对未内嵌 profile 的手工 dump 通过 `--profile` 提供 target/pair 元数据。
+- `trace-plan` / `trace-run` / `trace-report` 的 profile 层只做通用进程选择、Title/Build ID 校验、消费方符号表/模块 offset 解析、每 target 可选命中时内存快照、`expectBytes` 校验和稳定 target ID 映射。target 的 `base` 默认 `main`;`base=code` 使用该 PID 最低可执行映射作为进程 code-region 基址,用于表达 kernel `StartProcess` 的 instruction-zero 入口。`ipc-decode` / `trace-ipc` 只解析 HIPC/CMIF 字节，并按 profile pair 把 request/response 配成 transaction，不内置具体 interface 语义。ACNH、Account、SSL 等具体 offset/profile 必须由消费方提供,不得写入 sysmodule;schema 与限制见 `docs/trace-profiles.md`。
 - `debug hwbp-layout <pid1> <pid2>` 是实验性硬件容量探针:短生命周期间时 attach 两个进程,只验证两个 context-IDR 句柄和可用执行槽是否可共存,不安装实际执行地址。结果用于决定同步多进程 trace 的架构,不要把它描述成已经支持 IPC trace。
-- `debug multitrace` 是实验性同步双进程 trace:固定两个独立 PID、每进程最多两个目标地址,共享 ring 和总命中上限,事件用 target index 区分目标。两个执行站点可分别传函数入口与调用者返回地址,用于捕获真实返回 `x0`;命中时可读取最多 2 个寄存器指针快照。它本身不理解 CMIF/HIPC,消息解析位于客户端 profile/decode 层;一个目标退出时整个会话停止。
+- `debug multitrace` 是实验性同步双进程 trace:固定两个独立 PID、每进程最多两个目标地址,共享 ring、总命中上限和 duration 时钟,事件用 target index 区分目标。两个执行站点可分别传函数入口与调用者返回地址,用于捕获真实返回 `x0`;命中时可读取最多 2 个寄存器指针快照。它本身不理解 CMIF/HIPC,消息解析位于客户端 profile/decode 层;一个目标退出时整个会话停止。
 
 ## 仓库边界
 
@@ -101,6 +102,7 @@ docker run --rm \
 | `README.md` | 项目范围、哲学与命令概览 |
 | `commands.md` | 全部可用命令参考 |
 | `client/README.md` | sys-agent client 说明 |
+| `docs/debug-workbench.md` | **通用调试工作台总入口**：何时用哪条命令、最短 trace/profile/instruction-zero/IPC 流程、安全边界与结果解读(新会话先读) |
 | `third_party/README.md` | 第三方源码清单 |
 | `docs/ftp-server.md` | FTP 服务与验证矩阵(改 FTP 前) |
 | `docs/hdls-virtual-controller-notes.md` | HDLS 虚拟手柄失效机制、自动重建/自愈、诊断命令与系统限制(改输入或手柄代码前必读) |

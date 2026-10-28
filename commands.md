@@ -317,6 +317,13 @@ is the foreground application; `pid=` selects any process the kernel lets sys-ag
 `main+offset` resolves against that selected process through `ldr:dmnt`, and all addresses are
 validated to be distinct, instruction-aligned absolute addresses before arming.
 
+The duration failsafe starts when the trace is armed. Add `durationFrom=first-hit` to leave the
+trace armed for an arbitrary setup or user-interaction period and start the clock only when a
+configured target first executes. Before that hit, `trace-status` reports the requested mode and
+`durationStartTick=0`; `trace-stop`, a hit limit, or target exit can still end the session.
+When the clock expires, the final status keeps `durationStartTick` and reports
+`stage=durationReached`.
+
 The command returns after the breakpoint has been armed. In one-shot mode (no `ring`), the
 session detaches at `hits` (default 1), and `debug trace-read 0` returns the most recent event.
 In ring mode, it keeps the most recent N events, overwrites the oldest, and stops at `hits`,
@@ -341,7 +348,7 @@ observation points.
 
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
-|debug trace|Arms one to four hardware execution breakpoints and returns after every configured target is armed. `ring` controls retention; `hits` is always a total-hit safety limit. Without `ring`, `hits` defaults to 1; with `ring`, it defaults to 64. `hits 0` means unlimited and requires `ring`|1-4 absolute instruction addresses or `main+offset` values<br>optional: `pid=PID`, `hits N` (default 1, or 64 with ring; 0 = unlimited with ring), `ring N` (1-64), `duration N` seconds (default 60, 0 = unlimited), `args N` (0-8, default 8), repeated `snap=xN+OFFSET:SIZE` (max 2)|`debug trace main+0x123456 main+0x123460 pid=0x71 ring 64 snap=x0:0x40`<br>`debug trace 0x2B5D9CF4C8 ring 64 duration 300 args 8`|
+|debug trace|Arms one to four hardware execution breakpoints and returns after every configured target is armed. `ring` controls retention; `hits` is always a total-hit safety limit. Without `ring`, `hits` defaults to 1; with `ring`, it defaults to 64. `hits 0` means unlimited and requires `ring`|1-4 absolute instruction addresses or `main+offset` values<br>optional: `pid=PID`, `hits N` (default 1, or 64 with ring; 0 = unlimited with ring), `ring N` (1-64), `duration N` seconds (default 60, 0 = unlimited), `durationFrom=arm\|first-hit` (default arm), `args N` (0-8, default 8), repeated `snap=xN+OFFSET:SIZE` (max 2)|`debug trace main+0x123456 main+0x123460 pid=0x71 ring 64 snap=x0:0x40`<br>`debug trace 0x2B5D9CF4C8 ring 64 duration 300 durationFrom=first-hit`|
 |debug trace-status|Reports active/armed state (`everArmed` distinguishes a completed session from one that never armed), all target addresses and per-target hit counts, ring counts, ignored unexpected hits, breakpoint slots, snapshot specs, last event summary, and attach errors|none|`debug trace-status`|
 |debug trace-read|Reads one retained event, oldest first in ring mode; index defaults to 0|optional ring entry index|`debug trace-read 0`|
 |debug trace-stop|Requests detach, waits for the trace thread, clears every configured breakpoint on every core, and releases the debug handle|none|`debug trace-stop`|
@@ -382,7 +389,8 @@ instructions in each of two processes at the same time:
 
 ```text
 debug multitrace PID1 TARGET1 PID2 TARGET2 \
-    [also TARGET1B TARGET2B] [hits N] [ring N] [duration N] [args N] \
+    [also TARGET1B TARGET2B] [hits N] [ring N] [duration N] \
+    [durationFrom=arm|first-hit] [args N] \
     [snap=SPEC] [snap=SPEC] \
     [tsnap=TARGET_INDEX:SPEC] [tsnap=TARGET_INDEX:SPEC]
 debug multitrace-status
@@ -409,7 +417,8 @@ The ring and hit limit are shared across both processes. Each target hit can cap
 register-pointer memory snapshots; use `snap=...` in the wire protocol or `--snapshot` in the
 Python client for a global rule. `tsnap=TARGET_INDEX:SPEC` applies a rule to one target and
 overrides the global rule there. Frame counters and descriptor contents are not interpreted by
-the sysmodule.
+the sysmodule. The duration clock is also shared: it starts at arming by default or at the first
+matching hit in either process with `durationFrom=first-hit`.
 A capture of the HIPC message buffer can be decoded offline with `debug ipc-decode` or
 `debug trace-ipc`; this provides generic synchronous observation, not kernel-side CMIF
 semantics. Memory commands remain blocked
@@ -439,11 +448,26 @@ offsets against the selected main module, and preserve stable target IDs for ent
 correlation. `trace-run` returns immediately after arming unless `--wait` or `--output` is used;
 consumers therefore remain responsible for triggering the game or service operation.
 
+Targets may set `"base": "main"` (default) or `"base": "code"`. The code base is the lowest
+executable mapping in the selected PID; `base=code, offset=0x0` therefore identifies the
+kernel's process entrypoint without hardcoding an ASLR address.
+
 `--wait-process` uses the PM process-creation hook before resolving PIDs, so the profile may
 refer to a title that is not running yet. `--wait-process-timeout` is per process. The same
 primitive is available as `debug wait-title TITLE_ID [TIMEOUT_MS]` and
-`debug wait-application [TIMEOUT_MS]`. This is attach-as-soon-as-created, not an
-instruction-zero loader hook.
+`debug wait-application [TIMEOUT_MS]`. A matched hook leaves the process created but not
+started, before its main thread executes. `trace-run --wait-process` then resolves modules,
+arms the trace, waits for `armed=1`, and releases the parked process with
+`debug start-process PID`. The raw wait commands start a background waiter and return
+immediately; poll `debug wait-status` until it reports `state=parked` or `state=exists`.
+Direct users must then call `debug start-process` themselves, otherwise the process remains
+suspended.
+
+Profile `trace.durationFrom` accepts `arm` or `first-hit`. The `trace-run` option
+`--duration-from arm|first-hit` overrides the profile; direct `debug trace` and
+`debug multitrace` expose the equivalent wire option. With `--wait` or `--output`, an implicit
+timeout starts at the first hit in `first-hit` mode, so a long manual setup does not cancel the
+trace. An explicit `--wait-timeout` remains a hard limit from trace start.
 
 The schema, selector rules, target ordering and current limitations are documented in
 `docs/trace-profiles.md`. Profile files belong to the consumer project; sys-agent does not ship
@@ -456,22 +480,45 @@ python3 client/sysagent.py debug ipc-decode HEX_BYTES --mode request
 python3 client/sysagent.py debug trace-ipc trace.jsonl --snapshot 0 \
   --profile profile.json --json
 python3 client/sysagent.py debug trace-timeline first.jsonl second.jsonl --json
+python3 client/sysagent.py debug trace-timeline trace.jsonl \
+  --profile profile.json --json
 ```
 
 `ipc-decode` parses the HIPC header, special header, handles, static/buffer descriptors,
 CMIF domain header and the `SFCI`/`SFCO` four-word header. Requests expose `commandId` and
-`token`; responses expose `result` and `token`. `trace-ipc` scans trace snapshots and emits the
-same decoded structure plus event seq/target/thread. If the trace has profile pair metadata,
-it also correlates request and response records into transactions. These commands interpret
-raw protocol bytes only and do not assign service-specific meanings to Command IDs.
+`token`; responses expose `result` and `interfaceId` (the `+0xC` field became InterfaceId in
+firmware 14.0.0 and was reserved earlier). `trace-ipc` scans trace snapshots and emits the same
+decoded structure plus event seq/target/thread. If the trace has profile pair metadata, it also
+correlates request and response records into transactions. These commands interpret raw
+protocol bytes only and do not assign service-specific meanings to Command IDs.
 Optional profile `ipc` metadata can attach consumer-supplied service, interface-hash and
-Command-ID names to those transactions.
-Domain object IDs are summarized separately with first/last tick, request/response counts,
-observed commands and Result frequencies.
+Command-ID names to those transactions. When both a profile `interfaceHash` and a non-zero
+response InterfaceId exist, `interfaceMatchesProfile` reports whether the protocol bytes agree.
+HIPC copy/move handles are retained as an ordered `handles[]` list with `kind`, per-kind
+`index`, numeric `value` and `valueHex`; `trace-timeline` carries that list on each event's IPC
+entries.
+Transactions record `outstandingAtResponse` and `correlation`. A single outstanding request is
+reported as `thread-fifo`; multiple outstanding requests are reported as
+`ambiguous-thread-fifo` and counted in `summary.ambiguousTransactions`. The decoder cannot
+prove response order merely from request/response tokens because the modern response field is
+an InterfaceId.
+Profiles may instead set `pairs[].ipc.correlation` with `request` and optional `response`
+expressions. Supported expressions are `event:FIELD` (thread, pc/lr/sp, target/address or
+x0-x7), `ipc:header:FIELD`, `ipc:domain:FIELD`, `ipc:payload:OFFSET:SIZE` and
+`snapshot:INDEX:OFFSET:SIZE`. `thread` defaults to true; set it false for asynchronous
+completion on another thread. `fallback` is `none` by default and may be `thread-fifo`.
+Exact-key matches report `profile-key`, key collisions report `ambiguous-profile-key`, and
+fallback matches say so explicitly. `summary.correlationMethods` counts each method used.
+Generic CMIF control requests are classified as convert/copy/clone/query operations. A
+convert-response object ID produces an explicit `create-domain-object` event, while
+`CmifDomainRequestType=2` produces `close-domain-object`. Domain object summaries retain
+request/response counts, observed commands, Result frequencies, `createCount`, `closeCount` and
+the corresponding ticks. `trace-timeline` includes these domain events.
 
 `trace-timeline` normalizes one or more trace files into a single system-tick timeline,
-including raw events, IPC records and transactions. It rejects files whose recorded boot epochs
-differ.
+including raw events, IPC records, transactions and domain create/close events. It rejects files
+whose recorded boot epochs differ. Pass `--profile` when the files came from plain
+`multitrace-dump` and therefore do not embed profile target IDs or request/response pairs.
 
 The same ownership rules as `debug watch` apply. For the foreground application, an existing
 `dmnt:cht` handle is closed when necessary and later memory commands reattach it. A trace of a
@@ -541,6 +588,10 @@ Requirements and conflict rules:
 |debug maps|Lists mapped memory regions of any process as `index=0xADDR+0xSIZE:tTYPE/pPERM` (libnx `MemoryType`/`MemoryPerm` values); unmapped regions are skipped and the reply is capped by `limit`|optional: `[pid] [limit]`; pid is `0x`-hex or decimal, limit 1..256 (default 64)|`debug maps 0x71 64`|
 |debug threads|Pauses any process, dumps up to 256 threads with PC/LR/SP, raw kernel thread `state`, current core and core mask, then resumes; `reported` is the actual count and `truncated=1` means the reply omitted IDs above the output cap. The target is stopped only for the duration of the command|optional: `[pid]`; pid is `0x`-hex or decimal|`debug threads 0x71`|
 |debug read|Transactionally attaches to any PID, drains the initial debug events, reads 1..0x1000 bytes at an absolute or `main+offset` address, then releases the handle|1. pid 2. address 3. byte count|`debug read 0x71 main+0x1000 4`|
+|debug wait-title|Starts a background waiter for a matching Title ID at PM's create-process hook. Returns immediately with `active=1`; poll `wait-status` for `state=parked`|1. title ID<br>optional: timeout in milliseconds (default 60000)|`debug wait-title 0x100000000000001E 60000`|
+|debug wait-application|Starts a background waiter at PM's create-application hook and returns immediately|optional: timeout in milliseconds (default 60000)|`debug wait-application 60000`|
+|debug wait-status|Shows `idle/waiting/parked/exists/started/timeout/error`, PID/title, and whether the hook-held process is still suspended|none|`debug wait-status`|
+|debug start-process|Releases a process held by a PM create-process hook (`pm:dmnt StartProcess`) and changes its wait state to `started`. Trace-run uses this automatically after arming|1. parked PID|`debug start-process 0x6C`|
 |debug patch-code|Generic transactional code patch (any process, any size up to 1 KiB): pause, optionally verify no thread PC is inside the patched range, optionally verify the original bytes, write, read back, resume; resume is guaranteed on every error path. Target cache maintenance is handled by the kernel debug-write path — never add explicit cache ops on a target address from this sysmodule|1. absolute address (0x-hex or decimal)<br>2. expected bytes as hex pairs of the same length as the patch, or `-` to skip verification<br>3. new bytes as hex pairs (0x optional; length 1..1024 bytes)<br>optional: `pid=<hex>` target process (default: foreground application), `no-pc-check` (only for provably cold code)|`debug patch-code 0x2B5D9CF4C8 FD7BBAA9FC6F01A9FD030091FA6702A9 5000005800021FD6...`<br>`debug patch-code 0x2B5D9CF4C8 - 5000005800021FD6...`<br>`debug patch-code 0x2B5D9CF4C8 FD7B... 5000... pid=0x2B5D900000`|
 |debug watch-stop|Requests the watch thread to detach and waits for it|none|`debug watch-stop`|
 |debug force-close|Closes gen1's (`dmnt:cht`) debug handle to the game if it is attached; the next memory command re-attaches it automatically|none|`debug force-close`|

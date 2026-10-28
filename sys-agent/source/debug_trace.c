@@ -31,6 +31,8 @@ typedef struct {
     u64 hitCount;
     u64 durationSeconds;
     u64 startedTick;
+    u64 durationStartTick;
+    bool durationFromFirstHit;
     u32 ringSize;
     u32 ringCount;
     u32 ringNext;
@@ -99,9 +101,14 @@ static bool durationExpired(void)
 {
     mutexLock(&traceState.mutex);
     const u64 duration = traceState.durationSeconds;
-    const u64 started = traceState.startedTick;
+    const u64 started = traceState.durationFromFirstHit
+        ? traceState.durationStartTick : traceState.startedTick;
+    const bool hasStarted = !traceState.durationFromFirstHit
+        || traceState.durationStartTick != 0;
     mutexUnlock(&traceState.mutex);
     if (duration == 0)
+        return false;
+    if (!hasStarted)
         return false;
     return (armGetSystemTick() - started)
         >= (u64)armGetSystemTickFreq() * duration;
@@ -259,6 +266,9 @@ static void recordEvent(DebugTraceEvent* event)
 {
     mutexLock(&traceState.mutex);
     traceState.hitCount++;
+    if (traceState.durationFromFirstHit
+        && traceState.durationStartTick == 0)
+        traceState.durationStartTick = event->tick;
     event->sequence = traceState.hitCount;
     if (event->targetIndex < traceState.targetCount)
         traceState.targetHits[event->targetIndex]++;
@@ -402,7 +412,11 @@ static void traceThreadMain(void* arg)
     traceState.hint[0] = 0;
     mutexUnlock(&traceState.mutex);
 
-    while (!stopRequested() && !durationExpired()) {
+    while (!stopRequested()) {
+        if (durationExpired()) {
+            setStage("durationReached");
+            break;
+        }
         s32 index = -1;
         rc = svcWaitSynchronization(&index, &debugHandle, 1,
             DEBUG_TRACE_EVENT_TIMEOUT_NS);
@@ -607,6 +621,8 @@ bool debugTraceStart(const DebugTraceConfig* config)
     traceState.maxHits = config->maxHits;
     traceState.durationSeconds = config->durationSeconds;
     traceState.startedTick = 0;
+    traceState.durationStartTick = 0;
+    traceState.durationFromFirstHit = config->durationFromFirstHit;
     traceState.hitCount = 0;
     traceState.ringSize = config->ringSize;
     traceState.ringCount = 0;
@@ -706,6 +722,8 @@ bool debugTraceGetStatus(DebugTraceStatus* out)
     out->hitCount = traceState.hitCount;
     out->durationSeconds = traceState.durationSeconds;
     out->startedTick = traceState.startedTick;
+    out->durationStartTick = traceState.durationStartTick;
+    out->durationFromFirstHit = traceState.durationFromFirstHit;
     out->ringSize = traceState.ringSize;
     out->ringCount = traceState.ringCount;
     out->argsCount = traceState.argsCount;

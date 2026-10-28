@@ -33,6 +33,9 @@ class FakeState:
         self.commands: list[list[str]] = []
         self.addresses = [0x80000010, 0x80000120, 0x80000230]
         self.application_running = True
+        self.application_hook_busy = False
+        self.wait_start_active = False
+        self.wait_status_responses: list[str] = []
         self.processes = {
             0x1234: "01006F8002326000",
             0x6C: "010000000000001E",
@@ -48,6 +51,8 @@ class FakeState:
         self.repeat_support = True
         self.sequence_error = False
         self.trace_busy = False
+        self.multi_trace_active = False
+        self.parked_process_count = 0
         self.trace_target_addresses = [0x2B00001000]
         # An older sysmodule has only `configure <name> <value>` and stays silent for a
         # read (`configure <name>`), which is what makes the client hit its socket timeout.
@@ -90,25 +95,64 @@ class FakeHandler(socketserver.StreamRequestHandler):
                     pid = int(command[2], 16)
                     if pid == 0x1234:
                         base, size = 0x2908406000, 0x5A06000
+                        code_base = 0x29083FE000
                     else:
                         base, size = 0x30000000, 0x4F8000
+                        code_base = base - 0x7000
                     response = (
-                        f"OK pid=0x{pid:X} count=1 limit={command[3]} "
+                        f"OK pid=0x{pid:X} count=2 limit={command[3]} "
                         f"truncated=0 dmntClosed=0 "
-                        f"maps=0=0x{base:X}+0x{size:X}:t3/p5")
+                        f"maps=0=0x{code_base:X}+0x6000:t3/p5,"
+                        f"1=0x{base:X}+0x{size:X}:t3/p5")
                 elif command[1] == "read":
                     response = (
                         f"OK pid={command[2]} address={command[3]} "
                         f"size={command[4]} data=FD7BBFA9")
                 elif command[1] == "wait-title":
-                    state.processes[0x6C] = "010000000000001E"
-                    response = (
-                        f"OK pid=000000000000006C titleId={command[2]} waited=1")
+                    state.parked_process_count += 1
+                    if int(command[2], 16) == 0x01006F8002326000:
+                        pid = 0x1234
+                        title_id = "01006F8002326000"
+                        state.application_running = True
+                    else:
+                        pid = 0x6C
+                        title_id = "010000000000001E"
+                    state.processes[pid] = title_id
+                    if state.wait_start_active:
+                        response = (
+                            "OK state=waiting active=1 pid=0000000000000000 "
+                            f"titleId={command[2]} waited=0 suspended=0 "
+                            "lastError=0x0 stage=waitEvent")
+                    else:
+                        response = (
+                            f"OK state=parked active=0 pid={pid:016X} "
+                            f"titleId={command[2]} waited=1 suspended=1 "
+                            "lastError=0x0 stage=parked")
                 elif command[1] == "wait-application":
-                    state.application_running = True
-                    state.processes[0x1234] = "01006F8002326000"
-                    response = (f"OK pid=0000000000001234 "
-                                f"titleId=01006F8002326000 waited=1")
+                    if state.application_hook_busy:
+                        response = "ERR code=WAIT_HOOK_FAILED result=0x80F"
+                    else:
+                        state.parked_process_count += 1
+                        state.application_running = True
+                        state.processes[0x1234] = "01006F8002326000"
+                        response = (f"OK pid=0000000000001234 "
+                                    "state=parked active=0 "
+                                    f"titleId=01006F8002326000 waited=1 "
+                                    "suspended=1 lastError=0x0 stage=parked")
+                elif command[1] == "start-process":
+                    if state.parked_process_count > 0:
+                        state.parked_process_count -= 1
+                    if state.parked_process_count == 0:
+                        state.multi_trace_active = False
+                    response = f"OK pid={command[2]} started=1"
+                elif command[1] == "wait-status":
+                    if state.wait_status_responses:
+                        response = state.wait_status_responses.pop(0)
+                    else:
+                        response = (
+                            "OK state=idle active=0 pid=0000000000000000 "
+                            "titleId=0000000000000000 waited=0 suspended=0 "
+                            "lastError=0x0 stage=")
                 elif command[1] == "trace":
                     if state.trace_busy:
                         response = "ERR code=TRACE_BUSY result=0x0 stage="
@@ -145,6 +189,7 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 elif command[1] == "trace-stop":
                     response = "OK state=stopped hitCount=1 ringCount=0 lastError=0x0 stage=hitsReached"
                 elif command[1] == "multitrace":
+                    state.multi_trace_active = state.parked_process_count > 0
                     response = (
                         "OK state=started active=1 pid0=0000000000000071 "
                         "target0=0000000000001000 pid1=0000000000000085 "
@@ -154,19 +199,31 @@ class FakeHandler(socketserver.StreamRequestHandler):
                         "args=4 ctx=4,5 slots=0,1,2,3"
                     )
                 elif command[1] == "multitrace-status":
-                    response = (
-                        "OK active=0 armed=0 everArmed=1 stale=1 memoryBlocked=0 "
-                        "pid0=0000000000000071 target0=0000000000001000 "
-                        "pid1=0000000000000085 target1=0000000000002000 hits=2,1 "
-                        "targetCount=4 target2=0000000000003000 "
-                        "target3=0000000000004000 targetProcesses=0,1,0,1 "
-                        "hits2=1,1 "
-                        "hitCount=3 maxHits=64 ring=8 ringCount=1 duration=30 "
-                        "startedTick=100 args=4 ctx=4,5 slots=0,1,2,3 lastSeq=3 "
-                        "lastPc=0000000000002000 lastLr=0000000000002004 "
-                        "lastSp=0000000000003000 lastThread=0000000000000088 "
-                        "lastCore=2 stage=hitsReached lastError=0x0"
-                    )
+                    if state.multi_trace_active:
+                        response = (
+                            "OK active=1 armed=1 everArmed=1 stale=0 memoryBlocked=1 "
+                            "pid0=0000000000000071 target0=0000000000001000 "
+                            "pid1=0000000000000085 target1=0000000000002000 hits=0,0 "
+                            "targetCount=4 target2=0000000000003000 "
+                            "target3=0000000000004000 targetProcesses=0,1,0,1 "
+                            "hits2=0,0 hitCount=0 maxHits=64 ring=8 ringCount=0 "
+                            "duration=30 startedTick=100 args=4 ctx=4,5 "
+                            "slots=0,1,2,3 lastSeq=0 stage= lastError=0x0"
+                        )
+                    else:
+                        response = (
+                            "OK active=0 armed=0 everArmed=1 stale=1 memoryBlocked=0 "
+                            "pid0=0000000000000071 target0=0000000000001000 "
+                            "pid1=0000000000000085 target1=0000000000002000 hits=2,1 "
+                            "targetCount=4 target2=0000000000003000 "
+                            "target3=0000000000004000 targetProcesses=0,1,0,1 "
+                            "hits2=1,1 "
+                            "hitCount=3 maxHits=64 ring=8 ringCount=1 duration=30 "
+                            "startedTick=100 args=4 ctx=4,5 slots=0,1,2,3 lastSeq=3 "
+                            "lastPc=0000000000002000 lastLr=0000000000002004 "
+                            "lastSp=0000000000003000 lastThread=0000000000000088 "
+                            "lastCore=2 stage=hitsReached lastError=0x0"
+                        )
                 elif command[1] == "multitrace-read":
                     response = (
                         "OK seq=3 target=3 targetAddress=0000000000004000 "
@@ -177,6 +234,7 @@ class FakeHandler(socketserver.StreamRequestHandler):
                         "x0=0000000000000000 x1=0000000000000001"
                     )
                 elif command[1] == "multitrace-stop":
+                    state.multi_trace_active = False
                     response = "OK state=stopped hitCount=3 ringCount=1"
                 else:
                     response = "ERR code=UNKNOWN_COMMAND"
@@ -607,10 +665,17 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(main(base + [
             "trace", "main+0x1000", "--pid", "0x71", "--hits", "2",
-            "--ring", "16", "--duration", "30", "--args", "4"]), 0)
+            "--ring", "16", "--duration", "30", "--duration-from",
+            "first-hit", "--args", "4"]), 0)
         self.assertEqual(self.server.state.last_command, [
             "debug", "trace", "main+0x1000", "pid=0x71", "hits", "2",
-            "ring", "16", "duration", "30", "args", "4"])
+            "ring", "16", "duration", "30", "durationFrom=first-hit",
+            "args", "4"])
+
+        self.assertEqual(main(base + [
+            "trace", "main+0x1000", "--duration-from", "arm"]), 0)
+        self.assertNotIn("durationFrom=first-hit",
+                         self.server.state.last_command)
 
         self.assertEqual(main(base + [
             "trace", "main+0x1000", "0x2000", "--snapshot",
@@ -628,6 +693,9 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(main(base + ["trace-stop"]), 0)
         self.assertEqual(self.server.state.last_command,
                          ["debug", "trace-stop"])
+        self.assertEqual(main(base + ["start-process", "0x88"]), 0)
+        self.assertEqual(self.server.state.last_command,
+                         ["debug", "start-process", "0x88"])
 
         self.assertEqual(main(base + ["trace", "0x1000", "--ring", "65"]), 2)
         self.assertEqual(main(base + ["trace", "0x1000", "--hits", "0"]), 2)
@@ -686,6 +754,62 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(
                 metadata["targets"][2]["address"], "0x2B00003000")
 
+    def test_debug_wait_polls_nonblocking_status(self) -> None:
+        from client.sysagent import main
+
+        self.server.state.wait_start_active = True
+        self.server.state.wait_status_responses = [
+            "OK state=waiting active=1 pid=0000000000000000 "
+            "titleId=010000000000001E waited=0 suspended=0 "
+            "lastError=0x0 stage=waitEvent",
+            "OK state=parked active=0 pid=000000000000006C "
+            "titleId=010000000000001E waited=1 suspended=1 "
+            "lastError=0x0 stage=parked",
+        ]
+        self.assertEqual(main([
+            "--host", "127.0.0.1", "--port",
+            str(self.server.server_address[1]), "--timeout", "1",
+            "debug", "wait-title", "0x010000000000001E", "1000"]), 0)
+        self.assertEqual(self.server.state.commands[-3:], [
+            ["debug", "wait-title", "0x10000000000001E", "1000"],
+            ["debug", "wait-status"],
+            ["debug", "wait-status"],
+        ])
+
+    def test_trace_wait_timeout_can_start_at_first_hit(self) -> None:
+        from client.sysagent import _wait_for_plan_trace
+
+        class TraceClient:
+            timeout = 1.0
+
+            def __init__(self) -> None:
+                self.statuses = iter([
+                    {"ok": "OK", "active": "1", "hitCount": "0"},
+                    {"ok": "OK", "active": "1", "hitCount": "0"},
+                    {"ok": "OK", "active": "1", "hitCount": "0"},
+                    {"ok": "OK", "active": "1", "hitCount": "1"},
+                    {"ok": "OK", "active": "1", "hitCount": "1"},
+                    {"ok": "OK", "active": "0", "hitCount": "1"},
+                ])
+
+            def command(self, command: str, retry: bool = False
+                        ) -> dict[str, str]:
+                self.assert_command = command
+                self.assert_retry = retry
+                return next(self.statuses)
+
+        trace_client = TraceClient()
+        with patch("client.sysagent.time.monotonic",
+                   side_effect=[1.0, 2.0, 3.0]), \
+                patch("client.sysagent.time.sleep") as sleep:
+            status = _wait_for_plan_trace(
+                trace_client, "single", 5.0,
+                start_timeout_at_first_hit=True)
+        self.assertEqual(status["active"], "0")
+        self.assertEqual(trace_client.assert_command, "debug trace-status")
+        self.assertTrue(trace_client.assert_retry)
+        self.assertEqual(sleep.call_count, 5)
+
     def test_debug_multitrace_cli_and_dump(self) -> None:
         import json
         import tempfile
@@ -697,12 +821,14 @@ class ClientTests(unittest.TestCase):
             "multitrace", "0x71", "main+0x10", "0x85", "0x2000",
             "--extra-target1", "main+0x20",
             "--extra-target2", "main+0x30",
-            "--ring", "8", "--duration", "30", "--args", "4",
+            "--ring", "8", "--duration", "30", "--duration-from",
+            "first-hit", "--args", "4",
             "--snapshot", "x1:0x100"]), 0)
         self.assertEqual(self.server.state.last_command, [
             "debug", "multitrace", "0x71", "main+0x10", "0x85", "0x2000",
             "also", "main+0x20", "main+0x30",
-            "ring", "8", "duration", "30", "args", "4", "snap=x1:0x100"])
+            "ring", "8", "duration", "30", "durationFrom=first-hit",
+            "args", "4", "snap=x1:0x100"])
         self.assertEqual(main(base + [
             "multitrace", "0x71", "0x10", "0x85", "0x20",
             "--extra-target1", "0x30"]), 2)
@@ -726,7 +852,7 @@ class ClientTests(unittest.TestCase):
     def test_trace_profile_plan_run_and_report(self) -> None:
         import json
         import tempfile
-        from client.sysagent import (load_trace_profile, main,
+        from client.sysagent import (build_trace_timeline, load_trace_profile, main,
                                      report_trace_with_profile,
                                      resolve_trace_profile)
 
@@ -769,6 +895,7 @@ class ClientTests(unittest.TestCase):
                 "hits": 16,
                 "ring": 16,
                 "duration": 20,
+                "durationFrom": "first-hit",
                 "args": 8,
                 "snapshots": ["x1:0x100"],
             },
@@ -787,6 +914,34 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(plan["targets"][0]["address"], "0x290C1BC5C0")
             self.assertEqual(plan["targets"][1]["address"], "0x30162620")
 
+            code_profile = {
+                "schemaVersion": 1,
+                "name": "code-entry",
+                "processes": [{
+                    "id": "client",
+                    "foreground": True,
+                    "expect": {
+                        "titleId": "01006F8002326000",
+                        "buildId": "FF1D1C05670DB6021C85B624A710B963",
+                    },
+                }],
+                "targets": [{
+                    "id": "entry",
+                    "process": "client",
+                    "base": "code",
+                    "offset": "0x0",
+                }],
+            }
+            code_path = os.path.join(directory, "code-entry.json")
+            with open(code_path, "w", encoding="utf-8") as handle:
+                json.dump(code_profile, handle)
+            with self.client() as client:
+                code_resolved = resolve_trace_profile(
+                    client, load_trace_profile(code_path))
+            self.assertEqual(
+                code_resolved["targets"][0]["address"], "0x29083FE000")
+            self.assertEqual(code_resolved["targets"][0]["base"], "code")
+
             base = ["--host", "127.0.0.1", "--port",
                     str(self.server.server_address[1]), "--timeout", "1",
                     "debug", "trace-plan", profile_path]
@@ -798,16 +953,32 @@ class ClientTests(unittest.TestCase):
                         str(self.server.server_address[1]), "--timeout", "1",
                         "debug", "trace-run", profile_path]
             self.server.state.application_running = False
+            self.server.state.application_hook_busy = True
             self.server.state.processes = {}
             self.assertEqual(main(run_base + ["--wait-process"]), 0)
-            self.assertEqual(self.server.state.last_command[:7], [
+            trace_start = next(
+                command for command in reversed(self.server.state.commands)
+                if command[:2] == ["debug", "multitrace"])
+            self.assertEqual(trace_start[:7], [
                 "debug", "multitrace", "0x1234", "0x290C1BC5C0",
                 "0x6C", "0x30162620", "also"])
-            self.assertIn("tsnap=0:x1:0x100", self.server.state.last_command)
+            self.assertIn("durationFrom=first-hit",
+                          trace_start)
+            self.assertIn("tsnap=0:x1:0x100", trace_start)
             self.assertIn(["debug", "wait-application", "60000"],
+                          self.server.state.commands)
+            self.assertIn(["debug", "wait-title", "0x1006F8002326000", "60000"],
                           self.server.state.commands)
             self.assertIn(["debug", "wait-title", "0x10000000000001E", "60000"],
                           self.server.state.commands)
+            self.assertIn(["debug", "start-process", "0x1234"],
+                          self.server.state.commands)
+            self.assertIn(["debug", "start-process", "0x6C"],
+                          self.server.state.commands)
+            self.assertEqual(main(run_base + [
+                "--duration-from", "arm"]), 0)
+            self.assertNotIn("durationFrom=first-hit",
+                             self.server.state.last_command)
             trace_output = os.path.join(directory, "profile-trace.jsonl")
             self.assertEqual(main(run_base + ["--output", trace_output]), 0)
             with open(trace_output, encoding="utf-8") as handle:
@@ -817,7 +988,6 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(
                 exported_metadata["profile"]["name"],
                 "client-server-entry-return")
-
             client_process = {
                 "pid": "0000000000001234",
                 "titleId": "01006F8002326000",
@@ -864,6 +1034,14 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(report["pairs"][0]["entryId"], "client-entry")
             self.assertEqual(report["pairs"][1]["firstNonZeroX0"], "167B")
             self.assertEqual(report["pairs"][1]["calls"][0]["x0NonZero"], True)
+            timeline = build_trace_timeline([{
+                "metadata": metadata,
+                "events": events,
+                "path": "trace.jsonl",
+            }], profile)
+            self.assertEqual(
+                [event["targetId"] for event in timeline["timeline"]],
+                ["client-entry", "client-return", "server-entry", "server-return"])
 
             trace_path = os.path.join(directory, "trace.jsonl")
             with open(trace_path, "w", encoding="utf-8") as handle:
@@ -876,6 +1054,11 @@ class ClientTests(unittest.TestCase):
                 "--host", "127.0.0.1", "--port",
                 str(self.server.server_address[1]), "--timeout", "1",
                 "debug", "trace-report", trace_path, profile_path]), 0)
+            self.assertEqual(main([
+                "--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1",
+                "debug", "trace-timeline", trace_path,
+                "--profile", profile_path]), 0)
 
             single_profile = {
                 "schemaVersion": 1,
@@ -921,14 +1104,66 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(decoded_request["cmif"]["mode"], "request")
         self.assertEqual(decoded_request["cmif"]["header"]["commandId"], 8)
         self.assertEqual(decoded_request["cmif"]["header"]["token"], 0xDEADBEEF)
+        self.assertEqual(decoded_request["cmif"]["operation"], "invoke-method")
+
+        close_request = bytearray(32)
+        close_request[0:4] = (4).to_bytes(4, "little")
+        close_request[4:8] = (6).to_bytes(4, "little")
+        close_request[16] = 2
+        close_request[20:24] = (12).to_bytes(4, "little")
+        decoded_close = decode_hipc_cmif(bytes(close_request))
+        self.assertTrue(decoded_close["cmif"]["domain"])
+        self.assertIsNone(decoded_close["cmif"]["header"])
+        self.assertEqual(decoded_close["cmif"]["operation"],
+                         "close-domain-object")
+        self.assertEqual(
+            decoded_close["cmif"]["domainHeader"]["objectId"], 12)
+
+        clone_request = bytearray(32)
+        clone_request[0:4] = (5).to_bytes(4, "little")
+        clone_request[4:8] = (6).to_bytes(4, "little")
+        clone_request[16:32] = b"".join((
+            (0x49434653).to_bytes(4, "little"),
+            (0).to_bytes(4, "little"),
+            (2).to_bytes(4, "little"),
+            (0).to_bytes(4, "little"),
+        ))
+        decoded_clone = decode_hipc_cmif(bytes(clone_request))
+        self.assertEqual(decoded_clone["cmif"]["operation"],
+                         "clone-current-object")
+
+        transfer_request = bytearray(52)
+        transfer_request[0:4] = (4).to_bytes(4, "little")
+        transfer_request[4:8] = (8 | (1 << 31)).to_bytes(4, "little")
+        transfer_request[8:12] = ((1 << 1) | (1 << 5)).to_bytes(4, "little")
+        transfer_request[12:16] = (0x11223344).to_bytes(4, "little")
+        transfer_request[16:20] = (0x55667788).to_bytes(4, "little")
+        transfer_request[32:48] = b"".join((
+            (0x49434653).to_bytes(4, "little"),
+            (0).to_bytes(4, "little"),
+            (9).to_bytes(4, "little"),
+            (0).to_bytes(4, "little"),
+        ))
+        decoded_transfer = decode_hipc_cmif(bytes(transfer_request))
+        self.assertEqual(decoded_transfer["hipc"]["copyHandles"], 1)
+        self.assertEqual(decoded_transfer["hipc"]["moveHandles"], 1)
+        self.assertEqual(decoded_transfer["hipc"]["handles"], [
+            {"kind": "copy", "index": 0, "value": 0x11223344,
+             "valueHex": "0x11223344"},
+            {"kind": "move", "index": 0, "value": 0x55667788,
+             "valueHex": "0x55667788"},
+        ])
 
         response = bytearray(request)
         response[16:32] = bytes(16)
         response[32:36] = (0x4F434653).to_bytes(4, "little")
         response[40:44] = (0x167B).to_bytes(4, "little")
+        response[44:48] = (0x11223344).to_bytes(4, "little")
         decoded_response = decode_hipc_cmif(bytes(response))
         self.assertEqual(decoded_response["cmif"]["mode"], "response")
         self.assertEqual(decoded_response["cmif"]["header"]["result"], "0x167B")
+        self.assertEqual(
+            decoded_response["cmif"]["header"]["interfaceId"], 0x11223344)
 
         metadata = {
             "record": "meta",
@@ -993,15 +1228,197 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(report["transactions"][0]["service"], "test-service")
         self.assertEqual(report["transactions"][0]["interfaceHash"], "0x11223344")
         self.assertEqual(report["transactions"][0]["result"], "0x167B")
+        self.assertEqual(report["transactions"][0]["correlation"], "thread-fifo")
+        self.assertEqual(
+            report["transactions"][0]["responseInterfaceId"], 0x11223344)
+        self.assertTrue(
+            report["transactions"][0]["interfaceMatchesProfile"])
         self.assertEqual(report["domainObjects"][0]["objectId"], 12)
         self.assertEqual(report["domainObjects"][0]["requestCount"], 1)
         self.assertEqual(report["domainObjects"][0]["responseCount"], 1)
+
+        second_request = bytearray(request)
+        second_request[40:44] = (9).to_bytes(4, "little")
+        concurrent_report = decode_trace_ipc([{
+            "metadata": metadata,
+            "events": [
+                request_event,
+                {**request_event, "seq": "2", "tick": "110",
+                 "snap0Data": second_request.hex().upper()},
+                response_event,
+                {**response_event, "seq": "4", "tick": "210"},
+            ],
+            "path": "concurrent.jsonl",
+        }])
+        self.assertEqual(
+            concurrent_report["summary"]["ambiguousTransactions"], 1)
+        self.assertEqual(
+            concurrent_report["summary"]["correlationMethods"],
+            {"thread-fifo": 1, "ambiguous-thread-fifo": 1})
+        self.assertEqual(
+            [item["commandId"] for item in concurrent_report["transactions"]],
+            [8, 9])
+        self.assertEqual(
+            concurrent_report["transactions"][0]["outstandingAtResponse"], 2)
+        self.assertTrue(
+            concurrent_report["transactions"][0]["correlationAmbiguous"])
+        self.assertEqual(
+            concurrent_report["transactions"][1]["outstandingAtResponse"], 1)
+        self.assertFalse(
+            concurrent_report["transactions"][1]["correlationAmbiguous"])
+
+        correlated_metadata = json.loads(json.dumps(metadata))
+        correlated_metadata["profile"]["pairs"][0]["ipc"]["correlation"] = {
+            "request": "event:x2",
+            "response": "event:x1",
+            "thread": False,
+        }
+        correlated_report = decode_trace_ipc([{
+            "metadata": correlated_metadata,
+            "events": [
+                {**request_event, "seq": "1", "tick": "100", "x2": "1"},
+                {**request_event, "seq": "2", "tick": "110", "x2": "2",
+                 "snap0Data": second_request.hex().upper()},
+                {**response_event, "seq": "3", "tick": "200", "thread": "R1",
+                 "x1": "2"},
+                {**response_event, "seq": "4", "tick": "210", "thread": "R2",
+                 "x1": "1"},
+            ],
+            "path": "correlated.jsonl",
+        }])
+        self.assertEqual(
+            [item["commandId"] for item in correlated_report["transactions"]],
+            [9, 8])
+        self.assertEqual(
+            [item["correlation"] for item in correlated_report["transactions"]],
+            ["profile-key", "profile-key"])
+        self.assertEqual(
+            correlated_report["transactions"][0]["requestCorrelationKey"], "2")
+        self.assertEqual(
+            correlated_report["transactions"][0]["responseCorrelationKey"], "2")
+        self.assertEqual(
+            correlated_report["summary"]["unmatchedRequests"], 0)
+        self.assertEqual(
+            correlated_report["summary"]["unmatchedResponses"], 0)
+        self.assertEqual(
+            correlated_report["summary"]["correlationMethods"],
+            {"profile-key": 2})
+        payload_metadata = json.loads(json.dumps(metadata))
+        payload_metadata["profile"]["pairs"][0]["ipc"]["correlation"] = {
+            "request": "ipc:payload:0:4",
+            "response": "ipc:payload:0:4",
+            "thread": False,
+        }
+        payload_request = bytearray(52)
+        payload_request[:48] = request
+        payload_request[4:8] = (11).to_bytes(4, "little")
+        payload_request[48:52] = (7).to_bytes(4, "little")
+        payload_response = bytearray(52)
+        payload_response[:48] = response
+        payload_response[4:8] = (11).to_bytes(4, "little")
+        payload_response[48:52] = (7).to_bytes(4, "little")
+        payload_report = decode_trace_ipc([{
+            "metadata": payload_metadata,
+            "events": [
+                {**request_event, "snap0Data": payload_request.hex().upper()},
+                {**response_event, "thread": "R",
+                 "snap0Data": payload_response.hex().upper()},
+            ],
+            "path": "payload-correlation.jsonl",
+        }])
+        self.assertEqual(payload_report["transactions"][0]["correlation"],
+                         "profile-key")
+        self.assertEqual(
+            payload_report["transactions"][0]["requestCorrelationKey"],
+            "07000000")
+        correlated_metadata["profile"]["pairs"][0]["ipc"]["correlation"][
+            "fallback"] = "thread-fifo"
+        fallback_events = [
+            {**request_event, "x2": "1"},
+            {**response_event, "x1": "999"},
+        ]
+        no_match_report = decode_trace_ipc([{
+            "metadata": correlated_metadata,
+            "events": fallback_events,
+            "path": "fallback.jsonl",
+        }])
+        self.assertEqual(
+            no_match_report["transactions"][0]["correlation"],
+            "thread-fifo-fallback")
+        self.assertEqual(
+            no_match_report["summary"]["correlationMethods"],
+            {"thread-fifo-fallback": 1})
+        correlated_metadata["profile"]["pairs"][0]["ipc"]["correlation"][
+            "fallback"] = "none"
+        unmatched_report = decode_trace_ipc([{
+            "metadata": correlated_metadata,
+            "events": fallback_events,
+            "path": "unmatched.jsonl",
+        }])
+        self.assertEqual(unmatched_report["summary"]["transactionCount"], 0)
+        self.assertEqual(unmatched_report["summary"]["unmatchedRequests"], 1)
+        self.assertEqual(unmatched_report["summary"]["unmatchedResponses"], 1)
         timeline = build_trace_timeline([{
             "metadata": metadata,
             "events": [request_event, response_event],
             "path": "trace.jsonl",
         }])
         self.assertEqual(timeline["summary"]["transactionCount"], 1)
+
+        convert_request = bytearray(32)
+        convert_request[0:4] = (5).to_bytes(4, "little")
+        convert_request[4:8] = (6).to_bytes(4, "little")
+        convert_request[16:32] = b"".join((
+            (0x49434653).to_bytes(4, "little"),
+            (0).to_bytes(4, "little"),
+            (0).to_bytes(4, "little"),
+            (0).to_bytes(4, "little"),
+        ))
+        convert_response = bytearray(52)
+        convert_response[4:8] = (11).to_bytes(4, "little")
+        convert_response[16:32] = b"".join((
+            (0x4F434653).to_bytes(4, "little"),
+            (0).to_bytes(4, "little"),
+            (0).to_bytes(4, "little"),
+            (0x11223344).to_bytes(4, "little"),
+        ))
+        convert_response[32:36] = (12).to_bytes(4, "little")
+        lifecycle_events = [
+            {**request_event, "seq": "1", "tick": "100",
+             "snap0Data": convert_request.hex().upper()},
+            {**response_event, "seq": "2", "tick": "110",
+             "snap0Data": convert_response.hex().upper()},
+            {**request_event, "seq": "3", "tick": "300",
+             "snap0Data": close_request.hex().upper()},
+        ]
+        lifecycle = decode_trace_ipc([{
+            "metadata": metadata,
+            "events": lifecycle_events,
+            "path": "lifecycle.jsonl",
+        }])
+        self.assertEqual(lifecycle["transactions"][0]["operation"],
+                         "convert-current-object-to-domain")
+        self.assertEqual(lifecycle["transactions"][0]["createdObjectId"], 12)
+        self.assertEqual(
+            [event["type"] for event in lifecycle["domainEvents"]],
+            ["create-domain-object", "close-domain-object"])
+        self.assertEqual(lifecycle["domainObjects"][0]["createCount"], 1)
+        self.assertEqual(lifecycle["domainObjects"][0]["closeCount"], 1)
+        self.assertEqual(
+            lifecycle["domainObjects"][0]["createdTick"], "110")
+        self.assertEqual(
+            lifecycle["domainObjects"][0]["closedTick"], "300")
+        lifecycle_timeline = build_trace_timeline([{
+            "metadata": metadata,
+            "events": lifecycle_events,
+            "path": "lifecycle.jsonl",
+        }])
+        self.assertEqual(
+            lifecycle_timeline["summary"]["domainEventCount"], 2)
+        self.assertEqual(
+            [event["type"] for event in lifecycle_timeline["timeline"]
+             if event["type"].endswith("-domain-object")],
+            ["create-domain-object", "close-domain-object"])
 
         with tempfile.TemporaryDirectory() as directory:
             trace_path = os.path.join(directory, "trace.jsonl")
@@ -1015,6 +1432,14 @@ class ClientTests(unittest.TestCase):
                 "--host", "127.0.0.1", "--port",
                 str(self.server.server_address[1]), "--timeout", "1",
                 "debug", "ipc-decode", request.hex()]), 0)
+            self.assertEqual(main([
+                "--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1",
+                "debug", "ipc-decode", close_request.hex()]), 0)
+            self.assertEqual(main([
+                "--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1",
+                "debug", "ipc-decode", response.hex()]), 0)
             self.assertEqual(main([
                 "--host", "127.0.0.1", "--port",
                 str(self.server.server_address[1]), "--timeout", "1",
@@ -1085,6 +1510,40 @@ class ClientTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                         SysAgentProtocolError, "instruction mismatch"):
                     resolve_trace_profile(client, profile)
+
+            profile_data["targets"][0]["expectBytes"] = "FD7BBFA9"
+            profile_data["trace"] = {"durationFrom": "later"}
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(profile_data, handle)
+            with self.assertRaisesRegex(
+                    ValueError, "trace.durationFrom"):
+                load_trace_profile(path)
+
+            profile_data["trace"] = {}
+            profile_data["pairs"][0]["ipc"] = {
+                "correlation": {
+                    "request": "event:x2",
+                    "response": "ipc:payload:0:4",
+                    "thread": False,
+                    "fallback": "thread-fifo",
+                },
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(profile_data, handle)
+            load_trace_profile(path)
+            profile_data["pairs"][0]["ipc"]["correlation"]["request"] = (
+                "event:not_a_register")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(profile_data, handle)
+            with self.assertRaisesRegex(
+                    ValueError, "unsupported event field"):
+                load_trace_profile(path)
+            profile_data["targets"][0]["base"] = "bad"
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(profile_data, handle)
+            with self.assertRaisesRegex(
+                    ValueError, "base must be main or code"):
+                load_trace_profile(path)
 
     def test_trace_timeline_merges_sessions_and_rejects_mixed_boots(self) -> None:
         from client.sysagent import build_trace_timeline
