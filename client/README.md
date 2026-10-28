@@ -12,6 +12,7 @@ backend   Inspect or configure the process-memory backend
 system    Query or control system state
 audio     Query or control system audio
 game      Launch, close, or inspect the running game
+debug     Trace instruction entry and inspect arbitrary processes
 memory    Read or write process memory
 freeze    Manage value freezing
 input     Send controller, touch, or keyboard input
@@ -40,8 +41,8 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.0.3
-sys-agent 2.14.0  (switch:6000)
+client    1.1.0
+sys-agent 2.16.0  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
@@ -124,6 +125,28 @@ after a reboot; `externalKey=title.keys`), then `--keys <prod.keys>` (ticket + t
 decryption), then a plain launch (`externalKey=none`). Only the title-key block/keygen or
 the titlekey travels to the console; `prod.keys` never leaves the host. See
 `docs/headless-launch-rights-key-notes.md` for the full mechanism.
+
+## Debug trace
+
+```bash
+python3 client/sysagent.py --host switch debug trace main+0x123456 --pid 0x71
+python3 client/sysagent.py --host switch debug trace \
+  main+0x123456 main+0x123460 --ring 64 --snapshot x0+0x10:0x40
+python3 client/sysagent.py --host switch debug trace-status
+python3 client/sysagent.py --host switch debug trace-read 0
+python3 client/sysagent.py --host switch debug trace-dump --output trace.jsonl
+```
+
+`debug trace` arms one to four hardware execution breakpoints without patching target code. It
+records target index/address, thread/core/PC/LR/SP, `x0`–`x7`, and instruction bytes. Use
+`--ring 64 --duration 300` to keep recent hits, or `--hits N` for a one-shot hit limit. Ring
+mode defaults to a 64-hit safety cap; `--hits 0 --ring 64` explicitly removes it. Each
+`--snapshot REG[+/-OFFSET]:SIZE` reads memory through `x0`–`x30`, `sp`, `pc`, or `lr` while the
+target is stopped and records its own Result; two snapshots are supported. The selected PID
+defaults to the foreground application; `main+OFFSET` is resolved against that process. The
+record is an entry-event trace, not a return-value or call-stack tracer. `debug trace-stop`
+releases the debug handle, after which memory commands can attach normally again. `trace-dump`
+writes the retained ring as JSONL and rejects a ring that changed during the dump.
 
 ## Controller
 

@@ -20,7 +20,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.0.3"
+CLIENT_VERSION = "1.1.0"
 
 # The console's default keySleepTime (25 ms) is fast enough for the home menu but too
 # fast for the game's on-screen keyboard: measured in ACNH 3.0.3's chat field, 25/30 ms
@@ -291,6 +291,7 @@ def require_ok(response: dict[str, str]) -> dict[str, str]:
 # still be looked up. Result keys are lower-case hex with the 0x prefix.
 RESULT_CODE_NOTES = {
     "0x10801": "debug handle unavailable or already owned (dmnt:cht)",
+    "0x10201": "debug handle is owned by an active watch/trace or another debugger",
     "0xf401": "debug handle already owned by another debugger (dmnt:cht)",
     "0x202": "filesystem: access denied, or the path name encoding is unsupported",
     "0x2f4471": "bluetooth: adapter is busy paging another link",
@@ -311,6 +312,13 @@ ERROR_CODE_NOTES = {
     "INVALID_HEX_PAYLOAD": "the payload is not an even-length hex byte string",
     "INVALID_ADDRESS": "the address argument could not be parsed",
     "NO_HIT": "no watchpoint hit has been recorded yet",
+    "NO_TRACE_EVENT": "no execution-trace event is available at that index",
+    "DEBUG_TRACE_START_FAILED": "the execution tracer could not attach and arm",
+    "DEBUG_TRACE_START_TIMEOUT": "the execution tracer did not finish arming in time",
+    "TRACE_BUSY": "another watch/trace session is active or the trace parameters are invalid",
+    "DEBUG_BUSY": "an active watch/trace owns the process debug handle",
+    "INVALID_SNAPSHOT": "snapshot must be REG[+/-OFFSET]:SIZE, with REG in x0..x30, sp, pc, or lr",
+    "DUPLICATE_TARGET": "trace target addresses must be distinct",
 }
 
 
@@ -2222,6 +2230,86 @@ def _cmd_raw(client: SysAgentClient, args: argparse.Namespace) -> None:
         print(line)
 
 
+def _cmd_debug_trace(client: SysAgentClient, args: argparse.Namespace) -> None:
+    if not 1 <= len(args.addresses) <= 4:
+        raise ValueError("trace needs one to four target addresses")
+    if args.pid is not None and args.pid <= 0:
+        raise ValueError("pid must be positive")
+    if args.hits is not None and args.hits < 0:
+        raise ValueError("hits must be non-negative")
+    if args.hits == 0 and args.ring is None:
+        raise ValueError("hits 0 (unlimited) requires --ring")
+    if args.ring is not None and not 1 <= args.ring <= 64:
+        raise ValueError("ring must be in 1..64")
+    if args.duration is not None and args.duration < 0:
+        raise ValueError("duration must be non-negative")
+    if args.args is not None and not 0 <= args.args <= 8:
+        raise ValueError("args must be in 0..8")
+    # Arming hardware breakpoints on all four cores can take several seconds
+    # when the target is busy. The normal command timeout is tuned for small
+    # control replies, not for this attach-and-arm operation.
+    client.timeout = max(client.timeout, 30.0)
+    snapshots = args.snapshots or []
+    if len(snapshots) > 2:
+        raise ValueError("at most two --snapshot specifications are supported")
+    parts = ["debug", "trace", *args.addresses]
+    if args.pid is not None:
+        parts.append(f"pid=0x{args.pid:X}")
+    if args.hits is not None:
+        parts.extend(("hits", str(args.hits)))
+    if args.ring is not None:
+        parts.extend(("ring", str(args.ring)))
+    if args.duration is not None:
+        parts.extend(("duration", str(args.duration)))
+    if args.args is not None:
+        parts.extend(("args", str(args.args)))
+    for snapshot in snapshots:
+        parts.append(f"snap={snapshot}")
+    _emit(require_ok(client.command(" ".join(parts))), args)
+
+
+def _cmd_debug_trace_status(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.timeout = max(client.timeout, 30.0)
+    _emit(require_ok(client.command("debug trace-status", retry=True)), args)
+
+
+def _cmd_debug_trace_read(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.timeout = max(client.timeout, 30.0)
+    _emit(require_ok(client.command(f"debug trace-read {args.index}", retry=True)), args)
+
+
+def _cmd_debug_trace_stop(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.timeout = max(client.timeout, 30.0)
+    _emit(require_ok(client.command("debug trace-stop")), args)
+
+
+def _cmd_debug_trace_dump(client: SysAgentClient, args: argparse.Namespace) -> None:
+    client.timeout = max(client.timeout, 30.0)
+    before = require_ok(client.command("debug trace-status", retry=True))
+    ring_count = parse_int(before.get("ringCount", "0"))
+    last_sequence = parse_int(before.get("lastSeq", "0"))
+    if ring_count == 0 and last_sequence == 0:
+        raise SysAgentProtocolError("the tracer has no recorded event to dump")
+    event_count = ring_count if ring_count > 0 else 1
+
+    events = []
+    for index in range(event_count):
+        response = require_ok(client.command(f"debug trace-read {index}", retry=True))
+        events.append({key: value for key, value in response.items() if key != "ok"})
+
+    after = require_ok(client.command("debug trace-status", retry=True))
+    if (after.get("ringCount") != before.get("ringCount")
+            or after.get("overwritten") != before.get("overwritten")):
+        raise SysAgentProtocolError(
+            "the trace ring changed during dump; stop the trace first and retry")
+
+    output = args.output or f"trace-{int(time.time())}.jsonl"
+    with open(output, "w", encoding="utf-8") as handle:
+        for event in events:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+    print(f"{output} ({len(events)} events)")
+
+
 def _cmd_start(client: SysAgentClient, args: argparse.Namespace) -> None:
     print(client.start(args.start, args.end, args.pattern))
 
@@ -2547,6 +2635,58 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 (Arg("output", "write the icon to this path "
                                "(default: game-icon-<unix time>.bin)",
                      flags=("--output",)),)),
+    )),
+
+    CommandGroup("debug", "Trace execution and inspect arbitrary processes", (
+        Command("trace", "Record hardware-execution-breakpoint hits at up to four addresses",
+                _cmd_debug_trace,
+                (Arg("addresses", "one to four absolute or main+OFFSET instruction addresses",
+                     nargs="+", metavar="ADDRESS"),
+                 Arg("pid", "target process ID (default: foreground application)",
+                     type=parse_int, default=None, flags=("--pid",)),
+                 Arg("hits", "total-hit safety limit; 0 means unlimited with --ring",
+                     type=parse_int, default=None, flags=("--hits",)),
+                 Arg("ring", "keep the most recent N hits (1..64); duration/stop ends it",
+                     type=parse_int, default=None, flags=("--ring",)),
+                 Arg("duration", "failsafe duration in seconds; 0 means unlimited",
+                     type=parse_int, default=None, flags=("--duration",)),
+                 Arg("args", "capture x0 through x(N-1), N=0..8",
+                     type=parse_int, default=None, flags=("--args",)),
+                 Arg("snapshots", "capture REG[+/-OFFSET]:SIZE at each hit "
+                                  "(for example x0+0x10:0x40; max 2)",
+                     action="append", default=None, flags=("--snapshot",)),
+                 JSON_ARG, OUT_ARG),
+                "\n".join((
+                    "The tracer attaches to any PID the kernel lets sys-agent debug and",
+                    "uses up to four hardware execution breakpoints; target instructions are not",
+                    "modified. The command returns after the breakpoint is armed, so it is",
+                    "safe to start before the function or boot-time service path runs.",
+                    "",
+                    "Without --ring, --hits (default 1) ends the session and `trace read 0`",
+                    "returns the last hit. With --ring, the session keeps the most recent N",
+                    "and also stops at --hits (default 64) to protect a hot instruction;",
+                    "--hits 0 removes that cap. --duration (default 60) and `trace stop`",
+                    "remain independent lifetime bounds.",
+                    "",
+                    "While the trace owns the target debug handle, memory commands are",
+                    "rejected. Trace records are opt-in: no unsolicited data is written.",
+                    "",
+                    "Each --snapshot reads memory through x0..x30, sp, pc, or lr (plus an",
+                    "optional signed byte offset) while the target is stopped. Snapshot read",
+                    "failures are recorded per event instead of failing the whole trace.",
+                ))),
+        Command("trace-status", "Show tracer state, counters and last hit",
+                _cmd_debug_trace_status, (JSON_ARG, OUT_ARG)),
+        Command("trace-read", "Read one recorded hit, oldest first in ring mode",
+                _cmd_debug_trace_read,
+                (Arg("index", "ring index (default 0)", type=parse_int,
+                     nargs="?", default=0), JSON_ARG, OUT_ARG)),
+        Command("trace-stop", "Stop the active trace and release the debug handle",
+                _cmd_debug_trace_stop, (JSON_ARG, OUT_ARG)),
+        Command("trace-dump", "Write retained trace events to a JSONL file",
+                _cmd_debug_trace_dump,
+                (Arg("output", "output JSONL path (default: trace-<unix time>.jsonl)",
+                     flags=("--output",), default=None),)),
     )),
 
     CommandGroup("memory", "Read or write process memory", (

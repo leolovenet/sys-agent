@@ -43,6 +43,7 @@ class FakeState:
         self.flaky_peek_remaining = 0
         self.repeat_support = True
         self.sequence_error = False
+        self.trace_busy = False
         # An older sysmodule has only `configure <name> <value>` and stays silent for a
         # read (`configure <name>`), which is what makes the client hit its socket timeout.
         self.silent_configure = False
@@ -62,7 +63,39 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 continue
             state.last_command = command
             state.commands.append(command)
-            if command[0] == "searchCapabilities":
+            if command[0] == "debug":
+                if command[1] == "trace":
+                    if state.trace_busy:
+                        response = "ERR code=TRACE_BUSY result=0x0 stage="
+                    else:
+                        response = (
+                            "OK state=started pid=0000000000000071 address=0000002B00001000 "
+                            "args=8 hits=1 ring=0 duration=60 ctxSlot=1 insnSlot=0 "
+                            "dmntClosed=0"
+                        )
+                elif command[1] == "trace-status":
+                    response = (
+                        "OK active=1 armed=1 stale=0 memoryBlocked=1 dmntClosed=0 "
+                        "pid=0000000000000071 address=0000002B00001000 maxHits=1 "
+                        "hitCount=1 duration=60 startedTick=100 ring=0 ringCount=0 "
+                        "overwritten=0 args=8 ctxSlot=1 insnSlot=0 lastSeq=1 "
+                        "lastPc=0000002B00001000 lastLr=0000002B00001004 "
+                        "lastSp=0000002B00002000 lastThread=0000000000000088 "
+                        "lastCore=2 stage= lastError=0x0 hint="
+                    )
+                elif command[1] == "trace-read":
+                    response = (
+                        "OK seq=1 thread=0000000000000088 core=2 tick=200 "
+                        "pc=0000002B00001000 lr=0000002B00001004 sp=0000002B00002000 "
+                        "args=2 contextResult=0x0 coreResult=0x0 insnBytes=12 "
+                        "insn=FD7BBFA9FD030091FD430091 x0=0000000000000001 "
+                        "x1=0000000000000002"
+                    )
+                elif command[1] == "trace-stop":
+                    response = "OK state=stopped hitCount=1 ringCount=0 lastError=0x0 stage=hitsReached"
+                else:
+                    response = "ERR code=UNKNOWN_COMMAND"
+            elif command[0] == "searchCapabilities":
                 response = "OK version=3 modes=bytes,u8,u16,u32,u64 regions=absolute,heap,main alignment=powerOfTwo,max256 endian=little maxPattern=256 chunk=0x40000 maxResults=65536 maxPage=256 refine=exact,changed,unchanged,increased,decreased persistent=runtime storage=sd cRegions=absolute,heap,main,alias,addressSpace"
             elif command[0] in {"searchStart", "searchStartRegion"}:
                 state.search_active = True
@@ -474,6 +507,63 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(info["permName"], "rw")
             self.assertEqual(self.server.state.last_command[0], "memoryQuery")
 
+    def test_debug_trace_cli(self) -> None:
+        from client.sysagent import main
+        base = ["--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1", "debug"]
+
+        self.assertEqual(main(base + [
+            "trace", "main+0x1000", "--pid", "0x71", "--hits", "2",
+            "--ring", "16", "--duration", "30", "--args", "4"]), 0)
+        self.assertEqual(self.server.state.last_command, [
+            "debug", "trace", "main+0x1000", "pid=0x71", "hits", "2",
+            "ring", "16", "duration", "30", "args", "4"])
+
+        self.assertEqual(main(base + [
+            "trace", "main+0x1000", "0x2000", "--snapshot",
+            "x0+0x10:0x20", "--snapshot", "lr:8"]), 0)
+        self.assertEqual(self.server.state.last_command, [
+            "debug", "trace", "main+0x1000", "0x2000",
+            "snap=x0+0x10:0x20", "snap=lr:8"])
+
+        self.assertEqual(main(base + ["trace-status"]), 0)
+        self.assertEqual(self.server.state.last_command,
+                         ["debug", "trace-status"])
+        self.assertEqual(main(base + ["trace-read", "0"]), 0)
+        self.assertEqual(self.server.state.last_command,
+                         ["debug", "trace-read", "0"])
+        self.assertEqual(main(base + ["trace-stop"]), 0)
+        self.assertEqual(self.server.state.last_command,
+                         ["debug", "trace-stop"])
+
+        self.assertEqual(main(base + ["trace", "0x1000", "--ring", "65"]), 2)
+        self.assertEqual(main(base + ["trace", "0x1000", "--hits", "0"]), 2)
+        self.assertEqual(main(base + [
+            "trace", "0x1000", "0x2000", "0x3000", "0x4000", "0x5000"]), 2)
+        self.assertEqual(
+            main(base + ["trace", "0x1000", "--ring", "8", "--hits", "0"]),
+            0)
+        self.server.state.trace_busy = True
+        self.assertEqual(main(base + ["trace", "0x1000"]), 2)
+
+    def test_debug_trace_dump(self) -> None:
+        import json
+        import tempfile
+        from client.sysagent import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "trace.jsonl")
+            code = main([
+                "--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1",
+                "debug", "trace-dump", "--output", output,
+            ])
+            self.assertEqual(code, 0)
+            with open(output, encoding="utf-8") as handle:
+                event = json.loads(handle.readline())
+            self.assertEqual(event["pc"], "0000002B00001000")
+            self.assertNotIn("ok", event)
+
     def test_peek_verified(self) -> None:
         with self.client() as client:
             self.assertEqual(client.peek_absolute_verified(0x100, 4)["data"], "DEADBEEF")
@@ -600,6 +690,8 @@ class ClientTests(unittest.TestCase):
             require_ok(parse_response("ERR code=READBACK_FAILED result=0x10801"))
         with self.assertRaisesRegex(SysAgentProtocolError, "debug handle unavailable"):
             require_ok(parse_response("ERR code=WEIRD result=0x10801"))
+        with self.assertRaisesRegex(SysAgentProtocolError, "active watch/trace"):
+            require_ok(parse_response("ERR code=DEBUG_BUSY result=0x10201"))
         with self.assertRaisesRegex(SysAgentProtocolError, "bluetooth"):
             require_ok(parse_response("ERR code=WEIRD result=0x2F4471"))
 

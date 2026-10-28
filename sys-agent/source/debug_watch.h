@@ -38,6 +38,7 @@ typedef struct {
 typedef struct {
     bool active;
     bool armed;
+    bool everArmed;
     bool stale;         /* active=0 but the fields below still describe the last session */
     bool memoryBlocked; /* memory commands are refused while this session is attached */
     u64 processId;

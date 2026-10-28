@@ -1,6 +1,8 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "debug_hwbp.h"
+#include "debug_trace.h"
 #include "debug_watch.h"
 
 /*
@@ -34,30 +36,7 @@
 #define DEBUG_WATCH_THREAD_STACK_SIZE 0x10000
 #define DEBUG_WATCH_THREAD_PRIORITY 0x30
 #define DEBUG_WATCH_EVENT_TIMEOUT_NS 20000000LL
-#define DEBUG_WATCH_PIN_RETRY_US 100LL
-#define DEBUG_WATCH_PIN_ATTEMPTS 64
 #define DEBUG_WATCH_DEFAULT_DURATION_SECONDS 60
-#define DEBUG_WATCH_CORE_COUNT 4
-#define DEBUG_WATCH_DEFAULT_CORE 3
-
-/* svcSetHardwareBreakPoint register bank (same indices as dmnt.gen2). */
-#define HW_BP_REGISTER_I0 0
-#define HW_BP_REGISTER_I15 15
-#define HW_BP_REGISTER_D0 16
-#define HW_BP_REGISTER_D15 31
-
-/*
- * svcContinueDebugEvent flags, mirroring ams::svc::ContinueFlag in the
- * Atmosphere tree (dmnt.gen2 uses ExceptionHandled | EnableExceptionEvent |
- * ContinueAll to resume every thread after an exception).
- */
-#define DEBUG_CONTINUE_FLAG_EXCEPTION_HANDLED (1u << 0)
-#define DEBUG_CONTINUE_FLAG_ENABLE_EXCEPTION_EVENT (1u << 1)
-#define DEBUG_CONTINUE_FLAG_CONTINUE_ALL (1u << 2)
-#define DEBUG_CONTINUE_FLAGS \
-    (DEBUG_CONTINUE_FLAG_EXCEPTION_HANDLED \
-     | DEBUG_CONTINUE_FLAG_ENABLE_EXCEPTION_EVENT \
-     | DEBUG_CONTINUE_FLAG_CONTINUE_ALL)
 
 typedef struct {
     Mutex mutex;
@@ -65,6 +44,7 @@ typedef struct {
     bool threadStarted;
     bool active;
     bool armed;
+    bool everArmed;
     bool stopRequested;
     bool hasHit;
     u64 processId;
@@ -125,180 +105,6 @@ static void setDebugHandleInUseHint(void)
         sizeof(watchState.hint) - 1);
     watchState.hint[sizeof(watchState.hint) - 1] = 0;
     mutexUnlock(&watchState.mutex);
-}
-
-static bool isValidWatchPoint(u64 address, u64 size)
-{
-    if (size == 0)
-        return false;
-    if (size <= 8) {
-        if ((address & ~7ULL) != ((address + size - 1) & ~7ULL))
-            return false;
-    } else {
-        if (size > 0x80000000ULL)
-            return false;
-        if ((size & (size - 1)) != 0)
-            return false;
-        if ((address & (size - 1)) != 0)
-            return false;
-    }
-    return true;
-}
-
-/* Pin the current thread to a single core and verify we actually run there. */
-static Result pinToCore(const Handle current, s32 core)
-{
-    Result rc = svcSetThreadCoreMask(current, core, 1u << core);
-    if (R_FAILED(rc))
-        return rc;
-
-    s32 attempt = 0;
-    while ((s32)svcGetCurrentProcessorNumber() != core) {
-        if (++attempt >= DEBUG_WATCH_PIN_ATTEMPTS)
-            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-        svcSleepThread(DEBUG_WATCH_PIN_RETRY_US * 1000LL);
-    }
-    return 0;
-}
-
-/*
- * Program one hardware-breakpoint register on all four cores.  Every core
- * transition is verified with svcGetCurrentProcessorNumber; on failure the
- * register is rolled back on the cores already programmed, and the original
- * affinity is restored before returning.
- */
-static Result setBreakPointOnAllCores(u32 reg, u64 ctrl, u64 value)
-{
-    const Handle current = threadGetCurHandle();
-    s32 originalCore = -1;
-    u64 originalMask = 0;
-    svcGetThreadCoreMask(&originalCore, &originalMask, current);
-
-    Result rc = 0;
-    s32 core = 0;
-    s32 programmed = -1;
-    for (core = 0; core < DEBUG_WATCH_CORE_COUNT; core++) {
-        rc = pinToCore(current, core);
-        if (R_FAILED(rc))
-            break;
-        rc = svcSetHardwareBreakPoint(reg, ctrl, value);
-        if (R_FAILED(rc))
-            break;
-        programmed = core;
-    }
-
-    if (R_FAILED(rc) && programmed >= 0) {
-        /* Roll back the partially programmed register. */
-        s32 rollback = 0;
-        for (rollback = 0; rollback <= programmed; rollback++) {
-            if (R_SUCCEEDED(pinToCore(current, rollback)))
-                svcSetHardwareBreakPoint(reg, 0, 0);
-        }
-    }
-
-    /* Restore the affinity the thread had before this call. */
-    if (originalCore >= 0 && originalMask != 0)
-        svcSetThreadCoreMask(current, originalCore, (u32)originalMask);
-    else
-        svcSetThreadCoreMask(current, DEBUG_WATCH_DEFAULT_CORE,
-            1u << DEBUG_WATCH_DEFAULT_CORE);
-    return rc;
-}
-
-static Result setDataBreakPoint(u32 reg, u32 ctx, u64 address, u64 size,
-    bool read, bool write)
-{
-    const u8 lsc = (read ? 1 : 0) | (write ? 2 : 0);
-    if (lsc != 0 && !isValidWatchPoint(address, size))
-        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-
-    /* Determine bas/mask exactly like dmnt.gen2 SetDataBreakPoint. */
-    u8 bas = 0, mask = 0;
-    if (size <= 8) {
-        bas = (u8)(((1u << size) - 1) << (address & 7));
-        address = address & ~7ULL;
-    } else {
-        bas = 0xFF;
-        mask = (u8)__builtin_popcountll((unsigned long long)(size - 1));
-    }
-
-    const u64 dbgbcr = ((u64)mask << 24) | ((u64)ctx << 16)
-        | ((u64)bas << 5) | ((u64)lsc << 3) | ((lsc != 0) ? 1 : 0);
-    return setBreakPointOnAllCores(reg, dbgbcr, address);
-}
-
-static Result setContextBreakPoint(u32 ctxReg, Handle debugHandle)
-{
-    const u64 dbgbcr = (0x3ULL << 20) | (0x0ULL << 16) | (0xFULL << 5) | 1;
-    return setBreakPointOnAllCores(ctxReg, dbgbcr, (u64)debugHandle);
-}
-
-/* Resume the debug session exactly like dmnt.gen2's DebugProcess::Continue:
- * ExceptionHandled | EnableExceptionEvent | ContinueAll with a valid (dummy)
- * one-element thread-id list. */
-static Result resumeDebugSession(Handle debugHandle)
-{
-    u64 thread_ids[] = { 0 };
-    return svcContinueDebugEvent(debugHandle, DEBUG_CONTINUE_FLAGS,
-        thread_ids, 1);
-}
-
-static Result clearBreakPointOnAllCores(u32 reg)
-{
-    return setBreakPointOnAllCores(reg, 0, 0);
-}
-
-/*
- * Discover a context-IDR-capable breakpoint slot at runtime.  The walk starts
- * at the highest valid instruction-breakpoint register and picks the highest
- * slot that accepts a context value; data watchpoints link to the slot after
- * it (this is dmnt.gen2's GetWatchPointContextRegister behaviour).  The
- * discovered slot is a property of the current HOS/Mariko, not a constant.
- */
-static Result probeContextBreakpointSlot(u32* outCtxSlot)
-{
-    s32 lastBp = -1;
-    s32 i = 0;
-    for (i = HW_BP_REGISTER_I0; i <= HW_BP_REGISTER_I15; i++) {
-        Result rc = svcSetHardwareBreakPoint((u32)i, 0, 0);
-        if (R_FAILED(rc))
-            break;
-        lastBp = i;
-    }
-    if (lastBp < 0)
-        return MAKERESULT(Module_Libnx, LibnxError_NotFound);
-
-    const u64 ctxDbgbcr = (0x3ULL << 20) | (0x0ULL << 16) | (0xFULL << 5) | 1;
-    s32 firstCtx = -1;
-    for (i = lastBp; i >= HW_BP_REGISTER_I0; i--) {
-        Result rc = svcSetHardwareBreakPoint((u32)i, ctxDbgbcr,
-            (u64)CUR_PROCESS_HANDLE);
-        svcSetHardwareBreakPoint((u32)i, 0, 0);
-        if (R_FAILED(rc)) {
-            /* A failure other than invalid-handle ends the context range. */
-            if (rc != KERNELRESULT(InvalidHandle))
-                break;
-        }
-        firstCtx = i;
-    }
-    if (firstCtx < 0)
-        return MAKERESULT(Module_Libnx, LibnxError_NotFound);
-
-    *outCtxSlot = (u32)(firstCtx + 1);
-    return 0;
-}
-
-static Result probeDataRegister(u32* outDataReg)
-{
-    s32 i = 0;
-    for (i = HW_BP_REGISTER_D0; i <= HW_BP_REGISTER_D15; i++) {
-        Result rc = svcSetHardwareBreakPoint((u32)i, 0, 0);
-        if (R_FAILED(rc))
-            break;
-        *outDataReg = (u32)i;
-        return 0;
-    }
-    return MAKERESULT(Module_Libnx, LibnxError_NotFound);
 }
 
 /*
@@ -475,11 +281,13 @@ static void debugWatchThreadMain(void* arg)
     Handle debugHandle = INVALID_HANDLE;
     u32 ctxSlot = 0, wpSlot = 0;
     bool attached = false;
+    bool resumed = false;
     bool processExited = false;
     bool eventPending = false;
     bool ctxArmed = false;
     bool dataArmed = false;
     Result rc = 0;
+    Result cleanupRc = 0;
 
     u64 pid = 0;
     rc = pmdmntGetApplicationProcessId(&pid);
@@ -516,12 +324,12 @@ static void debugWatchThreadMain(void* arg)
         goto cleanup;
     }
 
-    rc = probeContextBreakpointSlot(&ctxSlot);
+    rc = debugHwBpProbeContextSlots(0, &ctxSlot);
     if (R_FAILED(rc)) {
         setError("probeContext", rc);
         goto cleanup;
     }
-    rc = probeDataRegister(&wpSlot);
+    rc = debugHwBpProbeDataRegister(&wpSlot);
     if (R_FAILED(rc)) {
         setError("probeData", rc);
         goto cleanup;
@@ -532,7 +340,7 @@ static void debugWatchThreadMain(void* arg)
     watchState.wpSlot = wpSlot;
     mutexUnlock(&watchState.mutex);
 
-    rc = setContextBreakPoint(ctxSlot, debugHandle);
+    rc = debugHwBpSetContext(ctxSlot, debugHandle);
     if (R_FAILED(rc)) {
         setError("setContextBp", rc);
         goto cleanup;
@@ -545,7 +353,7 @@ static void debugWatchThreadMain(void* arg)
         address = watchState.watchAddress;
         size = watchState.watchSize;
         mutexUnlock(&watchState.mutex);
-        rc = setDataBreakPoint(wpSlot, ctxSlot, address, size, false, true);
+        rc = debugHwBpSetData(wpSlot, ctxSlot, address, size, false, true);
     }
     if (R_FAILED(rc)) {
         setError("setDataBp", rc);
@@ -555,14 +363,17 @@ static void debugWatchThreadMain(void* arg)
 
     /* The initial events have been drained; resume the process exactly once
      * with the watchpoint already armed. */
-    rc = resumeDebugSession(debugHandle);
+    rc = debugHwBpContinueAll(debugHandle);
     if (R_FAILED(rc)) {
         setError("resume", rc);
         goto cleanup;
     }
+    resumed = true;
 
     mutexLock(&watchState.mutex);
     watchState.armed = true;
+    watchState.everArmed = true;
+    watchState.startedTick = armGetSystemTick();
     watchState.lastError = 0;
     watchState.stage[0] = 0;
     watchState.hint[0] = 0;
@@ -615,33 +426,34 @@ static void debugWatchThreadMain(void* arg)
         }
 
         /* Queue drained; resume the session once. */
-        rc = resumeDebugSession(debugHandle);
+        rc = debugHwBpContinueAll(debugHandle);
         if (R_FAILED(rc)) {
             setError("continue", rc);
             break;
         }
         eventPending = false;
     }
+    /* A stop request or duration expiry normally leaves TimedOut here. */
+    rc = 0;
 
 cleanup:
-    /* If the target may still be stopped on events we consumed but did not
-     * resume (hit limit / stop / timeout / setup failure), drain the queue
-     * and resume it explicitly so detach has a deterministic state machine.
-     * This is best effort; closing the debug handle also resumes the target. */
-    if (attached && !processExited && eventPending) {
-        while (true) {
-            DebugEventInfo event;
-            Result eventRc = svcGetDebugEvent(&event, debugHandle);
-            if (R_FAILED(eventRc))
-                break;
-        }
-        resumeDebugSession(debugHandle);
+    if (attached && !processExited) {
+        Result quiesceRc =
+            debugHwBpQuiesce(debugHandle, !resumed || eventPending);
+        if (R_FAILED(quiesceRc))
+            cleanupRc = quiesceRc;
     }
 
-    if (ctxArmed)
-        clearBreakPointOnAllCores(ctxSlot);
-    if (dataArmed)
-        clearBreakPointOnAllCores(wpSlot);
+    if (ctxArmed) {
+        Result clearRc = debugHwBpClearAllCores(ctxSlot);
+        if (R_FAILED(clearRc) && R_SUCCEEDED(cleanupRc))
+            cleanupRc = clearRc;
+    }
+    if (dataArmed) {
+        Result clearRc = debugHwBpClearAllCores(wpSlot);
+        if (R_FAILED(clearRc) && R_SUCCEEDED(cleanupRc))
+            cleanupRc = clearRc;
+    }
 
     if (attached && debugHandle != INVALID_HANDLE)
         svcCloseHandle(debugHandle);
@@ -650,6 +462,11 @@ cleanup:
     watchState.active = false;
     watchState.armed = false;
     watchState.stopRequested = false;
+    if (R_FAILED(cleanupRc) && watchState.lastError == 0) {
+        watchState.lastError = cleanupRc;
+        strncpy(watchState.stage, "cleanup", sizeof(watchState.stage) - 1);
+        watchState.stage[sizeof(watchState.stage) - 1] = 0;
+    }
     if (R_FAILED(rc) && watchState.lastError == 0)
         watchState.lastError = rc;
     mutexUnlock(&watchState.mutex);
@@ -669,6 +486,12 @@ bool debugWatchStart(const DebugWatchConfig* config)
 {
     if (config == NULL)
         return false;
+    if (debugTraceIsActive()) {
+        mutexLock(&watchState.mutex);
+        watchState.lastError = KERNELRESULT(OwnedByAnotherProcess);
+        mutexUnlock(&watchState.mutex);
+        return false;
+    }
     const u64 address = config->address;
     const u64 size = config->size;
     const u32 maxHits = config->maxHits;
@@ -691,7 +514,7 @@ bool debugWatchStart(const DebugWatchConfig* config)
         mutexLock(&watchState.mutex);
         watchState.threadStarted = false;
     }
-    if (size == 0 || !isValidWatchPoint(address, size)) {
+    if (size == 0 || !debugHwBpIsValidWatchPoint(address, size)) {
         watchState.lastError = MAKERESULT(Module_Libnx, LibnxError_BadInput);
         mutexUnlock(&watchState.mutex);
         return false;
@@ -701,7 +524,7 @@ bool debugWatchStart(const DebugWatchConfig* config)
     watchState.watchSize = size;
     watchState.maxHits = maxHits > 0 ? maxHits : 1;
     watchState.durationSeconds = durationSeconds;
-    watchState.startedTick = armGetSystemTick();
+    watchState.startedTick = 0;
     watchState.hitCount = 0;
     watchState.ringSize = ringSize;
     watchState.ringCount = 0;
@@ -724,6 +547,7 @@ bool debugWatchStart(const DebugWatchConfig* config)
     watchState.stopRequested = false;
     watchState.active = true;
     watchState.armed = false;
+    watchState.everArmed = false;
     watchState.threadStarted = true;
     mutexUnlock(&watchState.mutex);
 
@@ -775,6 +599,7 @@ bool debugWatchGetStatus(DebugWatchStatus* out)
     mutexLock(&watchState.mutex);
     out->active = watchState.active;
     out->armed = watchState.armed;
+    out->everArmed = watchState.everArmed;
     /* A finished session keeps its last address/hit values so `watch-last`
      * stays useful, which makes "active=0 address=... hitCount=4" easy to
      * misread as a live breakpoint. Flag those values as stale instead of
@@ -855,7 +680,7 @@ Result debugWatchResolveMainBase(u64* outMainBase)
     rc = ldrDmntGetProcessModuleInfo(pid, modules, 2, &count);
     if (R_FAILED(rc) || count <= 0)
         return R_FAILED(rc) ? rc : MAKERESULT(Module_Libnx, LibnxError_NotFound);
-    const LoaderModuleInfo* mainModule = &modules[count == 2 ? 1 : 0];
+    const LoaderModuleInfo* mainModule = &modules[count > 1 ? 1 : 0];
     *outMainBase = mainModule->base_address;
     return 0;
 }

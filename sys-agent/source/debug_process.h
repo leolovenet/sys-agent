@@ -46,3 +46,6 @@ void debugProcessPrintThreads(u64 pid);
  * only known to accept two modules per request; larger counts close the
  * service session. */
 void debugProcessPrintModules(u64 pid, u32 limit);
+
+/* Resolve the main NSO base for any process through ldr:dmnt. */
+Result debugProcessResolveMainBase(u64 pid, u64* outMainBase);

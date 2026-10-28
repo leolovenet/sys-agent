@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "debug_trace.h"
 #include "debug_watch.h"
 #include "dmnt_client.h"
 
@@ -24,7 +25,7 @@ Result debugProcessOpen(u64 pid, Handle* out, bool* dmntClosed)
     *dmntClosed = false;
     if (pid == 0)
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-    if (debugWatchIsActive())
+    if (debugWatchIsActive() || debugTraceIsActive())
         return KERNELRESULT(OwnedByAnotherProcess);
 
     /* dmnt:cht owns the single debug handle to the foreground application.
@@ -358,4 +359,22 @@ void debugProcessPrintModules(u64 pid, u32 limit)
             printf("%02X", modules[i].build_id[byte]);
     }
     printf("\n");
+}
+
+Result debugProcessResolveMainBase(u64 pid, u64* outMainBase)
+{
+    if (pid == 0 || outMainBase == 0)
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+    LoaderModuleInfo modules[2];
+    s32 count = 0;
+    Result rc = ldrDmntGetProcessModuleInfo(pid, modules, 2, &count);
+    if (R_FAILED(rc))
+        return rc;
+    if (count <= 0)
+        return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+
+    /* ldr:dmnt returns rtld first and the process's main module second. */
+    *outMainBase = modules[count > 1 ? 1 : 0].base_address;
+    return 0;
 }

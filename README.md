@@ -49,6 +49,13 @@ commands should follow this rule:
   watched address, with per-core debug registers linked through a context-IDR breakpoint.
   It auto-resolves the dmnt-owned debug-handle conflict (`dmntClosed=1`), and a manual
   `debug force-close` is available; memory commands are rejected while a watch is armed.
+- A hardware execution tracer (`debug trace`) attaches to any PID, arms before the target
+  function runs, and records hits at up to four addresses with target identity, thread,
+  PC/LR/SP, x0-x7, core and instruction bytes. Each hit can also snapshot up to two register
+  pointers with offsets. It uses a fixed-size ring (up to 64 events) or a one-shot hit limit,
+  defaults ring sessions to a 64-hit safety cap so a hot instruction cannot starve the target,
+  exposes `trace-status` / `trace-read` / `trace-stop`, and never modifies target instructions.
+  The client `trace-dump` writes retained events as JSONL.
 - Verified memory access: `poke*Verified` writes and reads the range back, reporting
   `WRITE_FAILED`, `READBACK_FAILED`, or `WRITE_VERIFY_FAILED` distinctly; `peek*Verified`
   reads twice and retries until two reads agree, so zero data and a failed read are
@@ -141,6 +148,10 @@ trusted isolated network and restrict it with the surrounding network firewall.
   capture the writer's PC, registers, and instruction bytes. `ring N` keeps the last N hits
   without auto-detaching and `pc=LOW-HIGH` keeps only matching hits; `debug watch-ring <i>`
   dumps a stored hit.
+- Hardware execution trace (`debug trace` / `trace-status` / `trace-read` / `trace-stop`)
+  records entry hits at an absolute or `main+offset` instruction for the foreground
+  application or an explicit `pid=`. It is an entry-event recorder, not a full call/return
+  unwinder.
 - `log` lists the recent commands the console received, with a system tick.
 
 ### Screen Capture:

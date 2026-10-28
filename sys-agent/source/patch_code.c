@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "debug_trace.h"
 #include "debug_watch.h"
 #include "dmnt_client.h"
 
@@ -108,18 +109,8 @@ Result patchCodeRun(u64 address, const u8* expected, u64 expectedSize,
     if (!skipVerify && (expected == NULL || expectedSize != patchSize))
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
 
-    if (debugWatchIsActive())
+    if (debugWatchIsActive() || debugTraceIsActive())
         return KERNELRESULT(OwnedByAnotherProcess);
-
-    /* gen1 (dmnt:cht) owns the single debug handle when attached; close it so
-     * we can attach directly.  It re-attaches automatically after detach. */
-    if (R_SUCCEEDED(dmntClientInitialize())) {
-        bool attached = false;
-        if (R_SUCCEEDED(dmntClientHasProcess(&attached)) && attached) {
-            dmntClientForceClose();
-            out->dmntClosed = true;
-        }
-    }
 
     Result rc = 0;
     if (pid == 0)
@@ -128,6 +119,19 @@ Result patchCodeRun(u64 address, const u8* expected, u64 expectedSize,
         if (R_SUCCEEDED(rc))
             rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
         return rc;
+    }
+
+    /* dmnt:cht can own only the foreground application's debug handle. Close
+     * it only when that really is the selected target; patching a system
+     * process must not disturb the running game. */
+    u64 appPid = 0;
+    if (R_SUCCEEDED(pmdmntGetApplicationProcessId(&appPid))
+        && appPid == pid && R_SUCCEEDED(dmntClientInitialize())) {
+        bool attached = false;
+        if (R_SUCCEEDED(dmntClientHasProcess(&attached)) && attached) {
+            dmntClientForceClose();
+            out->dmntClosed = true;
+        }
     }
 
     Handle debugHandle = INVALID_HANDLE;

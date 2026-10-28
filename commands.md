@@ -308,6 +308,62 @@ still ask dmnt to attach, and Atmosphere retains ownership of that shared debug 
 direct mode, sys-agent owns the handle only for the current command, freeze cycle, mapping
 query, or search read and closes it immediately afterward.
 
+## Execution trace (debug trace)
+
+`debug trace` records entry hits at one to four AArch64 instructions through hardware execution
+breakpoints. It never writes the target's code, so it can be armed before a lazy initialization
+path or a system-service request without introducing an instruction patch. The default target
+is the foreground application; `pid=` selects any process the kernel lets sys-agent debug.
+`main+offset` resolves against that selected process through `ldr:dmnt`, and all addresses are
+validated to be distinct, instruction-aligned absolute addresses before arming.
+
+The command returns after the breakpoint has been armed. In one-shot mode (no `ring`), the
+session detaches at `hits` (default 1), and `debug trace-read 0` returns the most recent event.
+In ring mode, it keeps the most recent N events, overwrites the oldest, and stops at `hits`,
+`duration`, or `debug trace-stop`. The default ring safety limit is 64 total hits because a
+hot instruction can otherwise generate hundreds of thousands of debugger stops and starve the
+target; `hits 0` explicitly removes that cap and is valid only with `ring`. Each event contains
+a monotonically increasing sequence number, the target index and configured address, thread ID,
+current core, system tick, PC/LR/SP, selected `x0`-`x7` values, and 12 instruction bytes at the
+PC. If the context or core query fails, the relevant native Result is retained per event.
+
+At each hit, up to two optional memory snapshots are read while the target is stopped:
+`snap=REG[+/-OFFSET]:SIZE`. `REG` is `x0` through `x30`, `sp`, `pc`, or `lr`; `SIZE` is 1 through
+256 bytes. The event records the resolved address, bytes, and a per-snapshot native Result, so
+an unmapped or overflowed pointer does not fail the whole trace. Example:
+`snap=x0+0x10:0x40 snap=lr-8:8`.
+
+This first tracer is deliberately an entry-event recorder. It does not automatically set a
+second breakpoint on LR, so it does not claim call/return correlation for recursive or
+multi-threaded functions. A hardware instruction breakpoint reports that execution reached the
+instruction, not that the function completed; return values and nested calls need separate
+observation points.
+
+|Command|Description|Parameters|Usage|
+|--|--|--|--|
+|debug trace|Arms one to four hardware execution breakpoints and returns after every configured target is armed. `ring` controls retention; `hits` is always a total-hit safety limit. Without `ring`, `hits` defaults to 1; with `ring`, it defaults to 64. `hits 0` means unlimited and requires `ring`|1-4 absolute instruction addresses or `main+offset` values<br>optional: `pid=PID`, `hits N` (default 1, or 64 with ring; 0 = unlimited with ring), `ring N` (1-64), `duration N` seconds (default 60, 0 = unlimited), `args N` (0-8, default 8), repeated `snap=xN+OFFSET:SIZE` (max 2)|`debug trace main+0x123456 main+0x123460 pid=0x71 ring 64 snap=x0:0x40`<br>`debug trace 0x2B5D9CF4C8 ring 64 duration 300 args 8`|
+|debug trace-status|Reports active/armed state (`everArmed` distinguishes a completed session from one that never armed), all target addresses and per-target hit counts, ring counts, ignored unexpected hits, breakpoint slots, snapshot specs, last event summary, and attach errors|none|`debug trace-status`|
+|debug trace-read|Reads one retained event, oldest first in ring mode; index defaults to 0|optional ring entry index|`debug trace-read 0`|
+|debug trace-stop|Requests detach, waits for the trace thread, clears every configured breakpoint on every core, and releases the debug handle|none|`debug trace-stop`|
+
+The Python client adds `debug trace-dump --output FILE`, which paginates the retained ring into
+one JSON object per line. It refuses a result whose ring changed during the dump; stop the trace
+first when every event must come from one coherent window.
+
+The same ownership rules as `debug watch` apply. For the foreground application, an existing
+`dmnt:cht` handle is closed when necessary and later memory commands reattach it. A trace of a
+system process does not disturb the game's dmnt handle. While a trace is active, memory,
+patch-code, maps, and threads commands that need a conflicting debug handle return
+`OwnedByAnotherProcess`; query `debug trace-status` and stop the trace first. A standalone
+gdbstub remains a conflicting owner and must be disabled.
+
+`duration` and `hits` are safety bounds, not sampling intervals. A hot instruction can make the
+debugger stop and resume frequently, so trace a low-frequency boundary (request entry, worker
+entry, initialization function) rather than a per-frame leaf. Real-device testing hit one
+`svcWaitSynchronization` instruction 224,256 times in 8 seconds. Even 4096 rapid hits were
+enough for ACNH's watchdog to terminate the process. Use an explicit larger cap or an unlimited
+ring only when the instruction rate is known to be low.
+
 ## Hardware watchpoint (debug watch)
 
 `debug watch` attaches the current application directly with
@@ -355,7 +411,7 @@ Requirements and conflict rules:
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
 |debug watch|Arms a hardware write watchpoint and returns immediately; the thread detaches automatically after `hits` hits or `duration` seconds. `ring N` (max 8) instead keeps the most recent N hits in a ring and never auto-detaches on the hit count; `pc=LOW-HIGH` keeps only hits whose PC is in that range|1. absolute address or `main+offset`<br>2. optional size 1-8 (default 4)<br>3. optional `hits N` (default 1)<br>4. optional `duration N` seconds (default 60, 0 = unlimited)<br>optional: `ring N`, `pc=LOW-HIGH`|`debug watch main+0x123456 4 hits 100`<br>`debug watch 0x2E1000 4 ring 8 duration 300`<br>`debug watch 0x2E1000 4 pc=0x2B5D9C00-0x2B5D9D00 duration 60`|
-|debug watch-status|Reports arming state (`active`), process, address, hit count, discovered breakpoint slots (ctx/wp), the ring size and count (`ring`/`ringCount`), whether a PC filter is set (`filter`), and the latest hit's PC/LR/SP/data/thread. `stale=1` marks address/hit fields left over from a finished session (so `active=0` with a non-zero address is not a live breakpoint), and `memoryBlocked=1` says memory commands are refused while a session is attached|none|`debug watch-status`|
+|debug watch-status|Reports arming state (`active`, `armed`, and `everArmed`), process, address, hit count, discovered breakpoint slots (ctx/wp), the ring size and count (`ring`/`ringCount`), whether a PC filter is set (`filter`), and the latest hit's PC/LR/SP/data/thread. `stale=1` marks address/hit fields left over from a finished session (so `active=0` with a non-zero address is not a live breakpoint), and `memoryBlocked=1` says memory commands are refused while a session is attached|none|`debug watch-status`|
 |debug watch-last|Dumps the full register snapshot (x0-x30, sp, pc), the instruction window at pc-8..pc+3, and the stack windows captured at hit time: `fpStack` (0x200 bytes at x29, caller frame chain) and `spStack` (0x100 bytes at sp, current frame locals)|none|`debug watch-last`|
 |debug watch-ring|Dumps one stored hit from a `ring` session, oldest first; same fields as `debug watch-last`|ring entry index (0 = oldest)|`debug watch-ring 0`|
 |debug modules|Lists up to `limit` modules of a process through `ldr:dmnt`, including each module's base, size and Build ID; default is the foreground application and 2 modules. The service is only known to accept two modules per request; larger limits are rejected instead of closing the session|optional: `[pid] [limit]`; pid is `0x`-hex or decimal, limit 1..2|`debug modules 0x71 2`|
@@ -377,7 +433,7 @@ pid is supplied. Use `processList` to discover PIDs and their title IDs.
 `debug maps` and `debug threads` use a short-lived direct debug handle. If
 `dmnt:cht` already owns the foreground application, they close that handle and
 report `dmntClosed=1`; the next automatic memory operation reattaches dmnt.
-They fail while a `debug watch` session is active or when another debugger
+They fail while a `debug watch` or `debug trace` session is active or when another debugger
 such as the standalone gdbstub owns the target. `debug modules` is an
 `ldr:dmnt` query and does not pause the target.
 
@@ -495,7 +551,7 @@ search; wait for the terminal status before retrying or closing the session.
 |peekAbsoluteMulti  |Reads memory at given absolute addresses  |1. absolute address (0x-hex or decimal)<br>2. amount of bytes to read<br>...<br>n. absolute address (0x-hex or decimal)<br>n+1. amount of bytes to read <br>Return: hex string |peekMulti 0x45075880 344 0x45097552 344 0x45774450 344  |
 |peekMainMulti  |Reads memory at given absolute addresses  |1. NSOMain-relative offset (0x-hex or decimal)<br>2. amount of bytes to read<br>...<br>n. NSOMain-relative offset (0x-hex or decimal)<br>n+1. amount of bytes to read <br>Return: hex string |peekMulti 0x45075880 344 0x45097552 344 0x45774450 344  |
 |peekVerified / peekAbsoluteVerified / peekMainVerified|Verified read: reads the range twice, retrying until two consecutive reads agree (default 3 attempts, max 16), so "read returned zeros" is distinguishable from a failed read. `OK addr=... size=... attempts=... data=<hex>`, or `ERR code=READ_FAILED result=...` / `ERR code=READ_UNSTABLE`|same as the corresponding `peek` command, plus optional `attempts N` (1..16)|`peekAbsoluteVerified 0x45075880 0x10 attempts=5`|
-|memoryQuery|Queries the memory mapping covering an address (svcQueryMemory semantics): `OK addr=... base=... size=... type=... typeName=... attr=... perm=... permName=...`, or `ERR code=QUERY_FAILED`|absolute address (0x-hex or decimal)|`memoryQuery 0x2C1A400000`|
+|memoryQuery|Queries the memory mapping covering an address (svcQueryMemory semantics): `OK addr=... base=... size=... type=... typeName=... attr=... perm=... permName=...`, `ERR code=DEBUG_BUSY` while a watch/trace owns the debug handle, or `ERR code=QUERY_FAILED`|absolute address (0x-hex or decimal)|`memoryQuery 0x2C1A400000`|
 |memoryHash|FNV-1a 32 fingerprint of an absolute region, read in 4 KiB chunks: `OK addr=... size=... algo=fnv1a32 hash=0x........`, or `ERR code=READ_FAILED`. Compare hashes to find which of several regions changed without pulling the bytes back|1. absolute address (0x-hex or decimal)<br>2. byte count<br>optional: `algo=fnv1a32`|`memoryHash 0x2C1A400000 0x100`|
 
 ### Pointer Reads

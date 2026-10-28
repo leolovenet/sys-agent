@@ -14,6 +14,7 @@
 #include "freeze.h"
 #include "search.h"
 #include "process_memory.h"
+#include "debug_trace.h"
 #include "debug_watch.h"
 #include "debug_process.h"
 #include "patch_code.h"
@@ -28,7 +29,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.15.0"
+#define VERSION_S "2.16.0"
 
 typedef enum {
     Active = 0,
@@ -335,6 +336,50 @@ static void printWatchHit(const DebugWatchHit* hit)
     printf("\n");
 }
 
+static void printTraceEvent(const DebugTraceEvent* event)
+{
+    printf("OK seq=%lu target=%u targetAddress=%016lX"
+        " thread=%016lX core=%u tick=%lu"
+        " pc=%016lX lr=%016lX sp=%016lX args=%u"
+        " contextResult=0x%X coreResult=0x%X insnBytes=%u insn=",
+        event->sequence, event->targetIndex, event->targetAddress,
+        event->threadId, event->core, event->tick, event->pc,
+        event->lr, event->sp, event->argsCount,
+        event->contextResult, event->coreResult, event->insnBytes);
+    for (u32 i = 0; i < event->insnBytes; i++)
+        printf("%02X", event->insn[i]);
+    for (u32 i = 0; i < event->argsCount && i < DEBUG_TRACE_ARGS_MAX; i++)
+        printf(" x%u=%016lX", i, event->x[i]);
+    printf(" snapshots=%u", event->snapshotCount);
+    for (u32 i = 0; i < event->snapshotCount
+        && i < DEBUG_TRACE_SNAPSHOT_MAX; i++) {
+        printf(" snap%uAddress=%016lX snap%uBytes=%u snap%uData=",
+            i, event->snapshotAddresses[i],
+            i, event->snapshotBytes[i], i);
+        for (u32 byte = 0; byte < event->snapshotBytes[i]; byte++)
+            printf("%02X", event->snapshots[i][byte]);
+        printf(" snap%uResult=0x%X", i, event->snapshotResults[i]);
+    }
+    printf("\n");
+}
+
+static void printTraceSnapshotSpec(const DebugTraceSnapshotSpec* spec)
+{
+    if (spec->base == DebugTraceSnapshotBase_Gpr)
+        printf("x%u", spec->registerIndex);
+    else if (spec->base == DebugTraceSnapshotBase_Sp)
+        printf("sp");
+    else if (spec->base == DebugTraceSnapshotBase_Pc)
+        printf("pc");
+    else
+        printf("lr");
+    if (spec->offset > 0)
+        printf("+0x%lX", (u64)spec->offset);
+    else if (spec->offset < 0)
+        printf("-0x%lX", (u64)(-(spec->offset + 1)) + 1);
+    printf(":0x%X", spec->size);
+}
+
 /* Print a byte range as uppercase hex (memory order, lowest address first). */
 static void printHexBytes(const u8* bytes, u64 size)
 {
@@ -548,6 +593,337 @@ int argmain(int argc, char** argv)
             debugProcessPrintThreads(pid);
             return 0;
         }
+        if (!strcmp(argv[1], "trace"))
+        {
+            /*
+             * debug trace <address|main+offset>
+             *     [pid=PID] [hits N] [ring N] [duration N] [args N]
+             *
+             * `ring` controls retention, not the lifetime safety bound. A
+             * ring session defaults to 64 total hits and `hits 0` removes
+             * that cap explicitly. Without `ring`, the default is one hit and
+             * `trace-read 0` returns the last event.
+             */
+            if (argc < 3) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+
+            const char* targetTexts[DEBUG_TRACE_TARGET_MAX];
+            u32 targetCount = 0;
+            DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX];
+            u32 snapshotCount = 0;
+            u64 pid = 0;
+            u32 maxHits = 1;
+            bool hitsSpecified = false;
+            u64 duration = 60;
+            u32 ringSize = 0;
+            u32 argsCount = DEBUG_TRACE_ARGS_MAX;
+
+            int index = 2;
+            while (index < argc) {
+                if (!strncmp(argv[index], "pid=", 4)) {
+                    if (!tryParseStringToInt(argv[index] + 4, &pid)
+                        || pid == 0) {
+                        printf("ERR code=INVALID_PID\n");
+                        return 0;
+                    }
+                    index++;
+                } else if (!strcmp(argv[index], "hits")
+                    && index + 1 < argc) {
+                    u64 parsed = 0;
+                    if (!tryParseStringToInt(argv[index + 1], &parsed)
+                        || parsed > 0xFFFFFFFFULL) {
+                        printf("ERR code=INVALID_HITS\n");
+                        return 0;
+                    }
+                    maxHits = (u32)parsed;
+                    hitsSpecified = true;
+                    index += 2;
+                } else if (!strcmp(argv[index], "ring")
+                    && index + 1 < argc) {
+                    u64 parsed = 0;
+                    if (!tryParseStringToInt(argv[index + 1], &parsed)
+                        || parsed == 0 || parsed > DEBUG_TRACE_RING_MAX) {
+                        printf("ERR code=INVALID_RING\n");
+                        return 0;
+                    }
+                    ringSize = (u32)parsed;
+                    index += 2;
+                } else if (!strcmp(argv[index], "duration")
+                    && index + 1 < argc) {
+                    u64 parsed = 0;
+                    if (!tryParseStringToInt(argv[index + 1], &parsed)
+                        || parsed > 0x7FFFFFFFULL) {
+                        printf("ERR code=INVALID_DURATION\n");
+                        return 0;
+                    }
+                    duration = parsed;
+                    index += 2;
+                } else if (!strcmp(argv[index], "args")
+                    && index + 1 < argc) {
+                    u64 parsed = 0;
+                    if (!tryParseStringToInt(argv[index + 1], &parsed)
+                        || parsed > DEBUG_TRACE_ARGS_MAX) {
+                        printf("ERR code=INVALID_ARGS\n");
+                        return 0;
+                    }
+                    argsCount = (u32)parsed;
+                    index += 2;
+                } else if (!strncmp(argv[index], "snap=", 5)) {
+                    if (snapshotCount >= DEBUG_TRACE_SNAPSHOT_MAX
+                        || !debugTraceParseSnapshotSpec(
+                            argv[index] + 5,
+                            &snapshots[snapshotCount])) {
+                        printf("ERR code=INVALID_SNAPSHOT\n");
+                        return 0;
+                    }
+                    snapshotCount++;
+                    index++;
+                } else if (!strcmp(argv[index], "hits")
+                    || !strcmp(argv[index], "ring")
+                    || !strcmp(argv[index], "duration")
+                    || !strcmp(argv[index], "args")) {
+                    printf("ERR code=INVALID_ARGUMENTS detail=missing_value\n");
+                    return 0;
+                } else {
+                    if (targetCount >= DEBUG_TRACE_TARGET_MAX) {
+                        printf("ERR code=INVALID_TARGET_COUNT max=%u\n",
+                            DEBUG_TRACE_TARGET_MAX);
+                        return 0;
+                    }
+                    targetTexts[targetCount++] = argv[index++];
+                }
+            }
+
+            if (targetCount == 0) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            if (ringSize > 0 && !hitsSpecified)
+                maxHits = DEBUG_TRACE_DEFAULT_RING_HITS;
+            if (ringSize == 0 && maxHits == 0) {
+                printf("ERR code=INVALID_HITS detail=unlimited_requires_ring\n");
+                return 0;
+            }
+
+            if (pid == 0) {
+                Result rc = pmdmntGetApplicationProcessId(&pid);
+                if (R_FAILED(rc) || pid == 0) {
+                    printf("ERR code=NO_APP result=0x%X\n", rc);
+                    return 0;
+                }
+            }
+
+            u64 addresses[DEBUG_TRACE_TARGET_MAX];
+            u64 mainBase = 0;
+            bool mainBaseResolved = false;
+            for (u32 i = 0; i < targetCount; i++) {
+                if (!strncmp(targetTexts[i], "main+", 5)) {
+                    if (!mainBaseResolved) {
+                        Result rc =
+                            debugProcessResolveMainBase(pid, &mainBase);
+                        if (R_FAILED(rc)) {
+                            printf("ERR code=MAIN_BASE_UNAVAILABLE"
+                                " result=0x%X\n", rc);
+                            return 0;
+                        }
+                        mainBaseResolved = true;
+                    }
+                    u64 offset = 0;
+                    if (!tryParseStringToInt(targetTexts[i] + 5,
+                            &offset)) {
+                        printf("ERR code=INVALID_ADDRESS\n");
+                        return 0;
+                    }
+                    addresses[i] = mainBase + offset;
+                } else if (!tryParseStringToInt(targetTexts[i],
+                        &addresses[i])) {
+                    printf("ERR code=INVALID_ADDRESS\n");
+                    return 0;
+                }
+                if ((addresses[i] & 3) != 0) {
+                    printf("ERR code=INVALID_ADDRESS"
+                        " detail=instruction_not_aligned\n");
+                    return 0;
+                }
+                for (u32 prior = 0; prior < i; prior++) {
+                    if (addresses[prior] == addresses[i]) {
+                        printf("ERR code=DUPLICATE_TARGET\n");
+                        return 0;
+                    }
+                }
+            }
+
+            DebugTraceConfig config;
+            memset(&config, 0, sizeof(config));
+            config.processId = pid;
+            config.targetCount = targetCount;
+            memcpy(config.addresses, addresses, sizeof(config.addresses));
+            config.maxHits = maxHits;
+            config.durationSeconds = duration;
+            config.ringSize = ringSize;
+            config.argsCount = argsCount;
+            config.snapshotCount = snapshotCount;
+            memcpy(config.snapshots, snapshots, sizeof(config.snapshots));
+            if (!debugTraceStart(&config)) {
+                DebugTraceStatus status;
+                debugTraceGetStatus(&status);
+                if (status.lastError
+                    == (Result)MAKERESULT(Module_Libnx,
+                        LibnxError_BadInput)) {
+                    printf("ERR code=INVALID_ARGUMENTS result=0x%X\n",
+                        status.lastError);
+                } else {
+                    printf("ERR code=TRACE_BUSY result=0x%X stage=%s\n",
+                        status.lastError, status.stage);
+                }
+                return 0;
+            }
+
+            DebugTraceStatus status;
+            u32 attempts = 0;
+            do {
+                svcSleepThread(100 * 1000 * 1000LL);
+                debugTraceGetStatus(&status);
+            } while (!status.everArmed && status.active
+                && ++attempts < 120);
+            if (!status.everArmed && !status.active
+                && status.lastError != 0) {
+                printf("ERR code=DEBUG_TRACE_START_FAILED result=0x%X"
+                    " stage=%s hint=%s\n",
+                    status.lastError, status.stage, status.hint);
+                return 0;
+            }
+            if (!status.everArmed) {
+                printf("ERR code=DEBUG_TRACE_START_TIMEOUT active=%d"
+                    " stage=%s result=0x%X\n",
+                    status.active, status.stage, status.lastError);
+                debugTraceStop();
+                return 0;
+            }
+            printf("OK state=started active=%d pid=%016lX address=%016lX"
+                " targetCount=%u targets=",
+                status.active, pid, status.address, status.targetCount);
+            for (u32 i = 0; i < status.targetCount; i++) {
+                if (i != 0)
+                    printf(",");
+                printf("%u:0x%lX", i, status.targetAddresses[i]);
+            }
+            printf(" args=%u hits=%u ring=%u duration=%lu"
+                " ctxSlot=%u insnSlot=%u slots=",
+                argsCount, maxHits, ringSize, duration,
+                status.contextSlot, status.instructionSlot);
+            for (u32 i = 0; i < status.targetCount; i++) {
+                if (i != 0)
+                    printf(",");
+                printf("%u", status.instructionSlots[i]);
+            }
+            printf(" snapshots=%u"
+                " dmntClosed=%d lastError=0x%X stage=%s\n",
+                status.snapshotCount, status.dmntClosed,
+                status.lastError, status.stage);
+            return 0;
+        }
+        if (!strcmp(argv[1], "trace-status"))
+        {
+            if (argc != 2) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            DebugTraceStatus status;
+            debugTraceGetStatus(&status);
+            printf("OK active=%d armed=%d everArmed=%d stale=%d memoryBlocked=%d"
+                " dmntClosed=%d pid=%016lX address=%016lX targetCount=%u"
+                " targets=",
+                status.active, status.armed, status.everArmed, status.stale,
+                status.memoryBlocked, status.dmntClosed, status.processId,
+                status.address, status.targetCount);
+            for (u32 i = 0; i < status.targetCount; i++) {
+                if (i != 0)
+                    printf(",");
+                printf("%u:0x%lX", i, status.targetAddresses[i]);
+            }
+            printf(" targetHits=");
+            for (u32 i = 0; i < status.targetCount; i++) {
+                if (i != 0)
+                    printf(",");
+                printf("%u:%u", i, status.targetHits[i]);
+            }
+            printf(" maxHits=%u hitCount=%lu duration=%lu startedTick=%lu"
+                " ring=%u ringCount=%u overwritten=%lu args=%u"
+                " ctxSlot=%u insnSlot=%u lastSeq=%lu"
+                " lastPc=%016lX lastLr=%016lX lastSp=%016lX"
+                " lastThread=%016lX lastCore=%u slots=",
+                status.maxHits, status.hitCount,
+                status.durationSeconds, status.startedTick,
+                status.ringSize, status.ringCount,
+                debugTraceOverwrittenCount(status.hitCount,
+                    status.ringCount),
+                status.argsCount, status.contextSlot,
+                status.instructionSlot, status.lastSequence,
+                status.lastPc, status.lastLr, status.lastSp,
+                status.lastThreadId, status.lastCore);
+            for (u32 i = 0; i < status.targetCount; i++) {
+                if (i != 0)
+                    printf(",");
+                printf("%u", status.instructionSlots[i]);
+            }
+            printf(" ignoredHits=%u snapshots=%u snapSpecs=",
+                status.ignoredHits, status.snapshotCount);
+            for (u32 i = 0; i < status.snapshotCount; i++) {
+                if (i != 0)
+                    printf(",");
+                printf("%u:", i);
+                printTraceSnapshotSpec(&status.snapshots[i]);
+            }
+            printf(" stage=%s lastError=0x%X hint=%s\n",
+                status.stage, status.lastError, status.hint);
+            return 0;
+        }
+        if (!strcmp(argv[1], "trace-read"))
+        {
+            if (argc > 3) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            u64 index = 0;
+            if (argc == 3
+                && (!tryParseStringToInt(argv[2], &index)
+                    || index > DEBUG_TRACE_RING_MAX)) {
+                printf("ERR code=INVALID_INDEX\n");
+                return 0;
+            }
+            DebugTraceEvent event;
+            if (!debugTraceGetEvent((u32)index, &event)) {
+                printf("ERR code=NO_TRACE_EVENT\n");
+                return 0;
+            }
+            printTraceEvent(&event);
+            return 0;
+        }
+        if (!strcmp(argv[1], "trace-stop"))
+        {
+            if (argc != 2) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            debugTraceStop();
+            DebugTraceStatus status;
+            debugTraceGetStatus(&status);
+            if (status.lastError != 0) {
+                printf("ERR code=TRACE_STOP_INCOMPLETE result=0x%X"
+                    " stage=%s hitCount=%lu ringCount=%u\n",
+                    status.lastError, status.stage, status.hitCount,
+                    status.ringCount);
+                return 0;
+            }
+            printf("OK state=stopped hitCount=%lu ringCount=%u"
+                " lastError=0x%X stage=%s\n",
+                status.hitCount, status.ringCount, status.lastError,
+                status.stage);
+            return 0;
+        }
         if (!strcmp(argv[1], "watch"))
         {
             /* debug watch <address|main+offset> [size] [hits N] [duration N] */
@@ -697,17 +1073,27 @@ int argmain(int argc, char** argv)
             DebugWatchStatus status;
             u32 attempts = 0;
             do {
-                svcSleepThread(50 * 1000 * 1000LL);
+                svcSleepThread(100 * 1000 * 1000LL);
                 debugWatchGetStatus(&status);
-            } while (!status.armed && status.active && ++attempts < 20);
-            if (!status.active && status.lastError != 0) {
+            } while (!status.everArmed && status.active
+                && ++attempts < 120);
+            if (!status.everArmed && !status.active
+                && status.lastError != 0) {
                 printf("ERR code=DEBUG_HANDLE_IN_USE result=0x%X stage=%s"
                     " hint=%s\n", status.lastError, status.stage, status.hint);
                 return 0;
             }
-            printf("OK state=started address=%016lX size=%lu hits=%u"
-                " duration=%lu dmntClosed=%d\n", address, size, maxHits,
-                duration, dmntClosed);
+            if (!status.everArmed) {
+                printf("ERR code=DEBUG_WATCH_START_TIMEOUT active=%d"
+                    " stage=%s result=0x%X\n",
+                    status.active, status.stage, status.lastError);
+                debugWatchStop();
+                return 0;
+            }
+            printf("OK state=started active=%d address=%016lX size=%lu"
+                " hits=%u duration=%lu dmntClosed=%d\n",
+                status.active, address, size, maxHits, duration,
+                dmntClosed);
             return 0;
         }
         if (!strcmp(argv[1], "force-close"))
@@ -729,7 +1115,17 @@ int argmain(int argc, char** argv)
                 return 0;
             }
             debugWatchStop();
-            printf("OK state=stopped\n");
+            DebugWatchStatus status;
+            debugWatchGetStatus(&status);
+            if (status.lastError != 0) {
+                printf("ERR code=WATCH_STOP_INCOMPLETE result=0x%X"
+                    " stage=%s hitCount=%u ringCount=%u\n",
+                    status.lastError, status.stage, status.hitCount,
+                    status.ringCount);
+                return 0;
+            }
+            printf("OK state=stopped hitCount=%u ringCount=%u\n",
+                status.hitCount, status.ringCount);
             return 0;
         }
         if (!strcmp(argv[1], "watch-status"))
@@ -740,12 +1136,13 @@ int argmain(int argc, char** argv)
             }
             DebugWatchStatus status;
             debugWatchGetStatus(&status);
-            printf("OK active=%d armed=%d stale=%d memoryBlocked=%d pid=%016lX address=%016lX size=%lu"
+            printf("OK active=%d armed=%d everArmed=%d stale=%d memoryBlocked=%d pid=%016lX address=%016lX size=%lu"
                 " maxHits=%u hitCount=%u ctxSlot=%u wpSlot=%u duration=%lu"
                 " ring=%u ringCount=%u filter=%d"
                 " lastPc=%016lX lastLr=%016lX lastSp=%016lX lastData=%016lX"
                 " lastThread=%016lX stage=%s lastError=0x%X hint=%s\n",
-                status.active, status.armed, status.stale, status.memoryBlocked,
+                status.active, status.armed, status.everArmed,
+                status.stale, status.memoryBlocked,
                 status.processId,
                 status.watchAddress, status.watchSize, status.maxHits,
                 status.hitCount, status.ctxSlot, status.wpSlot,
@@ -1372,7 +1769,13 @@ int argmain(int argc, char** argv)
             processMemoryClose(&session);
         }
         if (R_FAILED(rc)) {
-            printf("ERR code=QUERY_FAILED addr=0x%lX result=0x%X\n", address, rc);
+            if (rc == KERNELRESULT(OwnedByAnotherProcess)) {
+                printf("ERR code=DEBUG_BUSY addr=0x%lX result=0x%X"
+                    " hint=stop_active_watch_or_trace\n", address, rc);
+            } else {
+                printf("ERR code=QUERY_FAILED addr=0x%lX result=0x%X\n",
+                    address, rc);
+            }
             return 0;
         }
         char perm[4] = {
@@ -2403,6 +2806,7 @@ int main()
 
     initFreezes();
     processMemoryInitialize();
+    debugTraceInitialize();
     debugWatchInitialize();
     searchInitialize(searchSdMounted);
     ftpServerInitialize(searchSdMounted);

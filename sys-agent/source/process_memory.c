@@ -3,6 +3,7 @@
 #include "dmnt_client.h"
 #include "process_memory.h"
 #include "process_memory_select.h"
+#include "debug_trace.h"
 #include "debug_watch.h"
 
 static Mutex backendMutex;
@@ -162,7 +163,7 @@ static Result openLocked(ProcessMemorySession* session, ProcessMemoryPolicy poli
     /* A running hardware-watchpoint session owns the single debug handle;
      * reject memory opens so they fail fast with a clear error instead of a
      * conflicting second svcDebugActiveProcess (0xF401). */
-    if (debugWatchIsActive()) {
+    if (debugWatchIsActive() || debugTraceIsActive()) {
         Result rc = KERNELRESULT(OwnedByAnotherProcess);
         recordOpenResult(session, rc);
         if (reportErrors)
