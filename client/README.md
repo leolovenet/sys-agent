@@ -149,6 +149,8 @@ python3 client/sysagent.py debug ipc-decode HEX_BYTES --mode request
 python3 client/sysagent.py --host switch debug trace-plan profile.json
 python3 client/sysagent.py --host switch debug trace-run profile.json \
   --duration 30 --ring 64
+python3 client/sysagent.py --host switch debug trace-run profile.json \
+  --wait-process --output trace.jsonl
 python3 client/sysagent.py debug trace-report trace.jsonl profile.json --json
 python3 client/sysagent.py --host switch debug read 0x71 main+0x1000 4
 ```
@@ -194,6 +196,8 @@ trigger the operation.
 
 Profile v2 adds a consumer-owned symbol-offset table, per-target named/typed snapshots and
 optional `expectBytes` validation through the generic `debug read PID ADDRESS SIZE` command.
+`--wait-process` waits on PM creation hooks before PID/module resolution and arming;
+`debug wait-title` / `debug wait-application` expose the underlying primitives directly.
 
 `trace-ipc` scans trace snapshots for HIPC envelopes containing CMIF `SFCI` or `SFCO`
 headers. It reports the target/thread/sequence, command ID for requests, Result for responses,

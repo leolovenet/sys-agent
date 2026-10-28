@@ -762,6 +762,20 @@ class SysAgentClient:
                 f"debug read returned {len(data)} bytes, expected {size}")
         return data
 
+    def debug_wait_process(self, title_id: int, timeout_ms: int = 60000) -> dict[str, str]:
+        if title_id <= 0 or timeout_ms <= 0:
+            raise ValueError("title ID and timeout must be positive")
+        self.timeout = max(self.timeout, timeout_ms / 1000 + 10)
+        return require_ok(self.command(
+            f"debug wait-title 0x{title_id:X} {timeout_ms}", retry=True))
+
+    def debug_wait_application(self, timeout_ms: int = 60000) -> dict[str, str]:
+        if timeout_ms <= 0:
+            raise ValueError("timeout must be positive")
+        self.timeout = max(self.timeout, timeout_ms / 1000 + 10)
+        return require_ok(self.command(
+            f"debug wait-application {timeout_ms}", retry=True))
+
     def system_action(self, action: str, unlock: bool = True) -> dict[str, str]:
         commands = {
             "reboot": "systemReboot",
@@ -3218,6 +3232,15 @@ def _cmd_debug_read(client: SysAgentClient, args: argparse.Namespace) -> None:
     print(client.debug_read(args.pid, args.address, args.size).hex().upper())
 
 
+def _cmd_debug_wait_title(client: SysAgentClient, args: argparse.Namespace) -> None:
+    _emit(client.debug_wait_process(args.title_id, args.timeout_ms), args)
+
+
+def _cmd_debug_wait_application(client: SysAgentClient,
+                                args: argparse.Namespace) -> None:
+    _emit(client.debug_wait_application(args.timeout_ms), args)
+
+
 def _cmd_system_action(client: SysAgentClient, args: argparse.Namespace) -> None:
     print_fields(client.system_action(args.command, unlock=not args.no_unlock))
 
@@ -4013,6 +4036,23 @@ def _start_plan_trace(client: SysAgentClient, plan: dict[str, object],
     return require_ok(client.command(" ".join(parts)))
 
 
+def _wait_for_profile_processes(client: SysAgentClient,
+                                profile: dict[str, object],
+                                timeout_ms: int) -> None:
+    for raw_process in _profile_list(profile["processes"], "processes"):
+        process = _profile_object(raw_process, "process")
+        if "foreground" in process:
+            if not client.game_status().running:
+                client.debug_wait_application(timeout_ms)
+        elif "titleId" in process:
+            title_id = _profile_hex_id(
+                process["titleId"], "process titleId")
+            try:
+                _find_profile_pid(client, title_id)
+            except SysAgentProtocolError:
+                client.debug_wait_process(title_id, timeout_ms)
+
+
 def _wait_for_plan_trace(client: SysAgentClient, mode: str,
                          timeout_seconds: float) -> dict[str, str]:
     if timeout_seconds <= 0:
@@ -4059,6 +4099,9 @@ def _cmd_debug_trace_plan(client: SysAgentClient,
 def _cmd_debug_trace_run(client: SysAgentClient,
                          args: argparse.Namespace) -> None:
     profile = load_trace_profile(args.profile)
+    if args.wait_process:
+        _wait_for_profile_processes(
+            client, profile, args.wait_process_timeout)
     plan = resolve_trace_profile(client, profile)
     options = _trace_profile_options(profile, args)
     started = _start_plan_trace(client, plan, options)
@@ -4680,6 +4723,13 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                  Arg("snapshots", "capture REG[+/-OFFSET]:SIZE at each hit "
                                   "(for example x1:0x100; max 2)",
                      action="append", default=None, flags=("--snapshot",)),
+                 Arg("wait_process", "wait for profile-selected processes before arming",
+                     action="store_true", default=False,
+                     flags=("--wait-process",)),
+                 Arg("wait_process_timeout",
+                     "per-process creation timeout in milliseconds",
+                     type=parse_int, default=60000,
+                     flags=("--wait-process-timeout",)),
                  Arg("wait", "wait for the trace to finish before returning",
                      action="store_true", default=False, flags=("--wait",)),
                  Arg("wait_timeout", "maximum seconds to wait for completion",
@@ -4752,6 +4802,17 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 (Arg("pid", "target process ID", type=parse_int),
                  Arg("address", "absolute or main+OFFSET address"),
                  Arg("size", "byte count (1..0x1000)", type=parse_int))),
+        Command("wait-title", "Wait for a title process to be created",
+                _cmd_debug_wait_title,
+                (Arg("title_id", "title ID", type=parse_int),
+                 Arg("timeout_ms", "failure timeout in milliseconds",
+                     type=parse_int, nargs="?", default=60000),
+                 JSON_ARG, OUT_ARG)),
+        Command("wait-application", "Wait for an application process to be created",
+                _cmd_debug_wait_application,
+                (Arg("timeout_ms", "failure timeout in milliseconds",
+                     type=parse_int, nargs="?", default=60000),
+                 JSON_ARG, OUT_ARG)),
     )),
 
     CommandGroup("memory", "Read or write process memory", (

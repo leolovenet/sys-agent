@@ -1661,6 +1661,63 @@ int argmain(int argc, char** argv)
             printf("\n");
             return 0;
         }
+        if (!strcmp(argv[1], "wait-title")
+            || !strcmp(argv[1], "wait-application"))
+        {
+            const bool application =
+                !strcmp(argv[1], "wait-application");
+            const int firstArg = 2;
+            const int expectedArgc = application ? 3 : 4;
+            if (argc != expectedArgc) {
+                printf("ERR code=INVALID_ARGUMENTS\n");
+                return 0;
+            }
+            u64 titleId = 0;
+            u64 timeoutMs = 60000;
+            if (!application
+                && (!tryParseStringToInt(argv[firstArg], &titleId)
+                    || titleId == 0)) {
+                printf("ERR code=INVALID_TITLE\n");
+                return 0;
+            }
+            if (!tryParseStringToInt(
+                    argv[application ? firstArg : firstArg + 1],
+                    &timeoutMs)
+                || timeoutMs > 0x7FFFFFFFULL) {
+                printf("ERR code=INVALID_TIMEOUT\n");
+                return 0;
+            }
+
+            Event event;
+            memset(&event, 0, sizeof(event));
+            Result rc = application
+                ? pmdmntHookToCreateApplicationProcess(&event)
+                : pmdmntHookToCreateProcess(&event, titleId);
+            if (R_FAILED(rc)) {
+                printf("ERR code=WAIT_HOOK_FAILED result=0x%X\n", rc);
+                return 0;
+            }
+
+            u64 pid = 0;
+            rc = application
+                ? pmdmntGetApplicationProcessId(&pid)
+                : pmdmntGetProcessId(&pid, titleId);
+            if (R_FAILED(rc) || pid == 0)
+                rc = eventWait(&event, timeoutMs * 1000000ULL);
+            if (R_SUCCEEDED(rc)) {
+                rc = application
+                    ? pmdmntGetApplicationProcessId(&pid)
+                    : pmdmntGetProcessId(&pid, titleId);
+            }
+            pmdmntClearHook(application ? 2 : 1);
+            eventClose(&event);
+            if (R_FAILED(rc) || pid == 0) {
+                printf("ERR code=WAIT_TIMEOUT result=0x%X\n", rc);
+                return 0;
+            }
+            printf("OK pid=%016lX titleId=%016lX waited=1\n", pid, titleId);
+            return 0;
+        }
         if (!strcmp(argv[1], "watch-last"))
         {
             if (argc != 2) {

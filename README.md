@@ -66,7 +66,9 @@ commands should follow this rule:
   pairing profile entry/return targets into transactions; see `docs/trace-profiles.md`.
 - Profile v2 adds per-target named snapshots, consumer-owned symbol offsets and exact
   instruction-byte validation before arming. `debug read PID ADDRESS SIZE` is the generic,
-  transactional primitive used for those checks.
+  transactional primitive used for those checks. `trace-run --wait-process` uses PM creation
+  hooks to resolve and arm a profile after the selected title appears; the underlying
+  `debug wait-title` and `debug wait-application` commands are available independently.
 - Experimental `debug multitrace` holds two debug handles simultaneously with independently
   probed context-IDR slots, allowing up to two instruction targets in each of two processes.
   The optional second target on each side can be the corresponding caller return address,

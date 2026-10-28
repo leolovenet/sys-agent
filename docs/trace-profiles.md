@@ -12,6 +12,8 @@ python3 client/sysagent.py --host switch debug trace-run profile.json \
   --duration 30 --ring 64
 python3 client/sysagent.py --host switch debug trace-run profile.json \
   --wait --output trace.jsonl
+python3 client/sysagent.py --host switch debug trace-run profile.json \
+  --wait-process --wait-process-timeout 60000 --output trace.jsonl
 python3 client/sysagent.py debug trace-report trace.jsonl profile.json --json
 python3 client/sysagent.py --host switch debug read 0x71 main+0x1000 4
 ```
@@ -21,6 +23,12 @@ starts the matching `debug trace` or `debug multitrace` command. Without `--wait
 `--output`, it returns as soon as the hardware breakpoints are armed, so the consumer can
 trigger the target operation. `--output` implies waiting and exports a versioned JSONL file.
 That export is annotated with the profile target IDs, process IDs and original module offsets.
+
+`--wait-process` waits through the generic PM creation hooks before resolving process IDs and
+arming. Foreground selectors use `debug wait-application`; Title ID selectors use
+`debug wait-title`. The timeout is per process. This removes repeated client-side polling, but
+it is still an attach-after-creation primitive: PM exposes the created PID, not an
+instruction-zero suspension point.
 
 `trace-report` uses the module bases recorded in the trace file, not the console's current
 address layout. It verifies each target offset, correlates configured entry/return IDs, and
@@ -191,6 +199,10 @@ python3 client/sysagent.py --host switch debug trace-run profile.json \
 Use this only when the current UI state has already been verified. For interactive work, run
 `trace-run` without `--wait`, perform the action, then use `multitrace-stop`/`trace-stop` and
 the existing dump commands.
+
+`debug wait-title TITLE_ID [TIMEOUT_MS]` and `debug wait-application [TIMEOUT_MS]` are also
+available directly. PM allows one program-ID hook at a time, so profiles that wait for two
+not-yet-running Title IDs wait for them sequentially.
 
 ## Report semantics
 

@@ -6,7 +6,7 @@
 
 - sys-agent 是**通用 Switch 工具箱**(见 README "Project scope and philosophy")。命令保持进程与游戏无关;游戏专属偏移、hook 布局与签名属于消费方项目。
 - `debug patch-code` 是通用事务性代码补丁原语:任意进程(经 `pid=`),载荷 ≤ 1 KiB,pause/verify/write/readback/resume,保证恢复。普通数据 poke 保持不暂停。
-- `debug maps` / `debug threads` / `debug modules` / `debug read` 是通用的任意进程检查原语(内存区域、线程 PC/LR/SP、模块列表、短生命周期原始字节读取);保持与游戏/具体系统服务无关,不要为单一调查加特例。
+- `debug maps` / `debug threads` / `debug modules` / `debug read` / `debug wait-title` / `debug wait-application` 是通用的任意进程检查与生命周期原语;保持与游戏/具体系统服务无关,不要为单一调查加特例。
 - `debug trace` 是通用的任意 PID 硬件执行 tracer:不修改目标代码,单会话最多 4 个目标,记录目标/线程/core/PC/LR/SP/参数/指令、命中时最多 2 个寄存器指针内存快照与固定 ring。命中后必须清除当前执行槽、对命中的线程硬件单步一条指令、恢复执行槽,再继续整个进程;省略这一步会让同一断点原地反复触发,永远到不了后续目标。ring 仍受默认 64 次总命中安全上限约束,只有显式 `hits 0` 才解除;实机表明 4096 次快速命中已足以触发 ACNH watchdog。它只记录显式配置的站点;客户端配对 entry/return 仍是离线分析,不是自动调用栈追踪。游戏偏移仍由消费方提供。
 - `trace-dump` 的版本化 JSONL、`trace-analyze` 与 `trace-diff` 属于客户端离线关联层:只能对已显式记录的站点做同 session/thread 配对,不代表已实现跨进程 IPC 自动追踪。
 - `trace-plan` / `trace-run` / `trace-report` 的 profile 层只做通用进程选择、Title/Build ID 校验、消费方符号表/主模块 offset 解析、每 target 可选命中时内存快照、`expectBytes` 校验和稳定 target ID 映射。`ipc-decode` / `trace-ipc` 只解析 HIPC/CMIF 字节，并按 profile pair 把 request/response 配成 transaction，不内置具体 interface 语义。ACNH、Account、SSL 等具体 offset/profile 必须由消费方提供,不得写入 sysmodule;schema 与限制见 `docs/trace-profiles.md`。

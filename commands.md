@@ -428,6 +428,8 @@ python3 client/sysagent.py --host switch debug trace-run profile.json \
   --duration 30 --ring 64
 python3 client/sysagent.py --host switch debug trace-run profile.json \
   --wait --output trace.jsonl
+python3 client/sysagent.py --host switch debug trace-run profile.json \
+  --wait-process --output trace.jsonl
 python3 client/sysagent.py debug trace-report trace.jsonl profile.json --json
 ```
 
@@ -436,6 +438,12 @@ processes with two targets each. They verify Title ID and Build ID before arming
 offsets against the selected main module, and preserve stable target IDs for entry/return
 correlation. `trace-run` returns immediately after arming unless `--wait` or `--output` is used;
 consumers therefore remain responsible for triggering the game or service operation.
+
+`--wait-process` uses the PM process-creation hook before resolving PIDs, so the profile may
+refer to a title that is not running yet. `--wait-process-timeout` is per process. The same
+primitive is available as `debug wait-title TITLE_ID [TIMEOUT_MS]` and
+`debug wait-application [TIMEOUT_MS]`. This is attach-as-soon-as-created, not an
+instruction-zero loader hook.
 
 The schema, selector rules, target ordering and current limitations are documented in
 `docs/trace-profiles.md`. Profile files belong to the consumer project; sys-agent does not ship

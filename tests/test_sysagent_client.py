@@ -100,6 +100,15 @@ class FakeHandler(socketserver.StreamRequestHandler):
                     response = (
                         f"OK pid={command[2]} address={command[3]} "
                         f"size={command[4]} data=FD7BBFA9")
+                elif command[1] == "wait-title":
+                    state.processes[0x6C] = "010000000000001E"
+                    response = (
+                        f"OK pid=000000000000006C titleId={command[2]} waited=1")
+                elif command[1] == "wait-application":
+                    state.application_running = True
+                    state.processes[0x1234] = "01006F8002326000"
+                    response = (f"OK pid=0000000000001234 "
+                                f"titleId=01006F8002326000 waited=1")
                 elif command[1] == "trace":
                     if state.trace_busy:
                         response = "ERR code=TRACE_BUSY result=0x0 stage="
@@ -788,11 +797,17 @@ class ClientTests(unittest.TestCase):
             run_base = ["--host", "127.0.0.1", "--port",
                         str(self.server.server_address[1]), "--timeout", "1",
                         "debug", "trace-run", profile_path]
-            self.assertEqual(main(run_base), 0)
+            self.server.state.application_running = False
+            self.server.state.processes = {}
+            self.assertEqual(main(run_base + ["--wait-process"]), 0)
             self.assertEqual(self.server.state.last_command[:7], [
                 "debug", "multitrace", "0x1234", "0x290C1BC5C0",
                 "0x6C", "0x30162620", "also"])
             self.assertIn("tsnap=0:x1:0x100", self.server.state.last_command)
+            self.assertIn(["debug", "wait-application", "60000"],
+                          self.server.state.commands)
+            self.assertIn(["debug", "wait-title", "0x10000000000001E", "60000"],
+                          self.server.state.commands)
             trace_output = os.path.join(directory, "profile-trace.jsonl")
             self.assertEqual(main(run_base + ["--output", trace_output]), 0)
             with open(trace_output, encoding="utf-8") as handle:
