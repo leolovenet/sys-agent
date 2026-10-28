@@ -21,7 +21,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.5.0"
+CLIENT_VERSION = "1.6.0"
 TRACE_SCHEMA_VERSION = 1
 TRACE_PROFILE_SCHEMA_VERSION = 1
 
@@ -1813,6 +1813,27 @@ def _profile_offset(value: object, label: str) -> int:
     return parsed
 
 
+def _validate_snapshot_spec(value: str, label: str) -> None:
+    match = re.fullmatch(
+        r"(x(?:[0-9]|[12][0-9]|30)|sp|pc|lr)"
+        r"(?:([+-])(0x[0-9A-Fa-f]+|[0-9]+))?"
+        r":(0x[0-9A-Fa-f]+|[0-9]+)",
+        value)
+    if match is None:
+        raise ValueError(f"{label} has invalid snapshot syntax: {value!r}")
+
+    def parse_number(text: str) -> int:
+        return int(text, 16) if text.lower().startswith("0x") else int(text, 10)
+
+    if match.group(2):
+        magnitude = parse_number(match.group(3))
+        if magnitude > 0x7FFFFFFFFFFFFFFF:
+            raise ValueError(f"{label} snapshot offset is too large")
+    size = parse_number(match.group(4))
+    if not 1 <= size <= 0x100:
+        raise ValueError(f"{label} snapshot size must be in 1..0x100")
+
+
 def load_trace_profile(path: str) -> dict[str, object]:
     """Load and validate a versioned, game-independent execution-trace profile."""
     with open(path, encoding="utf-8") as handle:
@@ -1928,6 +1949,15 @@ def load_trace_profile(path: str) -> dict[str, object]:
                     not isinstance(trace_options[name], int)
                     or trace_options[name] < 0):
                 raise ValueError(f"trace.{name} must be a non-negative integer")
+        snapshots = trace_options.get("snapshots", [])
+        snapshots = _profile_list(snapshots, "trace.snapshots")
+        if len(snapshots) > 2 or any(
+                not isinstance(value, str) or not value for value in snapshots):
+            raise ValueError(
+                "trace.snapshots must contain at most two non-empty strings")
+        for index, snapshot in enumerate(snapshots):
+            _validate_snapshot_spec(
+                str(snapshot), f"trace.snapshots[{index}]")
     return profile
 
 
@@ -2248,6 +2278,321 @@ def _trace_address(value: object) -> int | None:
         return int(str(value), 16)
     except ValueError:
         return None
+
+
+CMIF_IN_HEADER_MAGIC = 0x49434653
+CMIF_OUT_HEADER_MAGIC = 0x4F434653
+
+
+def _read_u32(data: bytes, offset: int, label: str) -> int:
+    if offset < 0 or offset + 4 > len(data):
+        raise SysAgentProtocolError(f"{label} is truncated at offset 0x{offset:X}")
+    return int.from_bytes(data[offset:offset + 4], "little")
+
+
+def _read_u64(data: bytes, offset: int, label: str) -> int:
+    if offset < 0 or offset + 8 > len(data):
+        raise SysAgentProtocolError(f"{label} is truncated at offset 0x{offset:X}")
+    return int.from_bytes(data[offset:offset + 8], "little")
+
+
+def _hipc_static_descriptor(data: bytes, offset: int) -> dict[str, int]:
+    first = _read_u32(data, offset, "HIPC static descriptor")
+    second = _read_u32(data, offset + 4, "HIPC static descriptor")
+    return {
+        "index": first & 0x3F,
+        "address": (
+            second
+            | (((first >> 6) & 0x3F) << 36)
+            | (((first >> 12) & 0xF) << 32)
+        ),
+        "size": (first >> 16) & 0xFFFF,
+    }
+
+
+def _hipc_buffer_descriptor(data: bytes, offset: int) -> dict[str, int]:
+    size_low = _read_u32(data, offset, "HIPC buffer descriptor")
+    address_low = _read_u32(data, offset + 4, "HIPC buffer descriptor")
+    attributes = _read_u32(data, offset + 8, "HIPC buffer descriptor")
+    return {
+        "mode": attributes & 0x3,
+        "address": (
+            address_low
+            | (((attributes >> 28) & 0xF) << 32)
+            | (((attributes >> 2) & 0x3FFFFF) << 36)
+        ),
+        "size": size_low | (((attributes >> 24) & 0xF) << 32),
+    }
+
+
+def decode_hipc_cmif(data: bytes, mode: str = "auto") -> dict[str, object]:
+    """Decode an HIPC request/response containing a CMIF SFCI or SFCO payload."""
+    if mode not in {"auto", "request", "response"}:
+        raise ValueError("HIPC mode must be auto, request or response")
+    if len(data) < 8:
+        raise SysAgentProtocolError("HIPC data is shorter than its header")
+
+    def decode_one(selected_mode: str) -> dict[str, object]:
+        header0 = _read_u32(data, 0, "HIPC header")
+        header1 = _read_u32(data, 4, "HIPC header")
+        metadata = {
+            "type": header0 & 0xFFFF,
+            "sendStatics": (header0 >> 16) & 0xF,
+            "sendBuffers": (header0 >> 20) & 0xF,
+            "receiveBuffers": (header0 >> 24) & 0xF,
+            "exchangeBuffers": (header0 >> 28) & 0xF,
+            "dataWords": header1 & 0x3FF,
+            "receiveStaticMode": (header1 >> 10) & 0xF,
+            "specialHeader": (header1 >> 31) & 1,
+            "copyHandles": 0,
+            "moveHandles": 0,
+            "pid": None,
+        }
+        offset = 8
+        if metadata["specialHeader"]:
+            special = _read_u32(data, offset, "HIPC special header")
+            metadata["copyHandles"] = (special >> 1) & 0xF
+            metadata["moveHandles"] = (special >> 5) & 0xF
+            offset += 4
+            if special & 1:
+                metadata["pid"] = _read_u64(data, offset, "HIPC PID")
+                offset += 8
+
+        handle_bytes = 4 * (
+            int(metadata["copyHandles"]) + int(metadata["moveHandles"]))
+        if offset + handle_bytes > len(data):
+            raise SysAgentProtocolError("HIPC handle area is truncated")
+        offset += handle_bytes
+
+        descriptors: list[dict[str, object]] = []
+        if selected_mode == "request":
+            for name, count, parser, descriptor_size in (
+                    ("sendStatic", int(metadata["sendStatics"]),
+                     _hipc_static_descriptor, 8),
+                    ("sendBuffer", int(metadata["sendBuffers"]),
+                     _hipc_buffer_descriptor, 12),
+                    ("receiveBuffer", int(metadata["receiveBuffers"]),
+                     _hipc_buffer_descriptor, 12),
+                    ("exchangeBuffer", int(metadata["exchangeBuffers"]),
+                     _hipc_buffer_descriptor, 12)):
+                for _ in range(count):
+                    descriptor = parser(data, offset)
+                    descriptor["kind"] = name
+                    descriptors.append(descriptor)
+                    offset += descriptor_size
+        else:
+            for _ in range(int(metadata["sendStatics"])):
+                descriptor = _hipc_static_descriptor(data, offset)
+                descriptor["kind"] = "sendStatic"
+                descriptors.append(descriptor)
+                offset += 8
+
+        data_words_offset = offset
+        data_words_end = data_words_offset + int(metadata["dataWords"]) * 4
+        if data_words_end > len(data):
+            raise SysAgentProtocolError("HIPC data-word area is truncated")
+        cmif_offset = (data_words_offset + 15) & ~15
+        cmif = None
+        for is_domain in (False, True):
+            candidate = cmif_offset + (16 if is_domain else 0)
+            if candidate + 16 > data_words_end:
+                continue
+            magic = _read_u32(data, candidate, "CMIF header")
+            expected = (
+                CMIF_IN_HEADER_MAGIC if selected_mode == "request"
+                else CMIF_OUT_HEADER_MAGIC)
+            if magic != expected:
+                continue
+            if is_domain:
+                domain_offset = cmif_offset
+                domain = {
+                    "type": data[domain_offset],
+                    "numInObjects": data[domain_offset + 1]
+                    if selected_mode == "request" else None,
+                    "dataSize": int.from_bytes(
+                        data[domain_offset + 2:domain_offset + 4], "little")
+                    if selected_mode == "request" else None,
+                    "objectId": _read_u32(
+                        data, domain_offset + 4, "CMIF domain header")
+                    if selected_mode == "request" else None,
+                    "token": _read_u32(
+                        data, domain_offset + 12, "CMIF domain header")
+                    if selected_mode == "request" else None,
+                }
+                if selected_mode == "response":
+                    domain["numOutObjects"] = _read_u32(
+                        data, domain_offset, "CMIF domain header")
+            else:
+                domain = None
+            payload_offset = candidate + 16
+            header = {
+                "magic": f"{magic:08X}",
+                "version": _read_u32(data, candidate + 4, "CMIF header"),
+            }
+            if selected_mode == "request":
+                header["commandId"] = _read_u32(
+                    data, candidate + 8, "CMIF header")
+                header["token"] = _read_u32(
+                    data, candidate + 12, "CMIF header")
+            else:
+                header["result"] = f"0x{_read_u32(data, candidate + 8, 'CMIF header'):X}"
+                header["token"] = _read_u32(
+                    data, candidate + 12, "CMIF header")
+            cmif = {
+                "mode": selected_mode,
+                "domain": is_domain,
+                "domainHeader": domain,
+                "header": header,
+                "payloadOffset": payload_offset,
+                "payloadHex": data[payload_offset:data_words_end].hex().upper(),
+            }
+            break
+        if cmif is None:
+            raise SysAgentProtocolError(
+                f"HIPC data does not contain a CMIF {selected_mode} header")
+        return {
+            "hipc": {
+                **metadata,
+                "dataWordsOffset": data_words_offset,
+                "dataWordsHex": data[
+                    data_words_offset:data_words_end].hex().upper(),
+                "descriptors": descriptors,
+            },
+            "cmif": cmif,
+        }
+
+    modes = ("request", "response") if mode == "auto" else (mode,)
+    errors: list[str] = []
+    for selected_mode in modes:
+        try:
+            return decode_one(selected_mode)
+        except SysAgentProtocolError as error:
+            errors.append(str(error))
+    raise SysAgentProtocolError("; ".join(errors))
+
+
+def decode_trace_ipc(documents: Sequence[dict[str, object]],
+                     snapshot_index: int | None = None
+                     ) -> dict[str, object]:
+    """Decode CMIF/HIPC snapshots embedded in versioned trace events."""
+    records: list[dict[str, object]] = []
+    transactions: list[dict[str, object]] = []
+    skipped = 0
+    pending_requests: dict[
+        tuple[str, str, str, str], list[dict[str, object]]] = {}
+    unmatched_responses = 0
+    for document in documents:
+        metadata = _profile_object(document.get("metadata"), "trace metadata")
+        session_id = str(metadata.get("sessionId", document.get("path", "")))
+        targets = metadata.get("targets")
+        target_metadata = {
+            str(target.get("index")): target
+            for target in targets
+            if isinstance(target, dict)
+        } if isinstance(targets, list) else {}
+        profile = metadata.get("profile")
+        profile = profile if isinstance(profile, dict) else {}
+        pair_for_target: dict[str, tuple[str, str]] = {}
+        for pair in profile.get("pairs", []):
+            if not isinstance(pair, dict):
+                continue
+            entry_id = str(pair.get("entry", ""))
+            return_id = str(pair.get("return", ""))
+            if entry_id:
+                pair_for_target[entry_id] = (entry_id, return_id)
+            if return_id:
+                pair_for_target[return_id] = (entry_id, return_id)
+        events = document.get("events")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            snapshot_count = parse_int(str(event.get("snapshots", "0")))
+            indexes = (
+                (snapshot_index,) if snapshot_index is not None
+                else tuple(range(snapshot_count)))
+            for index in indexes:
+                if not 0 <= index < 2:
+                    raise ValueError("snapshot index must be 0 or 1")
+                encoded = event.get(f"snap{index}Data")
+                if not isinstance(encoded, str) or not encoded:
+                    skipped += 1
+                    continue
+                try:
+                    decoded = decode_hipc_cmif(
+                        bytes.fromhex(encoded), mode="auto")
+                except (ValueError, SysAgentProtocolError):
+                    skipped += 1
+                    continue
+                target_index = str(event.get("target", "0"))
+                target = target_metadata.get(target_index, {})
+                record = {
+                    "sessionId": session_id,
+                    "seq": event.get("seq"),
+                    "tick": event.get("tick"),
+                    "thread": event.get("thread"),
+                    "target": target_index,
+                    "targetAddress": event.get("targetAddress"),
+                    "targetId": target.get("id") if isinstance(target, dict) else None,
+                    "snapshot": index,
+                    "snapshotAddress": event.get(f"snap{index}Address"),
+                    **decoded,
+                }
+                records.append(record)
+                target_id = record.get("targetId")
+                pair = pair_for_target.get(str(target_id))
+                cmif = record["cmif"]
+                assert isinstance(cmif, dict)
+                if pair is not None:
+                    entry_id, return_id = pair
+                    key = (session_id, str(event.get("thread", "0")),
+                        entry_id, return_id)
+                    if target_id == entry_id and cmif["mode"] == "request":
+                        pending_requests.setdefault(key, []).append(record)
+                    elif target_id == return_id and cmif["mode"] == "response":
+                        requests = pending_requests.get(key)
+                        if requests:
+                            request = requests.pop(0)
+                            request_cmif = request["cmif"]
+                            assert isinstance(request_cmif, dict)
+                            request_header = request_cmif["header"]
+                            response_header = cmif["header"]
+                            assert isinstance(request_header, dict)
+                            assert isinstance(response_header, dict)
+                            transactions.append({
+                                "sessionId": session_id,
+                                "thread": event.get("thread"),
+                                "entryTarget": entry_id,
+                                "returnTarget": return_id,
+                                "requestSeq": request.get("seq"),
+                                "returnSeq": record.get("seq"),
+                                "requestTick": request.get("tick"),
+                                "returnTick": record.get("tick"),
+                                "commandId": request_header.get("commandId"),
+                                "requestToken": request_header.get("token"),
+                                "responseToken": response_header.get("token"),
+                                "result": response_header.get("result"),
+                                "requestSnapshot": request.get("snapshot"),
+                                "responseSnapshot": record.get("snapshot"),
+                            })
+                        else:
+                            unmatched_responses += 1
+    unmatched_requests = sum(
+        len(requests) for requests in pending_requests.values())
+    return {
+        "schemaVersion": TRACE_SCHEMA_VERSION,
+        "records": records,
+        "transactions": transactions,
+        "summary": {
+            "traceCount": len(documents),
+            "ipcCount": len(records),
+            "transactionCount": len(transactions),
+            "unmatchedRequests": unmatched_requests,
+            "unmatchedResponses": unmatched_responses,
+            "skippedSnapshots": skipped,
+        },
+    }
 
 
 def analyze_trace_documents(
@@ -3136,6 +3481,41 @@ def _write_versioned_trace(output: str, metadata: dict[str, object],
             handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
+def _annotate_trace_with_plan(output: str, plan: dict[str, object]) -> None:
+    document = load_trace_jsonl([output])[0]
+    metadata = _profile_object(document.get("metadata"), "trace metadata")
+    targets = metadata.get("targets")
+    if not isinstance(targets, list):
+        raise SysAgentProtocolError("trace metadata has no targets")
+    plan_targets = {
+        int(target["index"]): target
+        for target in (
+            _profile_object(value, "plan target")
+            for value in _profile_list(plan["targets"], "plan targets")
+        )
+    }
+    for raw_target in targets:
+        if not isinstance(raw_target, dict):
+            continue
+        plan_target = plan_targets.get(int(raw_target.get("index", -1)))
+        if plan_target is not None:
+            raw_target.update({
+                "id": plan_target["id"],
+                "processId": plan_target["processId"],
+                "offset": plan_target["offset"],
+                "mapping": plan_target["mapping"],
+            })
+    metadata["profile"] = {
+        "schemaVersion": plan["schemaVersion"],
+        "name": plan["profile"],
+        "pairs": plan.get("pairs", []),
+    }
+    events = document.get("events")
+    if not isinstance(events, list):
+        raise SysAgentProtocolError("trace document has no events")
+    _write_versioned_trace(output, metadata, events)
+
+
 def _export_single_trace(client: SysAgentClient,
                          output: str) -> tuple[int, str]:
     client.timeout = max(client.timeout, 30.0)
@@ -3216,6 +3596,9 @@ def _cmd_debug_multitrace(client: SysAgentClient, args: argparse.Namespace) -> N
         raise ValueError("duration must be non-negative")
     if args.args is not None and not 0 <= args.args <= 8:
         raise ValueError("args must be in 0..8")
+    snapshots = args.snapshots or []
+    if len(snapshots) > 2:
+        raise ValueError("at most two --snapshot specifications are supported")
     client.timeout = max(client.timeout, 30.0)
     parts = [
         "debug", "multitrace",
@@ -3232,6 +3615,8 @@ def _cmd_debug_multitrace(client: SysAgentClient, args: argparse.Namespace) -> N
         parts.extend(("duration", str(args.duration)))
     if args.args is not None:
         parts.extend(("args", str(args.args)))
+    for snapshot in snapshots:
+        parts.append(f"snap={snapshot}")
     _emit(require_ok(client.command(" ".join(parts))), args)
 
 
@@ -3329,7 +3714,7 @@ def _cmd_debug_multitrace_dump(client: SysAgentClient,
 
 
 def _trace_profile_options(profile: dict[str, object],
-                           args: argparse.Namespace) -> dict[str, int | None]:
+                           args: argparse.Namespace) -> dict[str, object]:
     configured = profile.get("trace", {})
     configured = configured if isinstance(configured, dict) else {}
     options = {
@@ -3351,12 +3736,24 @@ def _trace_profile_options(profile: dict[str, object],
         raise ValueError("duration must be non-negative")
     if options["args"] is not None and not 0 <= int(options["args"]) <= 8:
         raise ValueError("args must be in 0..8")
-    return {name: (int(value) if value is not None else None)
-            for name, value in options.items()}
+    parsed_options: dict[str, object] = {
+        name: (int(value) if value is not None else None)
+        for name, value in options.items()
+    }
+    snapshots = getattr(args, "snapshots", None)
+    if snapshots is None:
+        snapshots = configured.get("snapshots", [])
+    if not isinstance(snapshots, list) or len(snapshots) > 2 or any(
+            not isinstance(value, str) or not value for value in snapshots):
+        raise ValueError("snapshots must contain at most two non-empty strings")
+    for index, snapshot in enumerate(snapshots):
+        _validate_snapshot_spec(str(snapshot), f"snapshots[{index}]")
+    parsed_options["snapshots"] = snapshots
+    return parsed_options
 
 
 def _start_plan_trace(client: SysAgentClient, plan: dict[str, object],
-                      options: dict[str, int | None]) -> dict[str, str]:
+                      options: dict[str, object]) -> dict[str, str]:
     processes = _profile_list(plan["processes"], "plan processes")
     targets = _profile_list(plan["targets"], "plan targets")
     parts: list[str]
@@ -3387,6 +3784,8 @@ def _start_plan_trace(client: SysAgentClient, plan: dict[str, object],
         value = options.get(name)
         if value is not None:
             parts.extend((name, str(value)))
+    for snapshot in options.get("snapshots", []):
+        parts.append(f"snap={snapshot}")
     client.timeout = max(client.timeout, 30.0)
     return require_ok(client.command(" ".join(parts)))
 
@@ -3445,7 +3844,8 @@ def _cmd_debug_trace_run(client: SysAgentClient,
         return
 
     duration = options.get("duration")
-    default_wait = 90.0 if duration is None else max(30.0, duration + 15.0)
+    default_wait = (
+        90.0 if duration is None else max(30.0, float(duration) + 15.0))
     wait_timeout = args.wait_timeout if args.wait_timeout is not None else default_wait
     status = _wait_for_plan_trace(client, str(plan["mode"]), wait_timeout)
     output_path = args.output
@@ -3454,6 +3854,7 @@ def _cmd_debug_trace_run(client: SysAgentClient,
             event_count, session_id = _export_single_trace(client, output_path)
         else:
             event_count, session_id = _export_multitrace(client, output_path)
+        _annotate_trace_with_plan(output_path, plan)
     else:
         event_count = parse_int(status.get("hitCount", "0"))
         session_id = ""
@@ -3506,6 +3907,66 @@ def _cmd_debug_trace_report(client: SysAgentClient,
             print(
                 f"  thread={call['thread']} entrySeq={call['entrySeq']} "
                 f"returnSeq={call['returnSeq']} x0={call['returnX0']}")
+
+
+def _cmd_debug_ipc_decode(client: SysAgentClient,
+                          args: argparse.Namespace) -> None:
+    del client
+    decoded = decode_hipc_cmif(args.data, args.mode)
+    cmif = decoded["cmif"]
+    assert isinstance(cmif, dict)
+    header = cmif["header"]
+    assert isinstance(header, dict)
+    if args.json or args.out:
+        _emit(decoded, args)
+        return
+    print(
+        f"mode={cmif['mode']} domain={int(bool(cmif['domain']))} "
+        f"magic={header['magic']} token={header['token']}")
+    if "commandId" in header:
+        print(f"command={header['commandId']}")
+    else:
+        print(f"result={header['result']}")
+    print(f"payload={cmif['payloadHex']}")
+
+
+def _cmd_debug_trace_ipc(client: SysAgentClient,
+                         args: argparse.Namespace) -> None:
+    del client
+    if args.snapshot not in (None, 0, 1):
+        raise ValueError("snapshot index must be 0 or 1")
+    documents = load_trace_jsonl(args.traces)
+    report = decode_trace_ipc(documents, args.snapshot)
+    if args.json or args.out:
+        _emit(report, args)
+        return
+    summary = report["summary"]
+    assert isinstance(summary, dict)
+    print(
+        f"ipc={summary['ipcCount']} transactions={summary['transactionCount']} "
+        f"skippedSnapshots={summary['skippedSnapshots']}")
+    for record in report["records"]:
+        assert isinstance(record, dict)
+        cmif = record["cmif"]
+        assert isinstance(cmif, dict)
+        header = cmif["header"]
+        assert isinstance(header, dict)
+        detail = (
+            f"command={header['commandId']}"
+            if "commandId" in header else f"result={header['result']}")
+        print(
+            f"  seq={record['seq']} target={record['target']} "
+            f"targetId={record['targetId']} "
+            f"thread={record['thread']} snapshot={record['snapshot']} "
+            f"mode={cmif['mode']} domain={int(bool(cmif['domain']))} "
+            f"token={header['token']} {detail}")
+    for transaction in report["transactions"]:
+        assert isinstance(transaction, dict)
+        print(
+            f"  transaction seq={transaction['requestSeq']}->{transaction['returnSeq']} "
+            f"thread={transaction['thread']} "
+            f"target={transaction['entryTarget']}->{transaction['returnTarget']} "
+            f"command={transaction['commandId']} result={transaction['result']}")
 
 
 def _cmd_debug_trace_analyze(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -3946,6 +4407,9 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      type=parse_int, default=None, flags=("--duration",)),
                  Arg("args", "capture x0 through x(N-1), N=0..8",
                      type=parse_int, default=None, flags=("--args",)),
+                 Arg("snapshots", "capture REG[+/-OFFSET]:SIZE at each hit "
+                                  "(for example x1:0x100; max 2)",
+                     action="append", default=None, flags=("--snapshot",)),
                  JSON_ARG, OUT_ARG),
                 "\n".join((
                     "Experimental: assigns one runtime-probed context slot to each process",
@@ -3986,6 +4450,9 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      type=parse_int, default=None, flags=("--duration",)),
                  Arg("args", "capture x0 through x(N-1), N=0..8",
                      type=parse_int, default=None, flags=("--args",)),
+                 Arg("snapshots", "capture REG[+/-OFFSET]:SIZE at each hit "
+                                  "(for example x1:0x100; max 2)",
+                     action="append", default=None, flags=("--snapshot",)),
                  Arg("wait", "wait for the trace to finish before returning",
                      action="store_true", default=False, flags=("--wait",)),
                  Arg("wait_timeout", "maximum seconds to wait for completion",
@@ -4007,6 +4474,28 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                     "Matches profile offsets against the module bases recorded in",
                     "the trace, reports entry/return pairs and identifies each call's",
                     "return-time x0 plus the first non-zero x0.",
+                ))),
+        Command("ipc-decode", "Decode an HIPC message containing CMIF headers",
+                _cmd_debug_ipc_decode,
+                (Arg("data", "raw HIPC message bytes as hex", type=parse_pattern),
+                 Arg("mode", "message direction (default: auto-detect)",
+                     choices=("auto", "request", "response"), default="auto",
+                     flags=("--mode",)),
+                 JSON_ARG, OUT_ARG),
+                "\n".join((
+                    "Parses HIPC metadata, descriptors, CMIF SFCI/SFCO headers,",
+                    "domain headers, token, command ID or response Result, and payload.",
+                ))),
+        Command("trace-ipc", "Decode CMIF/HIPC snapshots in trace JSONL",
+                _cmd_debug_trace_ipc,
+                (Arg("traces", "versioned trace JSONL files", nargs="+",
+                     metavar="TRACE"),
+                 Arg("snapshot", "only inspect snapshot 0 or 1",
+                     type=parse_int, default=None, flags=("--snapshot",)),
+                 JSON_ARG, OUT_ARG),
+                "\n".join((
+                    "Scans captured snapshots and reports every CMIF request or",
+                    "response with its trace seq/target/thread and decoded header.",
                 ))),
         Command("trace-dump", "Write retained trace events to a JSONL file",
                 _cmd_debug_trace_dump,

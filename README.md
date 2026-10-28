@@ -59,14 +59,17 @@ commands should follow this rule:
   exposes `trace-status` / `trace-read` / `trace-stop`, and never modifies target instructions.
   The client `trace-dump` writes versioned JSONL with session metadata; `trace-analyze` and
   `trace-diff` summarize, pair explicit entry/return sites and compare A/B captures.
-  Versioned trace profiles resolve foreground/title-ID process selectors, verify Build ID and
-  emit `trace-plan` / `trace-run` / `trace-report` workflows without embedding game offsets in
-  the sysmodule; see `docs/trace-profiles.md`.
+  Versioned trace profiles resolve foreground/title-ID process selectors, verify Build ID,
+  capture optional register-pointer snapshots and emit `trace-plan` / `trace-run` /
+  `trace-report` workflows without embedding game offsets in the sysmodule. The client decodes
+  captured HIPC envelopes and CMIF request/response headers with `ipc-decode` / `trace-ipc`,
+  pairing profile entry/return targets into transactions; see `docs/trace-profiles.md`.
 - Experimental `debug multitrace` holds two debug handles simultaneously with independently
   probed context-IDR slots, allowing up to two instruction targets in each of two processes.
   The optional second target on each side can be the corresponding caller return address,
-  yielding a real return-time `x0` without patching code. It remains a generic hardware-event
-  prototype rather than an IPC-aware tracer.
+  yielding a real return-time `x0` without patching code. Register-pointer snapshots can capture
+  the HIPC message buffer for offline CMIF decoding. It remains a generic hardware-event tracer
+  rather than an in-kernel IPC parser.
 - Verified memory access: `poke*Verified` writes and reads the range back, reporting
   `WRITE_FAILED`, `READBACK_FAILED`, or `WRITE_VERIFY_FAILED` distinctly; `peek*Verified`
   reads twice and retries until two reads agree, so zero data and a failed read are

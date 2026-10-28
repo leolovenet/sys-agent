@@ -19,6 +19,7 @@ python3 client/sysagent.py debug trace-report trace.jsonl profile.json --json
 starts the matching `debug trace` or `debug multitrace` command. Without `--wait` or
 `--output`, it returns as soon as the hardware breakpoints are armed, so the consumer can
 trigger the target operation. `--output` implies waiting and exports a versioned JSONL file.
+That export is annotated with the profile target IDs, process IDs and original module offsets.
 
 `trace-report` uses the module bases recorded in the trace file, not the console's current
 address layout. It verifies each target offset, correlates configured entry/return IDs, and
@@ -62,7 +63,8 @@ marks each return-time `x0` as zero or non-zero.
     "hits": 64,
     "ring": 64,
     "duration": 30,
-    "args": 8
+    "args": 8,
+    "snapshots": ["x1:0x100"]
   }
 }
 ```
@@ -109,12 +111,19 @@ For a single process, profile declaration order is the trace target order.
 
 ### Trace options
 
-The optional `trace` object supplies defaults for `hits`, `ring`, `duration` and `args`.
-Command-line options override them. The sysmodule's normal safety rules still apply:
+The optional `trace` object supplies defaults for `hits`, `ring`, `duration`, `args` and
+`snapshots`. Command-line options override them. The sysmodule's normal safety rules still
+apply:
 
 - `hits 0` requires a ring;
 - ring size is 1 through 64;
 - captured arguments are limited to `x0` through `x7`.
+- snapshot specifications use `REG[+/-OFFSET]:SIZE`, are limited to two entries and may read at
+  most 0x100 bytes per snapshot.
+
+Snapshots are captured for every profile target with the same register-relative rule. For a
+typical HIPC boundary, `"snapshots": ["x1:0x100"]` captures the message buffer referenced by
+the first argument after the service object.
 
 ## Triggering while armed
 
@@ -149,12 +158,32 @@ The generic client does not assume that every `x0` is an `nn::Result`. A consume
 a real Result return can interpret the non-zero `x0` as a candidate Result; a normal function
 may return a pointer or another integer instead.
 
+## HIPC and CMIF decoding
+
+```bash
+python3 client/sysagent.py debug ipc-decode HEX_BYTES --mode request
+python3 client/sysagent.py debug trace-ipc trace.jsonl --json
+```
+
+The decoder accepts a captured HIPC message beginning with its normal header. It handles the
+special header and optional PID, copy/move handles, request static and buffer descriptors,
+response statics, data-word alignment, CMIF domain wrappers and `SFCI`/`SFCO` headers.
+
+Decoded request headers contain `commandId` and `token`; response headers contain `result` and
+`token`. `trace-ipc` scans all snapshot slots in one or more trace files and skips snapshots
+that do not contain a valid CMIF header. The decoder intentionally does not claim that a
+Command ID has a particular service-specific meaning.
+
+For trace files produced by `trace-run --output`, the embedded profile pairs let `trace-ipc`
+combine matching request and response records into transactions. Each transaction reports the
+request/return sequences and ticks, thread, target IDs, Command ID, both tokens and the
+response Result. Unmatched requests and responses are counted separately.
+
 ## Current limits
 
-- Profiles do not yet include CMIF/HIPC interface hashes or command IDs.
+- Profiles capture HIPC/CMIF bytes but do not yet assign interface hashes or semantic names to
+  Command IDs.
 - Dual-process profiles currently use two targets per process because that is the sysmodule's
   four-register multitrace layout.
-- Memory snapshots are available only through the existing single-process `debug trace`
-  command, not through profile v1.
 - Process identification is based on the currently running title table; boot-time tracing
   before a process starts remains a separate feature.

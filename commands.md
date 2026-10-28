@@ -382,7 +382,8 @@ instructions in each of two processes at the same time:
 
 ```text
 debug multitrace PID1 TARGET1 PID2 TARGET2 \
-    [also TARGET1B TARGET2B] [hits N] [ring N] [duration N] [args N]
+    [also TARGET1B TARGET2B] [hits N] [ring N] [duration N] [args N] \
+    [snap=SPEC] [snap=SPEC]
 debug multitrace-status
 debug multitrace-read 0
 debug multitrace-stop
@@ -403,9 +404,12 @@ is normally context `4,5` and instruction slots `0,1,2,3`. Target indices `0,1` 
 site for processes 0 and 1; indices `2,3` are their second sites. Events otherwise match the
 single-process trace field set.
 
-The ring and hit limit are shared across both processes. A process exit stops the whole session.
-This prototype does not capture memory snapshots and does not understand CMIF/HIPC operations;
-it provides generic synchronous two-process observation only. Memory commands remain blocked
+The ring and hit limit are shared across both processes. Each target hit can capture up to two
+register-pointer memory snapshots; use `snap=...` in the wire protocol or `--snapshot` in the
+Python client. Frame counters and descriptor contents are not interpreted by the sysmodule.
+A capture of the HIPC message buffer can be decoded offline with `debug ipc-decode` or
+`debug trace-ipc`; this provides generic synchronous observation, not kernel-side CMIF
+semantics. Memory commands remain blocked
 while it is active, and both context registers, every armed instruction register and both debug
 handles are released on stop/error. `multitrace-status.ignoredHits` counts
 hardware-instruction events that did not match a configured address or arrived on the wrong
@@ -433,6 +437,20 @@ consumers therefore remain responsible for triggering the game or service operat
 The schema, selector rules, target ordering and current limitations are documented in
 `docs/trace-profiles.md`. Profile files belong to the consumer project; sys-agent does not ship
 game-specific offsets.
+
+### HIPC and CMIF decoding
+
+```bash
+python3 client/sysagent.py debug ipc-decode HEX_BYTES --mode request
+python3 client/sysagent.py debug trace-ipc trace.jsonl --snapshot 0 --json
+```
+
+`ipc-decode` parses the HIPC header, special header, handles, static/buffer descriptors,
+CMIF domain header and the `SFCI`/`SFCO` four-word header. Requests expose `commandId` and
+`token`; responses expose `result` and `token`. `trace-ipc` scans trace snapshots and emits the
+same decoded structure plus event seq/target/thread. If the trace has profile pair metadata,
+it also correlates request and response records into transactions. These commands interpret
+raw protocol bytes only and do not assign service-specific meanings to Command IDs.
 
 The same ownership rules as `debug watch` apply. For the foreground application, an existing
 `dmnt:cht` handle is closed when necessary and later memory commands reattach it. A trace of a

@@ -684,11 +684,12 @@ class ClientTests(unittest.TestCase):
             "multitrace", "0x71", "main+0x10", "0x85", "0x2000",
             "--extra-target1", "main+0x20",
             "--extra-target2", "main+0x30",
-            "--ring", "8", "--duration", "30", "--args", "4"]), 0)
+            "--ring", "8", "--duration", "30", "--args", "4",
+            "--snapshot", "x1:0x100"]), 0)
         self.assertEqual(self.server.state.last_command, [
             "debug", "multitrace", "0x71", "main+0x10", "0x85", "0x2000",
             "also", "main+0x20", "main+0x30",
-            "ring", "8", "duration", "30", "args", "4"])
+            "ring", "8", "duration", "30", "args", "4", "snap=x1:0x100"])
         self.assertEqual(main(base + [
             "multitrace", "0x71", "0x10", "0x85", "0x20",
             "--extra-target1", "0x30"]), 2)
@@ -751,7 +752,13 @@ class ClientTests(unittest.TestCase):
                 {"entry": "client-entry", "return": "client-return"},
                 {"entry": "server-entry", "return": "server-return"},
             ],
-            "trace": {"hits": 16, "ring": 16, "duration": 20, "args": 8},
+            "trace": {
+                "hits": 16,
+                "ring": 16,
+                "duration": 20,
+                "args": 8,
+                "snapshots": ["x1:0x100"],
+            },
         }
         with tempfile.TemporaryDirectory() as directory:
             profile_path = os.path.join(directory, "profile.json")
@@ -781,10 +788,16 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(self.server.state.last_command[:7], [
                 "debug", "multitrace", "0x1234", "0x290C1BC5C0",
                 "0x6C", "0x30162620", "also"])
+            self.assertIn("snap=x1:0x100", self.server.state.last_command)
             trace_output = os.path.join(directory, "profile-trace.jsonl")
             self.assertEqual(main(run_base + ["--output", trace_output]), 0)
             with open(trace_output, encoding="utf-8") as handle:
-                self.assertEqual(json.loads(handle.readline())["kind"], "multitrace")
+                exported_metadata = json.loads(handle.readline())
+            self.assertEqual(exported_metadata["kind"], "multitrace")
+            self.assertEqual(exported_metadata["targets"][0]["id"], "client-entry")
+            self.assertEqual(
+                exported_metadata["profile"]["name"],
+                "client-server-entry-return")
 
             client_process = {
                 "pid": "0000000000001234",
@@ -866,6 +879,106 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(self.server.state.last_command[:6], [
                 "debug", "trace", "0x290C1BC5C0", "0x290C1BC5C4",
                 "0x290C1BC5C8", "pid=0x1234"])
+
+    def test_hipc_cmif_decode_and_trace_scan(self) -> None:
+        import json
+        import tempfile
+        from client.sysagent import (decode_hipc_cmif, decode_trace_ipc,
+                                     load_trace_jsonl, main)
+
+        request = bytearray(40)
+        request[0:4] = (4).to_bytes(4, "little")
+        request[4:8] = (8).to_bytes(4, "little")
+        request[16:32] = b"".join((
+            (0x49434653).to_bytes(4, "little"),
+            (0).to_bytes(4, "little"),
+            (8).to_bytes(4, "little"),
+            (0xDEADBEEF).to_bytes(4, "little"),
+        ))
+        decoded_request = decode_hipc_cmif(bytes(request))
+        self.assertEqual(decoded_request["cmif"]["mode"], "request")
+        self.assertEqual(decoded_request["cmif"]["header"]["commandId"], 8)
+        self.assertEqual(decoded_request["cmif"]["header"]["token"], 0xDEADBEEF)
+
+        response = bytearray(request)
+        response[16:20] = (0x4F434653).to_bytes(4, "little")
+        response[24:28] = (0x167B).to_bytes(4, "little")
+        decoded_response = decode_hipc_cmif(bytes(response))
+        self.assertEqual(decoded_response["cmif"]["mode"], "response")
+        self.assertEqual(decoded_response["cmif"]["header"]["result"], "0x167B")
+
+        metadata = {
+            "record": "meta",
+            "schemaVersion": 1,
+            "sessionId": "ipc-test",
+            "profile": {
+                "name": "ipc-pair",
+                "pairs": [{
+                    "entry": "account-entry",
+                    "return": "account-return",
+                }],
+            },
+            "targets": [
+                {
+                    "index": 0,
+                    "id": "account-entry",
+                    "process": {"pid": "000000000000006C"},
+                },
+                {
+                    "index": 1,
+                    "id": "account-return",
+                    "process": {"pid": "000000000000006C"},
+                },
+            ],
+        }
+        request_event = {
+            "record": "event",
+            "schemaVersion": 1,
+            "seq": "1",
+            "tick": "100",
+            "thread": "AA",
+            "target": "0",
+            "targetAddress": "0000000000001000",
+            "snapshots": "1",
+            "snap0Address": "0000000000002000",
+            "snap0Data": request.hex().upper(),
+        }
+        response_event = {
+            **request_event,
+            "seq": "2",
+            "tick": "200",
+            "target": "1",
+            "targetAddress": "0000000000001004",
+            "snap0Address": "0000000000002000",
+            "snap0Data": response.hex().upper(),
+        }
+        report = decode_trace_ipc([{
+            "metadata": metadata,
+            "events": [request_event, response_event],
+            "path": "trace.jsonl",
+        }])
+        self.assertEqual(report["summary"]["ipcCount"], 2)
+        self.assertEqual(report["summary"]["transactionCount"], 1)
+        self.assertEqual(report["records"][0]["targetId"], "account-entry")
+        self.assertEqual(report["transactions"][0]["commandId"], 8)
+        self.assertEqual(report["transactions"][0]["result"], "0x167B")
+
+        with tempfile.TemporaryDirectory() as directory:
+            trace_path = os.path.join(directory, "trace.jsonl")
+            with open(trace_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(metadata) + "\n")
+                handle.write(json.dumps(request_event) + "\n")
+                handle.write(json.dumps(response_event) + "\n")
+            report = decode_trace_ipc(load_trace_jsonl([trace_path]))
+            self.assertEqual(report["records"][0]["cmif"]["header"]["commandId"], 8)
+            self.assertEqual(main([
+                "--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1",
+                "debug", "ipc-decode", request.hex()]), 0)
+            self.assertEqual(main([
+                "--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1",
+                "debug", "trace-ipc", trace_path]), 0)
 
     def test_trace_analyze_and_diff(self) -> None:
         import json

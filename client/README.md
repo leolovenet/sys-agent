@@ -41,8 +41,8 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.5.0
-sys-agent 2.18.0  (switch:6000)
+client    1.6.0
+sys-agent 2.19.0  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
@@ -138,12 +138,14 @@ python3 client/sysagent.py --host switch debug trace-dump --output trace.jsonl
 python3 client/sysagent.py --host switch debug multitrace \
   0x71 main+0x1000 0x85 main+0x2000 \
   --extra-target1 main+0x1010 --extra-target2 main+0x2010 \
-  --ring 64 --duration 30
+  --ring 64 --duration 30 --snapshot x1:0x100
 python3 client/sysagent.py --host switch debug multitrace-status
 python3 client/sysagent.py --host switch debug multitrace-dump --output multi.jsonl
 python3 client/sysagent.py debug trace-analyze trace.jsonl \
   --pair 0x...:0x... --json
 python3 client/sysagent.py debug trace-diff before.jsonl after.jsonl
+python3 client/sysagent.py debug trace-ipc trace.jsonl --json
+python3 client/sysagent.py debug ipc-decode HEX_BYTES --mode request
 python3 client/sysagent.py --host switch debug trace-plan profile.json
 python3 client/sysagent.py --host switch debug trace-run profile.json \
   --duration 30 --ring 64
@@ -170,12 +172,14 @@ session and thread; the return event's `x0` is reported as the candidate Result.
 are directly comparable when captured in the same boot, because ordering uses the device system
 tick. `trace-diff` compares event, process, thread and target counts between an A/B pair.
 
-`debug multitrace` is the experimental two-process client for sysmodule `2.18.0+`. It assigns
+`debug multitrace` is the experimental two-process client for sysmodule `2.19.0+`. It assigns
 one instruction target to each explicitly supplied PID, using runtime-probed context and
 instruction slots. `--extra-target1` and `--extra-target2` add one more target to each side;
 use them together to observe client/server entry and caller-return sites in one session. The
 return event's `x0` is the actual function Result when the runtime function returns through
 that address.
+`--snapshot` may be repeated up to twice and captures memory relative to a register at every
+hit. A typical HIPC boundary uses `--snapshot x1:0x100`.
 `multitrace-dump` writes the same versioned JSONL schema with a `targets[]` process table, so
 `trace-analyze` attributes each event to the correct PID by target index.
 
@@ -185,6 +189,12 @@ PID, verify title/Build IDs, resolve main-module offsets, and retain stable targ
 entry/return reporting. `trace-run --output FILE` waits for completion and exports JSONL;
 without that option it returns immediately after the breakpoints are armed so the caller can
 trigger the operation.
+
+`trace-ipc` scans trace snapshots for HIPC envelopes containing CMIF `SFCI` or `SFCO`
+headers. It reports the target/thread/sequence, command ID for requests, Result for responses,
+token, domain metadata and payload. When the trace metadata contains profile pairs, matching
+request/response records are also emitted as transactions. `ipc-decode` applies the same parser
+to one raw hex message.
 
 ## Controller
 

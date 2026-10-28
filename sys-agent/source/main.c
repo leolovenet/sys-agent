@@ -31,7 +31,7 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.18.0"
+#define VERSION_S "2.19.0"
 
 typedef enum {
     Active = 0,
@@ -708,6 +708,8 @@ int argmain(int argc, char** argv)
             config.maxHits = 1;
             config.durationSeconds = 60;
             config.argsCount = DEBUG_TRACE_ARGS_MAX;
+            DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX] = { 0 };
+            u32 snapshotCount = 0;
             bool hitsSpecified = false;
             int index = 6;
             if (index < argc && !strcmp(argv[index], "also")) {
@@ -775,6 +777,15 @@ int argmain(int argc, char** argv)
                     }
                     config.argsCount = (u32)parsed;
                     index += 2;
+                } else if (!strncmp(argv[index], "snap=", 5)) {
+                    if (snapshotCount >= DEBUG_TRACE_SNAPSHOT_MAX
+                        || !debugTraceParseSnapshotSpec(
+                            argv[index] + 5, &snapshots[snapshotCount])) {
+                        printf("ERR code=INVALID_SNAPSHOT\n");
+                        return 0;
+                    }
+                    snapshotCount++;
+                    index++;
                 } else {
                     printf("ERR code=INVALID_ARGUMENTS\n");
                     return 0;
@@ -787,6 +798,8 @@ int argmain(int argc, char** argv)
                     " detail=unlimited_requires_ring\n");
                 return 0;
             }
+            config.snapshotCount = snapshotCount;
+            memcpy(config.snapshots, snapshots, sizeof(snapshots));
             if (!debugMultiTraceStart(&config)) {
                 DebugMultiTraceStatus status;
                 debugMultiTraceGetStatus(&status);
@@ -813,14 +826,14 @@ int argmain(int argc, char** argv)
                 " targetCount=%u"
                 " target2=%016lX target3=%016lX"
                 " targetProcesses=0,1,0,1"
-                " hits=%u ring=%u duration=%lu args=%u"
+                " hits=%u ring=%u duration=%lu args=%u snapshots=%u"
                 " ctx=%u,%u slots=%u,%u,%u,%u\n",
                 status.active, status.processIds[0], status.addresses[0],
                 status.processIds[1], status.addresses[1],
                 status.targetCount, status.addresses[2],
                 status.addresses[3],
                 config.maxHits, config.ringSize, config.durationSeconds,
-                config.argsCount, status.contextSlots[0],
+                config.argsCount, status.snapshotCount, status.contextSlots[0],
                 status.contextSlots[1], status.instructionSlots[0],
                 status.instructionSlots[1], status.instructionSlots[2],
                 status.instructionSlots[3]);
@@ -841,11 +854,7 @@ int argmain(int argc, char** argv)
                 " target2=%016lX target3=%016lX"
                 " targetProcesses=0,1,0,1 hits2=%u,%u"
                 " hitCount=%lu maxHits=%u ring=%u ringCount=%u"
-                " duration=%lu startedTick=%lu args=%u ignoredHits=%u"
-                " ctx=%u,%u slots=%u,%u,%u,%u lastSeq=%lu"
-                " lastPc=%016lX lastLr=%016lX lastSp=%016lX"
-                " lastThread=%016lX lastCore=%u"
-                " stage=%s lastError=0x%X\n",
+                " duration=%lu startedTick=%lu args=%u snapshots=%u snapSpecs=",
                 status.active, status.armed, status.everArmed,
                 status.stale, status.memoryBlocked,
                 status.processIds[0], status.addresses[0],
@@ -856,7 +865,20 @@ int argmain(int argc, char** argv)
                 status.targetHits[2], status.targetHits[3],
                 status.hitCount, status.maxHits, status.ringSize,
                 status.ringCount, status.durationSeconds,
-                status.startedTick, status.argsCount, status.ignoredHits,
+                status.startedTick, status.argsCount, status.snapshotCount);
+            for (u32 i = 0; i < status.snapshotCount
+                && i < DEBUG_TRACE_SNAPSHOT_MAX; i++) {
+                if (i != 0)
+                    printf(",");
+                printf("%u:", i);
+                printTraceSnapshotSpec(&status.snapshots[i]);
+            }
+            printf(" ignoredHits=%u"
+                " ctx=%u,%u slots=%u,%u,%u,%u lastSeq=%lu"
+                " lastPc=%016lX lastLr=%016lX lastSp=%016lX"
+                " lastThread=%016lX lastCore=%u"
+                " stage=%s lastError=0x%X\n",
+                status.ignoredHits,
                 status.contextSlots[0], status.contextSlots[1],
                 status.instructionSlots[0], status.instructionSlots[1],
                 status.instructionSlots[2], status.instructionSlots[3],

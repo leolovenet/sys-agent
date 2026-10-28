@@ -37,6 +37,8 @@ typedef struct {
     u32 ringCount;
     u32 ringNext;
     u32 argsCount;
+    u32 snapshotCount;
+    DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX];
     u32 ignoredHits;
     u64 lastSequence;
     u64 lastPc;
@@ -149,6 +151,7 @@ static Result drainInitialEvents(Handle debugHandle, bool* processExited)
 
 static void captureEvent(Handle debugHandle, const DebugEventInfo* event,
     u32 targetIndex, u64 targetAddress, u32 argsCount,
+    const DebugTraceSnapshotSpec* snapshots, u32 snapshotCount,
     DebugTraceEvent* out)
 {
     memset(out, 0, sizeof(*out));
@@ -158,14 +161,20 @@ static void captureEvent(Handle debugHandle, const DebugEventInfo* event,
     out->targetAddress = targetAddress;
     out->tick = armGetSystemTick();
     out->argsCount = argsCount;
+    out->snapshotCount = snapshotCount;
 
     ThreadContext context;
     Result contextRc = svcGetDebugThreadContext(&context, debugHandle,
         event->thread_id, RegisterGroup_CpuAll);
     out->contextResult = (u32)contextRc;
     if (R_SUCCEEDED(contextRc)) {
+        u64 gprs[31];
         for (u32 i = 0; i < DEBUG_TRACE_ARGS_MAX && i < 29; i++)
             out->x[i] = context.cpu_gprs[i].x;
+        for (u32 i = 0; i < 29; i++)
+            gprs[i] = context.cpu_gprs[i].x;
+        gprs[29] = context.fp;
+        gprs[30] = context.lr;
         out->lr = context.lr;
         out->sp = context.sp;
         out->pc = context.pc.x;
@@ -173,6 +182,27 @@ static void captureEvent(Handle debugHandle, const DebugEventInfo* event,
             && R_SUCCEEDED(svcReadDebugProcessMemory(out->insn, debugHandle,
                 out->pc, sizeof(out->insn))))
             out->insnBytes = sizeof(out->insn);
+
+        for (u32 i = 0; i < snapshotCount
+            && i < DEBUG_TRACE_SNAPSHOT_MAX; i++) {
+            u64 address = 0;
+            if (!debugTraceComputeSnapshotAddress(&snapshots[i], gprs,
+                    context.sp, context.pc.x, context.lr, &address)) {
+                out->snapshotResults[i] =
+                    (u32)MAKERESULT(Module_Libnx, LibnxError_BadInput);
+                continue;
+            }
+            out->snapshotAddresses[i] = address;
+            Result readRc = svcReadDebugProcessMemory(out->snapshots[i],
+                debugHandle, address, snapshots[i].size);
+            out->snapshotResults[i] = (u32)readRc;
+            if (R_SUCCEEDED(readRc))
+                out->snapshotBytes[i] = snapshots[i].size;
+        }
+    } else {
+        for (u32 i = 0; i < snapshotCount
+            && i < DEBUG_TRACE_SNAPSHOT_MAX; i++)
+            out->snapshotResults[i] = (u32)contextRc;
     }
 
     u64 coreValue = 0;
@@ -234,6 +264,8 @@ static void multiTraceThreadMain(void* arg)
     u32 targetProcesses[DEBUG_MULTITRACE_TARGET_MAX];
     u32 targetCount = 0;
     u32 argsCount = 0;
+    u32 snapshotCount = 0;
+    DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX];
     u32 context1 = 0;
     u32 context2 = 0;
     u32 slots[DEBUG_MULTITRACE_TARGET_MAX] = { 0, 0, 0, 0 };
@@ -245,6 +277,8 @@ static void multiTraceThreadMain(void* arg)
         sizeof(targetProcesses));
     targetCount = multiState.targetCount;
     argsCount = multiState.argsCount;
+    snapshotCount = multiState.snapshotCount;
+    memcpy(snapshots, multiState.snapshots, sizeof(snapshots));
     mutexUnlock(&multiState.mutex);
 
     for (u32 i = 0; i < DEBUG_MULTITRACE_PROCESS_COUNT; i++)
@@ -376,7 +410,8 @@ static void multiTraceThreadMain(void* arg)
                     && targetProcesses[targetIndex] == processIndex) {
                     DebugTraceEvent captured;
                     captureEvent(handles[processIndex], &event, targetIndex,
-                        addresses[targetIndex], argsCount, &captured);
+                        addresses[targetIndex], argsCount, snapshots,
+                        snapshotCount, &captured);
                     recordEvent(&captured);
                     if (hitLimitReached()) {
                         mutexLock(&multiState.mutex);
@@ -468,10 +503,18 @@ bool debugMultiTraceStart(const DebugMultiTraceConfig* config)
         || config->targetCount > DEBUG_MULTITRACE_TARGET_MAX
         || (config->maxHits == 0 && config->ringSize == 0)
         || config->ringSize > DEBUG_TRACE_RING_MAX
-        || config->argsCount > DEBUG_TRACE_ARGS_MAX) {
+        || config->argsCount > DEBUG_TRACE_ARGS_MAX
+        || config->snapshotCount > DEBUG_TRACE_SNAPSHOT_MAX) {
         setError("invalid", MAKERESULT(Module_Libnx,
             LibnxError_BadInput));
         return false;
+    }
+    for (u32 i = 0; i < config->snapshotCount; i++) {
+        if (!debugTraceSnapshotSpecIsValid(&config->snapshots[i])) {
+            setError("invalidSnapshot", MAKERESULT(Module_Libnx,
+                LibnxError_BadInput));
+            return false;
+        }
     }
     bool processRepresented[DEBUG_MULTITRACE_PROCESS_COUNT] = {
         false, false,
@@ -538,6 +581,9 @@ bool debugMultiTraceStart(const DebugMultiTraceConfig* config)
     multiState.ringCount = 0;
     multiState.ringNext = 0;
     multiState.argsCount = config->argsCount;
+    multiState.snapshotCount = config->snapshotCount;
+    memcpy(multiState.snapshots, config->snapshots,
+        sizeof(multiState.snapshots));
     multiState.ignoredHits = 0;
     multiState.hasEvent = false;
     multiState.lastSequence = 0;
@@ -626,6 +672,9 @@ bool debugMultiTraceGetStatus(DebugMultiTraceStatus* out)
     out->ringSize = multiState.ringSize;
     out->ringCount = multiState.ringCount;
     out->argsCount = multiState.argsCount;
+    out->snapshotCount = multiState.snapshotCount;
+    memcpy(out->snapshots, multiState.snapshots,
+        sizeof(out->snapshots));
     out->ignoredHits = multiState.ignoredHits;
     out->lastSequence = multiState.lastSequence;
     out->lastPc = multiState.lastPc;
