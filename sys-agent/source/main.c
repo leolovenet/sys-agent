@@ -24,7 +24,9 @@
 #include "sequence_repeat.h"
 #include "dmnt_client.h"
 #include "ftp_server.h"
+#include "network_http.h"
 #include "system_commands.h"
+#include "sys_agent_version.h"
 #include "boot_unlock.h"
 #include <poll.h>
 #include <switch/runtime/devices/fs_dev.h>
@@ -32,7 +34,6 @@
 #define TITLE_ID 0x43000000000000A6
 #define HEAP_SIZE 0x00480000
 #define THREAD_SIZE 0x1A000
-#define VERSION_S "2.16.1"
 
 typedef enum {
     Active = 0,
@@ -2878,7 +2879,7 @@ int argmain(int argc, char** argv)
     }
 
     if (!strcmp(argv[0], "getVersion")) {
-        printf("%s\n", VERSION_S);
+        printf("%s\n", SYS_AGENT_VERSION);
     }
 
     /* log [count N]: the most recent commands and the first line of each reply,
@@ -3368,9 +3369,11 @@ static void printOperationLog(u32 requested)
 static void dispatchCommand(int clientFd, char* linebuf)
 {
     dup2(clientFd, STDOUT_FILENO);
-    parseArgs(linebuf, &argmain);
-    if (echoCommands)
+    if (echoCommands) {
         printf("%s\n", linebuf);
+        fflush(stdout);
+    }
+    parseArgs(linebuf, &argmain);
     recordOperation(linebuf);
 }
 
@@ -3414,6 +3417,9 @@ int main()
     debugWaitInitialize();
     searchInitialize(searchSdMounted);
     ftpServerInitialize(searchSdMounted);
+    rc = networkHttpInitialize();
+    if (R_FAILED(rc))
+        logDiagnostic("networkHttpInitialize", rc);
 
     // freeze thread
     mutexInit(&freezeMutex);

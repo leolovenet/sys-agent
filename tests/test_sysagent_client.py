@@ -267,6 +267,38 @@ class FakeHandler(socketserver.StreamRequestHandler):
             elif command[0] in {"systemInfo", "systemTime", "powerStatus", "storageStatus",
                                "networkStatus", "networkProfile", "accountStatus"}:
                 response = f"OK command={command[0]} sample=1 errors=field:0x0"
+            elif command[0] == "accountBindings":
+                response = (
+                    "OK count=1 users=0:0123456789ABCDEF:"
+                    "FEDCBA9876543210:414243:1:0:0000000000000001:"
+                    "0000000000000002:0x0:0x0:0x0:0x0:0x0")
+            elif command[0] == "systemSaveDump":
+                response = (
+                    f"OK saveId={command[1]} files=2 bytes=4096 "
+                    "path=sdmc:/switch/sys-agent/backups/test")
+            elif command[0] == "programTerminate":
+                response = f"OK action=terminated-program titleId={command[1]}"
+            elif command[0] == "accountUnlink":
+                response = (
+                    f"OK uid0={command[1]} uid1={command[2]} registered=1 "
+                    "registeredRc=0x0 linked=0 linkedRc=0x0 unlinkRc=0x0")
+            elif command[0] in {"urlReq", "networkPublicIp"}:
+                body = '{"ip":"203.0.113.1","note":"中文"}'.encode("utf-8")
+                url = command[1] if len(command) == 2 else "https://ifconfig.co/json"
+                response = (
+                    f"OK status=200 url={url} bodyLen={len(body)} "
+                    f"body={body.hex().upper()}")
+            elif command[0] == "networkResolve":
+                if command[1] == "missing.example":
+                    response = (
+                        "ERR code=DNS_RESOLVE_FAILED host=missing.example "
+                        "gai=-2 errno=0 resolver=0x0")
+                else:
+                    response = (
+                        f"OK host={command[1]} count=2 "
+                        "addresses=3.169.231.55,3.169.231.56")
+            elif command[0] == "networkHostsReload":
+                response = "OK action=reload-hosts"
             elif command[0] == "applicationStatus":
                 response = (f"OK command=applicationStatus "
                             f"running={1 if state.application_running else 0} "
@@ -586,6 +618,151 @@ class ClientTests(unittest.TestCase):
                 client.process_list(0, 65)
             with self.assertRaises(ValueError):
                 client.system_action("payload")
+
+    def test_account_and_save_maintenance_commands(self) -> None:
+        with self.client() as client:
+            self.assertEqual(client.account_bindings()["count"], "1")
+            self.assertEqual(self.server.state.last_command, ["accountBindings"])
+
+            response = client.system_save_dump(0x8000000000000010, "test")
+            self.assertEqual(response["saveId"], "0x8000000000000010")
+            self.assertEqual(
+                self.server.state.last_command,
+                ["systemSaveDump", "0x8000000000000010", "test"])
+
+            response = client.program_terminate(0x010000000000001E)
+            self.assertEqual(response["titleId"], "0x10000000000001E")
+            self.assertEqual(
+                self.server.state.last_command,
+                ["programTerminate", "0x10000000000001E"])
+
+            response = client.account_unlink(0x0123456789ABCDEF, 0xFEDCBA9876543210)
+            self.assertEqual(response["unlinkRc"], "0x0")
+            self.assertEqual(
+                self.server.state.last_command,
+                ["accountUnlink", "0x123456789ABCDEF", "0xFEDCBA9876543210"])
+
+            with self.assertRaises(ValueError):
+                client.system_save_dump(0, "test")
+            with self.assertRaises(ValueError):
+                client.program_terminate(0)
+            with self.assertRaises(ValueError):
+                client.account_unlink(0, 0)
+
+    def test_url_request_and_required_url(self) -> None:
+        with self.client() as client:
+            response = client.url_request("https://ifconfig.co/json")
+            self.assertEqual(response["ok"], "OK")
+            self.assertEqual(response["status"], "200")
+            self.assertEqual(response["url"], "https://ifconfig.co/json")
+            self.assertEqual(response["bodyLen"], "36")
+            self.assertEqual(
+                bytes.fromhex(response["body"]).decode("utf-8"),
+                '{"ip":"203.0.113.1","note":"中文"}')
+            self.assertEqual(
+                self.server.state.last_command,
+                ["urlReq", "https://ifconfig.co/json"])
+            self.assertEqual(
+                client.url_request("http://example.com/plain")["url"],
+                "http://example.com/plain")
+            self.assertEqual(
+                self.server.state.last_command,
+                ["urlReq", "http://example.com/plain"])
+            with self.assertRaises(ValueError):
+                client.url_request("")
+            with self.assertRaises(ValueError):
+                client.url_request("https://example.com/a b")
+
+        from client.sysagent import build_parser
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["network", "url-req"])
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args([
+                "network", "https-req", "https://ifconfig.co/json"])
+
+    def test_network_resolve(self) -> None:
+        with self.client() as client:
+            response = client.resolve_hostname("example.com")
+            self.assertEqual(response["count"], "2")
+            self.assertEqual(response["addresses"], "3.169.231.55,3.169.231.56")
+            self.assertEqual(
+                self.server.state.last_command,
+                ["networkResolve", "example.com"])
+
+            for hostname in (
+                    "", "https://example.com", "example.com/path",
+                    "example.com?q=1", "exa mple.com", "example..com",
+                    "-example.com", "example-.com", "例え.jp"):
+                with self.subTest(hostname=hostname), self.assertRaises(ValueError):
+                    client.resolve_hostname(hostname)
+
+            with self.assertRaisesRegex(
+                    SysAgentProtocolError, r"DNS_RESOLVE_FAILED.*gai=-2.*errno=0"):
+                client.resolve_hostname("missing.example")
+
+        from client.sysagent import build_parser
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["network", "resolve"])
+
+    def test_network_http_commands_return_protocol_fields(self) -> None:
+        with self.client() as client:
+            response = client.public_ip()
+            self.assertEqual(response["status"], "200")
+            self.assertEqual(response["url"], "https://ifconfig.co/json")
+            self.assertIn("bodyLen", response)
+            self.assertIn("body", response)
+            self.assertEqual(
+                self.server.state.last_command,
+                ["networkPublicIp"])
+
+    def test_network_http_decode_body_cli(self) -> None:
+        import contextlib
+        import io
+        import tempfile
+        from client.sysagent import main
+
+        base = [
+            "--host", "127.0.0.1",
+            "--port", str(self.server.server_address[1]),
+            "--timeout", "1",
+        ]
+        expected = '{"ip":"203.0.113.1","note":"中文"}'
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = main(base + ["network", "public-ip", "--decode-body"])
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue(), expected + "\n")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "body.txt")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(base + [
+                    "network", "url-req", "https://ifconfig.co/json",
+                    "--decode-body", "--out", path,
+                ])
+            self.assertEqual(code, 0)
+            self.assertEqual(output.getvalue().strip(), path)
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), expected)
+
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            code = main(base + [
+                "network", "public-ip", "--decode-body", "--json",
+            ])
+        self.assertEqual(code, 2)
+        self.assertIn("--decode-body cannot be combined with --json", errors.getvalue())
+
+    def test_network_hosts_reload(self) -> None:
+        with self.client() as client:
+            self.assertEqual(
+                client.hosts_reload(),
+                {"ok": "OK", "action": "reload-hosts"})
+            self.assertEqual(
+                self.server.state.last_command,
+                ["networkHostsReload"])
 
     def test_audio_commands(self) -> None:
         with self.client() as client:

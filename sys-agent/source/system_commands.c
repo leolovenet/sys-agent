@@ -1,6 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <errno.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <switch.h>
 #include <switch/runtime/devices/fs_dev.h>
 
@@ -8,6 +15,7 @@
 #include "boot_unlock.h"
 #include "hekate_config.h"
 #include "hekate_reboot.h"
+#include "network_http.h"
 #include "process_memory.h"
 #include "system_commands.h"
 #include "util.h"
@@ -246,6 +254,133 @@ static void networkProfile(void)
     printf(" mtu=%u\n", profile.ip_setting_data.mtu);
 }
 
+static void networkHostsReload(void)
+{
+    Service resolver;
+    Result rc = smGetService(&resolver, "sfdnsres");
+    if (R_FAILED(rc)) {
+        printServiceError("sfdnsres", rc);
+        return;
+    }
+
+    rc = serviceDispatch(&resolver, 65000);
+    serviceClose(&resolver);
+    if (R_FAILED(rc)) {
+        printCommandError("reloadHosts", rc);
+        return;
+    }
+    printf("OK action=reload-hosts\n");
+}
+
+static bool validDnsHostname(const char* hostname)
+{
+    if (!hostname || !*hostname) return false;
+
+    size_t length = strlen(hostname);
+    if (hostname[length - 1] == '.') length--;
+    if (length == 0 || length > 253) return false;
+
+    size_t labelLength = 0;
+    for (size_t i = 0; i < length; i++) {
+        char c = hostname[i];
+        if (c == '.') {
+            if (labelLength == 0 || labelLength > 63) return false;
+            if (hostname[i - labelLength] == '-' || hostname[i - 1] == '-') return false;
+            labelLength = 0;
+            continue;
+        }
+        bool valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '-';
+        if (!valid) return false;
+        labelLength++;
+    }
+    if (labelLength == 0 || labelLength > 63) return false;
+    return hostname[length - labelLength] != '-' && hostname[length - 1] != '-';
+}
+
+static void networkResolve(const char* hostname)
+{
+    if (!validDnsHostname(hostname)) {
+        printf("ERR code=INVALID_ARGUMENTS field=hostname\n");
+        return;
+    }
+
+    struct addrinfo hints = {0};
+    struct addrinfo* addresses = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    errno = 0;
+    int gai = getaddrinfo(hostname, NULL, &hints, &addresses);
+    Result resolverResult = resolverGetLastResult();
+    if (gai != 0) {
+        printf("ERR code=DNS_RESOLVE_FAILED host=%s gai=%d errno=%d resolver=0x%X\n",
+            hostname, gai, errno, resolverResult);
+        return;
+    }
+
+    size_t addressCount = 0;
+    for (struct addrinfo* address = addresses; address; address = address->ai_next) {
+        if (address->ai_family == AF_INET && address->ai_addr
+            && address->ai_addrlen >= sizeof(struct sockaddr_in)) {
+            addressCount++;
+        }
+    }
+    if (addressCount == 0) {
+        freeaddrinfo(addresses);
+        printf("ERR code=DNS_NO_ADDRESS host=%s\n", hostname);
+        return;
+    }
+
+    u32* seen = calloc(addressCount, sizeof(u32));
+    if (!seen) {
+        freeaddrinfo(addresses);
+        printf("ERR code=NO_MEMORY\n");
+        return;
+    }
+
+    size_t uniqueCount = 0;
+    for (struct addrinfo* address = addresses; address; address = address->ai_next) {
+        if (address->ai_family != AF_INET || !address->ai_addr
+            || address->ai_addrlen < sizeof(struct sockaddr_in)) {
+            continue;
+        }
+        u32 ip = ((struct sockaddr_in*)address->ai_addr)->sin_addr.s_addr;
+        bool duplicate = false;
+        for (size_t i = 0; i < uniqueCount; i++) {
+            if (seen[i] == ip) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) seen[uniqueCount++] = ip;
+    }
+
+    printf("OK host=%s count=%zu addresses=", hostname, uniqueCount);
+    for (size_t i = 0; i < uniqueCount; i++) {
+        struct in_addr address = { .s_addr = seen[i] };
+        char text[INET_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &address, text, sizeof(text))) {
+            if (i > 0) printf(",");
+            printf("%s", text);
+        }
+    }
+    printf("\n");
+    free(seen);
+    freeaddrinfo(addresses);
+}
+
+static void submitNetworkRequest(bool publicIpDefault, const char* url)
+{
+    NetworkHttpSubmitResult result = networkHttpSubmit(publicIpDefault, url);
+    if (result == NetworkHttpBusy) {
+        printf("ERR code=NETWORK_BUSY\n");
+    } else if (result == NetworkHttpInvalidUrl) {
+        printf("ERR code=INVALID_URL\n");
+    } else if (result == NetworkHttpUnavailable) {
+        printf("ERR code=NETWORK_UNAVAILABLE\n");
+    }
+}
+
 static void accountStatus(void)
 {
     Result rc = accountInitialize(AccountServiceType_System);
@@ -276,6 +411,307 @@ static void accountStatus(void)
     printf("OK uid0=%016lX uid1=%016lX nicknameLen=%zu nickname=", uid.uid[0], uid.uid[1], nicknameLength);
     printHex(base.nickname, nicknameLength);
     printf("\n");
+}
+
+static Result getBaasAccountAdministrator(AccountUid uid, Service* out)
+{
+    return serviceDispatchIn(accountGetServiceSession(), 250, uid,
+        .out_num_objects = 1,
+        .out_objects = out,
+    );
+}
+
+static Result baasGetBool(Service* service, u32 command, bool* out)
+{
+    u8 value = 0;
+    Result rc = serviceDispatchOut(service, command, value);
+    if (R_SUCCEEDED(rc)) *out = value != 0;
+    return rc;
+}
+
+static Result baasGetU64(Service* service, u32 command, u64* out)
+{
+    return serviceDispatchOut(service, command, *out);
+}
+
+static void accountBindings(void)
+{
+    Result rc = accountInitialize(AccountServiceType_Administrator);
+    if (R_FAILED(rc)) {
+        printServiceError("acc:su", rc);
+        return;
+    }
+
+    AccountUid users[ACC_USER_LIST_SIZE] = {0};
+    s32 total = 0;
+    rc = accountListAllUsers(users, ACC_USER_LIST_SIZE, &total);
+    if (R_FAILED(rc)) {
+        accountExit();
+        printCommandError("listUsers", rc);
+        return;
+    }
+
+    printf("OK count=%d users=", total);
+    for (s32 i = 0; i < total; i++) {
+        AccountProfile profile;
+        AccountProfileBase base = {0};
+        rc = accountGetProfile(&profile, users[i]);
+        if (R_SUCCEEDED(rc)) rc = accountProfileGet(&profile, NULL, &base);
+        if (R_SUCCEEDED(rc)) accountProfileClose(&profile);
+        if (R_FAILED(rc)) {
+            accountExit();
+            printCommandError("getAccountProfile", rc);
+            return;
+        }
+
+        Service baas;
+        bool registered = false, linked = false;
+        u64 accountId = 0, nasId = 0;
+        Result openRc = getBaasAccountAdministrator(users[i], &baas);
+        Result registeredRc = openRc;
+        Result linkedRc = openRc;
+        Result accountIdRc = openRc;
+        Result nasIdRc = openRc;
+        if (R_SUCCEEDED(openRc)) {
+            registeredRc = baasGetBool(&baas, 200, &registered);
+            linkedRc = baasGetBool(&baas, 250, &linked);
+            accountIdRc = baasGetU64(&baas, 1, &accountId);
+            nasIdRc = baasGetU64(&baas, 120, &nasId);
+            serviceClose(&baas);
+        }
+
+        size_t nicknameLength = boundedLength(base.nickname, sizeof(base.nickname));
+        if (i > 0) printf(",");
+        printf("%d:%016lX:%016lX:", i,
+            users[i].uid[0], users[i].uid[1]);
+        printHex(base.nickname, nicknameLength);
+        printf(":%d:%d:%016lX:%016lX:0x%X:0x%X:0x%X:0x%X:0x%X",
+            registered, linked, accountId, nasId,
+            registeredRc, linkedRc, accountIdRc, nasIdRc, openRc);
+    }
+    printf("\n");
+
+    accountExit();
+}
+
+static void accountUnlink(const char* uid0Text, const char* uid1Text)
+{
+    AccountUid uid = {0};
+    if (!tryParseStringToInt(uid0Text, &uid.uid[0])
+        || !tryParseStringToInt(uid1Text, &uid.uid[1])
+        || !accountUidIsValid(&uid)) {
+        printf("ERR code=INVALID_ARGUMENTS\n");
+        return;
+    }
+
+    Result rc = accountInitialize(AccountServiceType_Administrator);
+    if (R_FAILED(rc)) {
+        printServiceError("acc:su", rc);
+        return;
+    }
+
+    Service baas;
+    rc = getBaasAccountAdministrator(uid, &baas);
+    if (R_FAILED(rc)) {
+        accountExit();
+        printCommandError("getBaasAccountAdministrator", rc);
+        return;
+    }
+
+    bool registered = false, linked = false;
+    Result registeredRc = baasGetBool(&baas, 200, &registered);
+    Result linkedRc = baasGetBool(&baas, 250, &linked);
+    Result unlinkRc = serviceDispatch(&baas, 203);
+    serviceClose(&baas);
+    accountExit();
+
+    if (R_FAILED(unlinkRc)) {
+        printf("ERR code=COMMAND_FAILED stage=unlink result=0x%X "
+               "uid0=%016lX uid1=%016lX registered=%d registeredRc=0x%X "
+               "linked=%d linkedRc=0x%X\n",
+            unlinkRc, uid.uid[0], uid.uid[1], registered, registeredRc,
+            linked, linkedRc);
+        return;
+    }
+    printf("OK uid0=%016lX uid1=%016lX registered=%d registeredRc=0x%X "
+           "linked=%d linkedRc=0x%X unlinkRc=0x%X\n",
+        uid.uid[0], uid.uid[1], registered, registeredRc,
+        linked, linkedRc, unlinkRc);
+}
+
+static bool validBackupName(const char* name)
+{
+    size_t length = strlen(name);
+    if (length == 0 || length > 64) return false;
+    for (size_t i = 0; i < length; i++) {
+        char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.')) {
+            return false;
+        }
+    }
+    return strcmp(name, ".") != 0 && strcmp(name, "..") != 0;
+}
+
+static bool copyDirectoryTree(const char* source, const char* destination,
+    size_t depth, u8* buffer, size_t bufferSize, u64* fileCount, u64* byteCount)
+{
+    if (depth > 32) return false;
+    DIR* directory = opendir(source);
+    if (!directory) return false;
+
+    bool ok = true;
+    struct dirent* entry = NULL;
+    while (ok && (entry = readdir(directory)) != NULL) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+
+        char sourcePath[FS_MAX_PATH];
+        char destinationPath[FS_MAX_PATH];
+        int sourceLength = snprintf(sourcePath, sizeof(sourcePath), "%s/%s", source, entry->d_name);
+        int destinationLength = snprintf(destinationPath, sizeof(destinationPath), "%s/%s", destination, entry->d_name);
+        if (sourceLength < 0 || (size_t)sourceLength >= sizeof(sourcePath)
+            || destinationLength < 0 || (size_t)destinationLength >= sizeof(destinationPath)) {
+            ok = false;
+            break;
+        }
+
+        struct stat status;
+        if (stat(sourcePath, &status) != 0) {
+            ok = false;
+            break;
+        }
+        if (S_ISDIR(status.st_mode)) {
+            if (mkdir(destinationPath, 0777) != 0 && errno != EEXIST) {
+                ok = false;
+                break;
+            }
+            ok = copyDirectoryTree(sourcePath, destinationPath, depth + 1,
+                buffer, bufferSize, fileCount, byteCount);
+        } else if (S_ISREG(status.st_mode)) {
+            FILE* input = fopen(sourcePath, "rb");
+            FILE* output = input ? fopen(destinationPath, "wb") : NULL;
+            if (!input || !output) {
+                if (input) fclose(input);
+                if (output) fclose(output);
+                ok = false;
+                break;
+            }
+            size_t readSize;
+            while (ok && (readSize = fread(buffer, 1, bufferSize, input)) != 0) {
+                if (fwrite(buffer, 1, readSize, output) != readSize) {
+                    ok = false;
+                    break;
+                }
+                *byteCount += readSize;
+            }
+            if (ferror(input)) ok = false;
+            if (fclose(output) != 0) ok = false;
+            fclose(input);
+            if (ok) (*fileCount)++;
+        }
+    }
+
+    closedir(directory);
+    return ok;
+}
+
+static void systemSaveDump(const char* saveIdText, const char* name)
+{
+    u64 saveId = 0;
+    if (!tryParseStringToInt(saveIdText, &saveId) || saveId == 0 || !validBackupName(name)) {
+        printf("ERR code=INVALID_ARGUMENTS\n");
+        return;
+    }
+
+    char backupRoot[64];
+    char backupPath[160];
+    snprintf(backupRoot, sizeof(backupRoot), "sdmc:/switch/sys-agent/backups");
+    int backupPathLength = snprintf(backupPath, sizeof(backupPath), "%s/%.64s", backupRoot, name);
+    if (backupPathLength < 0 || (size_t)backupPathLength >= sizeof(backupPath)) {
+        printf("ERR code=INVALID_ARGUMENTS\n");
+        return;
+    }
+    mkdir("sdmc:/switch", 0777);
+    mkdir("sdmc:/switch/sys-agent", 0777);
+    mkdir(backupRoot, 0777);
+    struct stat status;
+    if (stat(backupPath, &status) == 0) {
+        printf("ERR code=ALREADY_EXISTS path=%s\n", backupPath);
+        return;
+    }
+    if (mkdir(backupPath, 0777) != 0) {
+        printf("ERR code=CREATE_DIRECTORY_FAILED path=%s errno=%d\n", backupPath, errno);
+        return;
+    }
+
+    FsSaveDataAttribute attr = {0};
+    attr.system_save_data_id = saveId;
+    attr.save_data_type = FsSaveDataType_System;
+    FsFileSystem save;
+    Result rc = fsOpenReadOnlySaveDataFileSystem(&save, FsSaveDataSpaceId_System, &attr);
+    if (R_FAILED(rc)) {
+        Result readOnlyRc = rc;
+        rc = fsOpenSaveDataFileSystemBySystemSaveDataId(&save, FsSaveDataSpaceId_System, &attr);
+        if (R_FAILED(rc)) {
+            printf("ERR code=OPEN_SYSTEM_SAVE_FAILED saveId=%016lX "
+                   "readOnlyResult=0x%X systemResult=0x%X\n",
+                saveId, readOnlyRc, rc);
+            return;
+        }
+    }
+    if (fsdevMountDevice("syssave", save) < 0) {
+        printf("ERR code=MOUNT_SYSTEM_SAVE_FAILED saveId=%016lX\n", saveId);
+        return;
+    }
+
+    u8* buffer = malloc(64 * 1024);
+    u64 fileCount = 0, byteCount = 0;
+    bool copied = buffer && copyDirectoryTree("syssave:/", backupPath, 0,
+        buffer, 64 * 1024, &fileCount, &byteCount);
+    free(buffer);
+    int unmountRc = fsdevUnmountDevice("syssave");
+    if (!copied) {
+        printf("ERR code=COPY_SYSTEM_SAVE_FAILED path=%s errno=%d\n", backupPath, errno);
+        return;
+    }
+    if (unmountRc < 0) {
+        printf("ERR code=UNMOUNT_FAILED path=%s errno=%d\n", backupPath, errno);
+        return;
+    }
+    Result commitRc = fsdevCommitDevice("sdmc");
+    if (R_FAILED(commitRc)) {
+        printf("ERR code=COMMIT_FAILED stage=save-data result=0x%X path=%s\n",
+            commitRc, backupPath);
+        return;
+    }
+
+    char manifestPath[192];
+    int manifestPathLength = snprintf(manifestPath, sizeof(manifestPath), "%s.manifest.txt", backupPath);
+    if (manifestPathLength < 0 || (size_t)manifestPathLength >= sizeof(manifestPath)) {
+        printf("ERR code=PATH_TOO_LONG\n");
+        return;
+    }
+    FILE* manifest = fopen(manifestPath, "w");
+    if (!manifest) {
+        printf("ERR code=MANIFEST_WRITE_FAILED path=%s errno=%d\n",
+            manifestPath, errno);
+        return;
+    }
+    fprintf(manifest, "systemSaveId=%016lX\nfiles=%lu\nbytes=%lu\npath=%s\n",
+        saveId, fileCount, byteCount, backupPath);
+    if (fclose(manifest) != 0) {
+        printf("ERR code=MANIFEST_WRITE_FAILED path=%s errno=%d\n",
+            manifestPath, errno);
+        return;
+    }
+    commitRc = fsdevCommitDevice("sdmc");
+    if (R_FAILED(commitRc)) {
+        printf("ERR code=COMMIT_FAILED stage=manifest result=0x%X path=%s\n",
+            commitRc, manifestPath);
+        return;
+    }
+    printf("OK saveId=%016lX files=%lu bytes=%lu path=%s\n",
+        saveId, fileCount, byteCount, backupPath);
 }
 
 static bool getApplicationIdentity(u64* pid, u64* titleId)
@@ -578,6 +1014,23 @@ static void applicationTerminate(void)
         return;
     }
     printf("OK action=terminated titleId=%016lX\n", titleId);
+}
+
+static void programTerminate(u64 titleId)
+{
+    Result rc = pmshellInitialize();
+    if (R_FAILED(rc)) {
+        printServiceError("pm:shell", rc);
+        return;
+    }
+    rc = pmshellTerminateProgram(titleId);
+    pmshellExit();
+    if (R_FAILED(rc)) {
+        printCommandError("terminateProgram", rc);
+        return;
+    }
+    printf("OK action=terminated-program titleId=%016lX\n", titleId);
+    fflush(stdout);
 }
 
 static bool parseTitleId(const char* text, u64* titleId)
@@ -1737,6 +2190,10 @@ bool systemCommandsDispatch(int argc, char** argv)
         || !strcmp(command, "systemTime") || !strcmp(command, "powerStatus")
         || !strcmp(command, "storageStatus") || !strcmp(command, "networkStatus")
         || !strcmp(command, "networkProfile") || !strcmp(command, "accountStatus")
+        || !strcmp(command, "networkPublicIp") || !strcmp(command, "urlReq")
+        || !strcmp(command, "networkHostsReload") || !strcmp(command, "networkResolve")
+        || !strcmp(command, "accountBindings") || !strcmp(command, "accountUnlink")
+        || !strcmp(command, "systemSaveDump")
         || !strcmp(command, "applicationStatus") || !strcmp(command, "processList")
         || !strcmp(command, "systemReboot") || !strcmp(command, "systemRebootEmuMMC")
         || !strcmp(command, "systemShutdown")
@@ -1744,6 +2201,7 @@ bool systemCommandsDispatch(int argc, char** argv)
         || !strcmp(command, "lockScreenStatus") || !strcmp(command, "lockScreenSet")
         || !strcmp(command, "bootUnlock")
         || !strcmp(command, "applicationTerminate")
+        || !strcmp(command, "programTerminate")
         || !strcmp(command, "audioVolume") || !strcmp(command, "audioMute")
         || !strcmp(command, "gameLaunchHeadless")
         || !strcmp(command, "gameExternalKeyProbe")
@@ -1766,6 +2224,71 @@ bool systemCommandsDispatch(int argc, char** argv)
             return true;
         }
         gameNcaProbeCommand(argv[1]);
+        return true;
+    }
+    if (!strcmp(command, "accountBindings")) {
+        if (argc != 1) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        accountBindings();
+        return true;
+    }
+    if (!strcmp(command, "networkPublicIp")) {
+        if (argc > 2) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        submitNetworkRequest(true, argc == 2 ? argv[1] : NULL);
+        return true;
+    }
+    if (!strcmp(command, "networkHostsReload")) {
+        if (argc != 1) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        networkHostsReload();
+        return true;
+    }
+    if (!strcmp(command, "networkResolve")) {
+        if (argc != 2) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        networkResolve(argv[1]);
+        return true;
+    }
+    if (!strcmp(command, "urlReq")) {
+        if (argc != 2) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        submitNetworkRequest(false, argv[1]);
+        return true;
+    }
+    if (!strcmp(command, "accountUnlink")) {
+        if (argc != 3) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        accountUnlink(argv[1], argv[2]);
+        return true;
+    }
+    if (!strcmp(command, "systemSaveDump")) {
+        if (argc != 3) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        systemSaveDump(argv[1], argv[2]);
+        return true;
+    }
+    if (!strcmp(command, "programTerminate")) {
+        u64 titleId = 0;
+        if (argc != 2 || !parseTitleId(argv[1], &titleId)) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        programTerminate(titleId);
         return true;
     }
     if (!strcmp(command, "gameNcaDump")) {
@@ -1959,7 +2482,7 @@ bool systemCommandsDispatch(int argc, char** argv)
     }
 
     if (!strcmp(command, "systemCapabilities"))
-        printf("OK version=1 queries=systemInfo,systemTime,powerStatus,storageStatus,networkStatus,networkProfile,accountStatus,applicationStatus,processList,lockScreenStatus actions=systemReboot,systemRebootEmuMMC,systemShutdown,systemSleep,networkSet,lockScreenSet,applicationTerminate bootUnlock=status,arm,disarm,run unlockOnReboot=default,skipWithNoUnlock game=launchHeadless processPageMax=%d audio=volume,mute sensitiveData=serial,account,wifiPassphrase authentication=none sleep=experimental rebootEmuMMCMariko=validated rebootEmuMMCErista=experimental\n", PROCESS_PAGE_MAX);
+        printf("OK version=1 queries=systemInfo,systemTime,powerStatus,storageStatus,networkStatus,networkProfile,networkResolve,networkPublicIp,urlReq,accountStatus,accountBindings,applicationStatus,processList,lockScreenStatus actions=systemReboot,systemRebootEmuMMC,systemShutdown,systemSleep,networkSet,networkHostsReload,lockScreenSet,applicationTerminate,programTerminate,systemSaveDump,accountUnlink bootUnlock=status,arm,disarm,run unlockOnReboot=default,skipWithNoUnlock game=launchHeadless processPageMax=%d audio=volume,mute sensitiveData=serial,account,wifiPassphrase authentication=none sleep=experimental rebootEmuMMCMariko=validated rebootEmuMMCErista=experimental\n", PROCESS_PAGE_MAX);
     else if (!strcmp(command, "systemInfo")) systemInfo();
     else if (!strcmp(command, "systemTime")) systemTimeCommand();
     else if (!strcmp(command, "powerStatus")) powerStatus();

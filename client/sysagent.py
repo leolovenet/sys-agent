@@ -21,7 +21,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.1.1"
+CLIENT_VERSION = "1.2.0"
 TRACE_SCHEMA_VERSION = 1
 TRACE_PROFILE_SCHEMA_VERSION = 2
 TRACE_BOOT_EPOCH_TOLERANCE_MS = 2000
@@ -283,7 +283,8 @@ def require_ok(response: dict[str, str]) -> dict[str, str]:
         code = response.get("code", "UNKNOWN")
         details = ", ".join(
             f"{key}={response[key]}"
-            for key in ("stage", "result", "attempts") if key in response
+            for key in ("stage", "result", "attempts", "host", "gai", "errno", "resolver")
+            if key in response
         )
         suffix = f" ({details})" if details else ""
         raise SysAgentProtocolError(f"sys-agent error: {code}{suffix}{_describe_error(response)}")
@@ -330,6 +331,18 @@ ERROR_CODE_NOTES = {
     "WAIT_HOOK_FAILED": "the PM process-creation hook is unavailable or already in use",
     "PROCESS_START_FAILED": "PM could not release the suspended process",
     "WAIT_TIMEOUT": "the requested process was not created before the timeout",
+    "DNS_RESOLVE_FAILED": "the console resolver could not resolve the hostname",
+    "DNS_NO_ADDRESS": "the hostname resolved without an IPv4 address",
+    "NO_MEMORY": "there was not enough memory to format the response",
+    "NETWORK_BUSY": "another console-side URL request is still running",
+    "NETWORK_UNAVAILABLE": "the console-side network worker is unavailable",
+    "HTTP_TIMEOUT": "the URL request timed out",
+    "HTTP_READ_FAILED": "the HTTP response could not be read",
+    "HTTP_RESPONSE_TOO_LARGE": "the HTTP response exceeded the 32 KiB limit",
+    "SSL_CONTEXT_FAILED": "the console could not create an SSL context",
+    "MANIFEST_WRITE_FAILED": "the save backup copied but its manifest could not be written",
+    "COMMIT_FAILED": "the SD-card writes could not be flushed",
+    "UNMOUNT_FAILED": "the exported System Save filesystem could not be unmounted",
 }
 
 
@@ -346,6 +359,28 @@ def parse_int(value: str) -> int:
         return int(value, 0)
     except ValueError:
         return int(value, 16)
+
+
+def validate_dns_hostname(hostname: str) -> str:
+    """Validate one ASCII DNS hostname suitable for the console resolver."""
+    if not hostname:
+        raise ValueError("hostname must not be empty")
+    try:
+        hostname.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("hostname must contain ASCII characters only") from exc
+
+    name = hostname[:-1] if hostname.endswith(".") else hostname
+    if not name or len(name) > 253:
+        raise ValueError("hostname must contain 1..253 ASCII characters")
+    for label in name.split("."):
+        if not 1 <= len(label) <= 63:
+            raise ValueError("each hostname label must contain 1..63 characters")
+        if label[0] == "-" or label[-1] == "-":
+            raise ValueError("hostname labels must not start or end with '-'")
+        if any(not (character.isalnum() or character == "-") for character in label):
+            raise ValueError("hostname must not contain URL syntax or other punctuation")
+    return hostname
 
 
 def parse_log_line(line: str) -> dict[str, str]:
@@ -734,6 +769,45 @@ class SysAgentClient:
         if name not in queries:
             raise ValueError("unsupported system query")
         return require_ok(self.command(queries[name], retry=True))
+
+    def account_bindings(self) -> dict[str, str]:
+        return require_ok(self.command("accountBindings", retry=True))
+
+    def system_save_dump(self, save_id: int, name: str) -> dict[str, str]:
+        if save_id <= 0 or not name or len(name) > 64:
+            raise ValueError("save ID must be positive and name must be 1..64 characters")
+        return require_ok(self.command(f"systemSaveDump 0x{save_id:X} {name}", retry=False))
+
+    def resolve_hostname(self, hostname: str) -> dict[str, str]:
+        validate_dns_hostname(hostname)
+        return require_ok(self.command(f"networkResolve {hostname}", retry=True))
+
+    def public_ip(self, url: str | None = None) -> dict[str, str]:
+        if url is not None:
+            if not url or any(c.isspace() for c in url):
+                raise ValueError("URL must be a non-empty token without whitespace")
+            command = f"networkPublicIp {url}"
+        else:
+            command = "networkPublicIp"
+        return require_ok(self.command(command, retry=False))
+
+    def url_request(self, url: str) -> dict[str, str]:
+        if not url or any(c.isspace() for c in url):
+            raise ValueError("URL must be a non-empty token without whitespace")
+        return require_ok(self.command(f"urlReq {url}", retry=False))
+
+    def hosts_reload(self) -> dict[str, str]:
+        return require_ok(self.command("networkHostsReload", retry=False))
+
+    def program_terminate(self, title_id: int) -> dict[str, str]:
+        if title_id <= 0:
+            raise ValueError("title ID must be positive")
+        return require_ok(self.command(f"programTerminate 0x{title_id:X}", retry=False))
+
+    def account_unlink(self, uid0: int, uid1: int) -> dict[str, str]:
+        if uid0 < 0 or uid1 < 0 or (uid0 == 0 and uid1 == 0):
+            raise ValueError("account UID must be non-zero")
+        return require_ok(self.command(f"accountUnlink 0x{uid0:X} 0x{uid1:X}", retry=False))
 
     def game_status(self) -> GameStatus:
         """Typed `applicationStatus` (running, bases, build id, name)."""
@@ -1696,6 +1770,37 @@ def _emit(response: dict[str, str], args: argparse.Namespace) -> None:
         print(out)
     else:
         print(payload)
+
+
+def _decoded_network_body(response: dict[str, str]) -> str:
+    try:
+        expected_size = int(response["bodyLen"], 10)
+        body = bytes.fromhex(response["body"])
+    except (KeyError, ValueError) as exc:
+        raise SysAgentProtocolError("invalid HTTP response body fields") from exc
+    if expected_size < 0 or len(body) != expected_size:
+        raise SysAgentProtocolError(
+            f"HTTP body length mismatch: bodyLen={expected_size} decoded={len(body)}")
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SysAgentProtocolError(
+            "HTTP body is not valid UTF-8; use the default hex output") from exc
+
+
+def _emit_network_response(response: dict[str, str], args: argparse.Namespace) -> None:
+    if not getattr(args, "decode_body", False):
+        _emit(response, args)
+        return
+
+    body = _decoded_network_body(response)
+    out = getattr(args, "out", None)
+    if out:
+        with open(out, "w", encoding="utf-8", newline="") as handle:
+            handle.write(body)
+        print(out)
+    else:
+        print(body, end="" if body.endswith("\n") else "\n")
 
 
 def pair_values(values: Sequence[int]) -> list[tuple[int, int]]:
@@ -3879,6 +3984,42 @@ def _cmd_system_query(client: SysAgentClient, args: argparse.Namespace) -> None:
     _emit(client.system_query(args.query), args)
 
 
+def _cmd_account_bindings(client: SysAgentClient, args: argparse.Namespace) -> None:
+    _emit(client.account_bindings(), args)
+
+
+def _cmd_system_save_dump(client: SysAgentClient, args: argparse.Namespace) -> None:
+    _emit(client.system_save_dump(args.save_id, args.name), args)
+
+
+def _cmd_public_ip(client: SysAgentClient, args: argparse.Namespace) -> None:
+    if args.decode_body and args.json:
+        raise ValueError("--decode-body cannot be combined with --json")
+    _emit_network_response(client.public_ip(args.url), args)
+
+
+def _cmd_url_request(client: SysAgentClient, args: argparse.Namespace) -> None:
+    if args.decode_body and args.json:
+        raise ValueError("--decode-body cannot be combined with --json")
+    _emit_network_response(client.url_request(args.url), args)
+
+
+def _cmd_network_resolve(client: SysAgentClient, args: argparse.Namespace) -> None:
+    _emit(client.resolve_hostname(args.hostname), args)
+
+
+def _cmd_hosts_reload(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.hosts_reload())
+
+
+def _cmd_program_terminate(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.program_terminate(args.title_id))
+
+
+def _cmd_account_unlink(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.account_unlink(args.uid0, args.uid1))
+
+
 def _cmd_process_list(client: SysAgentClient, args: argparse.Namespace) -> None:
     print_fields(client.process_list(args.offset, args.count))
 
@@ -5295,6 +5436,9 @@ JSON_ARG = Arg("json", "print the response as JSON", action="store_true",
                default=False, flags=("--json",))
 OUT_ARG = Arg("out", "write the response to this file instead of stdout",
               flags=("--out",), default=None)
+DECODE_BODY_ARG = Arg(
+    "decode_body", "print the decoded UTF-8 response body instead of protocol fields",
+    action="store_true", default=False, flags=("--decode-body",))
 DIFF_ARG = Arg("diff", "compare the capture against this baseline image",
                flags=("--diff",), default=None)
 
@@ -5441,6 +5585,21 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      metavar="QUERY"),
                  JSON_ARG, OUT_ARG),
                 SYSTEM_QUERY_HELP),
+        Command("account-bindings", "List local users and their local BAAS/NAS binding state",
+                _cmd_account_bindings, (JSON_ARG, OUT_ARG)),
+        Command("save-dump", "Export a read-only NAND System Save tree to SD",
+                _cmd_system_save_dump,
+                (Arg("save_id", "System Save Data ID, for example 0x8000000000000010",
+                     type=parse_int),
+                 Arg("name", "new backup name under /switch/sys-agent/backups"),
+                 JSON_ARG, OUT_ARG)),
+        Command("terminate-program", "Terminate one title ID through pmshell",
+                _cmd_program_terminate,
+                (Arg("title_id", "numeric title ID", type=parse_int),)),
+        Command("account-unlink", "Delete one user's local BAAS registration (keeps user/save data)",
+                _cmd_account_unlink,
+                (Arg("uid0", "first 64-bit AccountUid word", type=parse_int),
+                 Arg("uid1", "second 64-bit AccountUid word", type=parse_int))),
         Command("log", "Show recent commands the console received (oldest first)",
                 _cmd_system_log,
                 (Arg("count", "entries to show (1..32; default all)",
@@ -5466,6 +5625,23 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
         Command("lock-screen", "Show or change the lock-screen flag", _cmd_lock_screen,
                 (Arg("state", "status, enabled, or disabled",
                      choices=("status", "enabled", "disabled")),)),
+    )),
+
+    CommandGroup("network", "Resolve names, inspect DNS state, or send requests", (
+        Command("hosts-reload", "Reload Atmosphere's DNS.mitm hosts file",
+                _cmd_hosts_reload),
+        Command("resolve", "Resolve IPv4 addresses for a hostname on the console",
+                _cmd_network_resolve,
+                (Arg("hostname", "DNS hostname without URL scheme or path"),
+                 JSON_ARG, OUT_ARG)),
+        Command("public-ip", "Fetch the console's public IP (default: ifconfig.co/json)",
+                _cmd_public_ip,
+                (Arg("url", "HTTP(S) URL to request instead of the default", nargs="?",
+                     default=None), JSON_ARG, DECODE_BODY_ARG, OUT_ARG)),
+        Command("url-req", "Send a one-shot HTTP(S) GET request from the console",
+                _cmd_url_request,
+                (Arg("url", "HTTP(S) URL (the protocol may be omitted for HTTPS)"),
+                 JSON_ARG, DECODE_BODY_ARG, OUT_ARG)),
     )),
 
     CommandGroup("audio", "Query or control system audio", (

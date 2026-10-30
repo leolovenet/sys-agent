@@ -20,7 +20,15 @@ The system-management protocol is additive and uses single-line `OK key=value` o
 |storageStatus|Reports SD mount state and total/free/used bytes|none|`storageStatus`|
 |networkStatus|Reports link state, signal strength, and current IPv4 configuration|none|`networkStatus`|
 |networkProfile|Reports the current profile, SSID, **Wi-Fi passphrase**, IPv4/DNS settings, and MTU|none|`networkProfile`|
+|networkHostsReload|Asks Atmosphere DNS.mitm to re-read and reparse the active hosts file|none|`networkHostsReload`|
+|networkResolve|Resolves a DNS hostname through the console's normal `getaddrinfo`/`sfdnsres` path and returns deduplicated IPv4 addresses. Resolution failure returns `ERR code=DNS_RESOLVE_FAILED`; a successful lookup without IPv4 returns `ERR code=DNS_NO_ADDRESS`|ASCII hostname without URL syntax|`networkResolve api.hac.lp1.acbaa.srv.nintendo.net`|
 |accountStatus|Reports the last-opened account UID and nickname|none|`accountStatus`|
+|accountBindings|Lists every local user with its AccountUid, nickname, local BAAS registration/link flags, account ID and NAS ID. Read-only.|none|`accountBindings`|
+|networkPublicIp|Starts a one-shot URL request through the console's DNS/TCP/TLS stack and returns `status`, `url`, `bodyLen`, and uppercase-hex `body`. Default URL is `https://ifconfig.co/json`; HTTP and HTTPS are accepted. The request runs outside the command loop|optional URL|`networkPublicIp https://ifconfig.co/json`|
+|urlReq|Starts a one-shot HTTP(S) GET through the console's DNS/TCP/TLS stack and returns `status`, `url`, `bodyLen`, and uppercase-hex `body`. TLS is used for HTTPS, `Connection: close` is sent, and the remote socket is closed as soon as the response is complete. The URL is required|HTTP(S) URL|`urlReq https://ifconfig.co/json`|
+|systemSaveDump|Exports a NAND System Save tree read-only to `/switch/sys-agent/backups/<name>` and writes a sibling manifest|saveIdHex, name|`systemSaveDump 0x8000000000000010 account-before-experiment`|
+|programTerminate|Terminates one exact title ID through `pmshellTerminateProgram`. Intended for controlled maintenance such as releasing Account before a read-only save export|titleId|`programTerminate 0x010000000000001E`|
+|accountUnlink|Calls Account administrator command 203 for one explicit AccountUid. Removes the local BAAS registration only; it does not delete the local user or game saves|uid0Hex, uid1Hex|`accountUnlink 0x100041DC55C84783 0x91C8BA01623FE7A1`|
 |applicationStatus|Reports the current application identity, version, memory bases, Build ID, and name|none|`applicationStatus`|
 |processList|Returns a PID/Title-ID page; count is 1 through 64|offset, count|`processList 0 64`|
 |systemReboot|Requests a normal Atmosphere/Horizon reboot. Arms the boot unlock before rebooting, so the console comes back unlocked; `noUnlock` skips that|`noUnlock` (optional)|`systemReboot` / `systemReboot noUnlock`|

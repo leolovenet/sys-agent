@@ -10,6 +10,7 @@ non-FTP sys-agent command behind grouped subcommands; FTP is intentionally not b
 version   Show the client version and the version the host reports
 backend   Inspect or configure the process-memory backend
 system    Query or control system state
+network   Resolve names, reload DNS hosts, or send requests from the console
 audio     Query or control system audio
 game      Launch, close, or inspect the running game
 debug     Trace instruction entry and inspect arbitrary processes
@@ -41,14 +42,44 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.1.1
-sys-agent 2.16.1  (switch:6000)
+client    1.2.0
+sys-agent 2.17.0  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
 `sys-agent` line is replaced by an error on stderr and the exit status is 2, so `version` doubles
 as a reachability check. `utility version` is unchanged, which keeps scripts that already read the
 console's version working.
+
+## Network
+
+```bash
+python3 client/sysagent.py --host switch network resolve example.com
+python3 client/sysagent.py --host switch network resolve example.com --json
+python3 client/sysagent.py --host switch network hosts-reload
+python3 client/sysagent.py --host switch network public-ip
+python3 client/sysagent.py --host switch network public-ip --decode-body
+python3 client/sysagent.py --host switch network public-ip http://myip.ipip.net
+python3 client/sysagent.py --host switch network url-req https://ifconfig.co/json
+python3 client/sysagent.py --host switch network url-req https://ifconfig.co/json --decode-body
+```
+
+`network resolve` uses the console's normal `getaddrinfo`/`sfdnsres` path and prints its
+deduplicated IPv4 addresses. Resolution failure is an error; the command does not fall back to
+the host's DNS. `network hosts-reload` invokes Atmosphere's `sfdnsres` extension command 65000,
+causing DNS.mitm to re-read the active hosts file without rebooting the console.
+`network url-req` requires the URL argument and accepts both `http://` and `https://`; when the
+protocol is omitted it uses HTTPS. Both request commands run on the console's DNS/TCP/TLS stack
+rather than the host. The sysmodule runs each request in a one-shot background worker, so a slow
+remote server does not block unrelated commands on port 6000; only one URL request can run at a
+time. `public-ip` defaults to `https://ifconfig.co/json`, while `url-req` always requires an
+explicit URL. Request commands return the normal protocol fields
+`status`, `url`, `bodyLen`, and uppercase-hex `body`; use `--json` or `--out` for
+machine-readable output. Add `--decode-body` to print only the UTF-8 response body;
+it can be combined with `--out` but not with `--json`. If the body is not valid UTF-8,
+the client reports an error and leaves the hex form available through the default output.
+URL requests are never retried automatically, so a client timeout cannot silently submit the
+same one-shot request again.
 
 ## Backend
 
@@ -68,6 +99,10 @@ python3 client/sysagent.py --host switch system capabilities
 python3 client/sysagent.py --host switch system query info
 python3 client/sysagent.py --host switch system log --count 8
 python3 client/sysagent.py --host switch system query network
+python3 client/sysagent.py --host switch system account-bindings
+python3 client/sysagent.py --host switch system save-dump 0x8000000000000010 account-before-experiment
+python3 client/sysagent.py --host switch system terminate-program 0x010000000000001E
+python3 client/sysagent.py --host switch system account-unlink 0xUID0 0xUID1
 python3 client/sysagent.py --host switch system process-list --offset 0 --count 64
 python3 client/sysagent.py --host switch system wireless enabled
 python3 client/sysagent.py --host switch system lock-screen status
@@ -79,6 +114,10 @@ python3 client/sysagent.py --host switch system action reboot --no-unlock
 `system query network-profile` returns the Wi-Fi passphrase over an unauthenticated,
 unencrypted TCP connection. Use it only on a trusted isolated network. The client never
 automatically retries reboot, shutdown, sleep, wireless changes, or application termination.
+`system save-dump` copies a System Save read-only to
+`/switch/sys-agent/backups/<name>` and refuses to overwrite an existing backup name.
+`system account-unlink` is an explicit destructive Account administrator operation: it removes
+the local BAAS registration but leaves the local user and game saves. It is never retried.
 
 ## Game
 
