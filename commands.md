@@ -252,7 +252,7 @@ are hidden from `systemCapabilities` and require raw access
 server is mid-transfer or during a C-level search. The rights id must be 16 bytes
 (32 hex digits). See `docs/headless-launch-rights-key-notes.md` for the recovery workflow.
 `gameExternalKeyPrepareCommon` is the headless-launch fix path: the client reads the
-title-key block + keygen from the customized `SDcard/switch/title.keys` line and calls this before
+title-key block + keygen from the customized `~/.switch/title.keys` line and calls this before
 launching, so every boot works without a manual game start.
 
 ## SD card FTP server

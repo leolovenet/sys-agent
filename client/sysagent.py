@@ -21,7 +21,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.2.0"
+CLIENT_VERSION = "1.2.1"
 TRACE_SCHEMA_VERSION = 1
 TRACE_PROFILE_SCHEMA_VERSION = 2
 TRACE_BOOT_EPOCH_TOLERANCE_MS = 2000
@@ -4352,18 +4352,9 @@ def _cmd_game_launch_headless(client: SysAgentClient, args: argparse.Namespace) 
 
 
 def _default_titlekeys_path() -> str | None:
-    """Locate the workspace title.keys mirror for automatic key registration."""
-    # realpath follows PATH symlinks (e.g. ~/bin/sysagent.py), so the
-    # file-relative candidate works regardless of how the client was invoked.
-    client_dir = os.path.dirname(os.path.realpath(__file__))
-    candidates = (
-        os.path.join(os.getcwd(), "SDcard", "switch", "title.keys"),
-        os.path.join(client_dir, "..", "..", "..", "SDcard", "switch", "title.keys"),
-    )
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
-    return None
+    """Return the canonical per-user title.keys path when it exists."""
+    path = os.path.expanduser("~/.switch/title.keys")
+    return path if os.path.isfile(path) else None
 
 
 def _cmd_game_terminate(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -5674,6 +5665,7 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                                   "(rightsId = key, or customized "
                                   "rightsId = title_key_block keygen for "
                                   "per-boot spl:es AccessKey computation); "
+                                  "default: ~/.switch/title.keys; "
                                   "auto-registers before launching",
                      flags=("--titlekeys",), default=None),),
                 "\n".join((

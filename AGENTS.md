@@ -74,7 +74,7 @@ docker run --rm \
 
 ## Headless 启动与 Keys
 
-- `game launch-headless <titleId>`:客户端解析更新的 rights id,读 `SDcard/switch/title.keys` 的自定义行(`rightsId = <title_key_block hex> <keygen>`),请求 sysmodule(`gameExternalKeyPrepareCommon`)经 `spl:es PrepareCommonEsTitleKey` 计算当前启动的 AccessKey 并注册(fsp-srv 607),设置 lr redirect base→patch,启动更新构建(ACNH 3.0.3 已验证,任何启动都不用手动开游戏)。
+- `game launch-headless <titleId>`:客户端解析更新的 rights id,读 `~/.switch/title.keys` 的自定义行(`rightsId = <title_key_block hex> <keygen>`),请求 sysmodule(`gameExternalKeyPrepareCommon`)经 `spl:es PrepareCommonEsTitleKey` 计算当前启动的 AccessKey 并注册(fsp-srv 607),设置 lr redirect base→patch,启动更新构建(ACNH 3.0.3 已验证,任何启动都不用手动开游戏)。
 - block 缺失时用 `gameExternalKeyScan <rightsIdHex> fs` 在游戏运行时扫描 fsp-srv 内存恢复;NPDM 含调试 syscall(`svcDebugActiveProcess` 等),可直接读 fsp-srv/es 内存。
 - 完整机制见 `docs/headless-launch-rights-key-notes.md`(改 launch/keys 前必读)。永不打印 key 值。
 

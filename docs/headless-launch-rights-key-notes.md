@@ -24,7 +24,7 @@
   （`44FDFC7D7F789693C24E5AA64112658E`）**本来就是真实密文**——只是用
   **`titlekek_0a`** 加密的（NCA 头 crypto 字段指向 0x0A），而票上的
   `master_key_revision=0x0B` 把之前所有尝试都带偏到 `titlekek_0b`。
-- 最终修复：客户端从 `SDcard/switch/title.keys` 的定制行
+- 最终修复：客户端从 `~/.switch/title.keys` 的定制行
   `rightsId = block keygen` 读出加密块 + keygen，调用 sys-agent 的
   `gameExternalKeyPrepareCommon`（→ `spl:es PrepareCommonEsTitleKey`）现算
   当前 boot 的 `A_boot` 并注册，然后 headless 启动。
@@ -148,7 +148,7 @@ Atmosphere 的 spl 模块不检查调用者，sys-agent（NPDM service `*`）可
 
 ### 4.2 客户端与 title.keys 定制格式
 
-`SDcard/switch/title.keys` 一行两种格式：
+`~/.switch/title.keys` 一行两种格式：
 
 ```text
 <rights id hex> = <16 字节解密后的 titlekey hex>          # 标准格式（回退用）
@@ -513,7 +513,7 @@ python3 deploy_sysagent.py
 1. 从该 title 的 common 票拿到 `title_key_block`（es16 或 NSP 内 .tik）。
 2. 离线用**全部 titlekek** 试解，并用该 title NCA 的 ExeFS PFS0 窗口做锚点，
    确定正确的 kek 索引 → 得到 `keygen = kek索引 + 1`。
-3. 把 `rightsId = block keygen` 写进 `SDcard/switch/title.keys`（定制格式）。
+3. 把 `rightsId = block keygen` 写进 `~/.switch/title.keys`（定制格式）。
 4. `sysagent.py game launch-headless <titleId>` 即自动可用；用 buildId +
    无 4075 验收。
 
@@ -557,9 +557,9 @@ gameExternalKeyPreparePersonal  # personalized 路径，从未使用、大概率
 ### 根仓库
 
 - `docs/sys-agent-headless-launch-handoff.md`（已删除，内容并入本文）。
-- `SDcard/switch/title.keys`（...0B 行 = 定制格式 block keygen + 头部注释；
+- `~/.switch/title.keys`（...0B 行 = 定制格式 block keygen + 头部注释；
   其余为 Lockpick 原始导出）。
-- `SDcard/switch/prod.keys`、`title.keys` 可进 git（用户已确认）。
+- `prod.keys` 与 `title.keys` 的规范本地位置都在仓外 `~/.switch/`。
 
 ---
 
@@ -580,6 +580,6 @@ gameExternalKeyPreparePersonal  # personalized 路径，从未使用、大概率
 
 - 避免频繁崩溃/死机风险的操作；部署/重启前先说明。
 - 设备上的操作节奏由用户掌控（手动启动/关闭游戏、开关 Docker）。
-- prod.keys 与 title.keys 已加入 git，可随意更改/恢复；key 值不打印进
+- `prod.keys` 与 `title.keys` 均以仓外 `~/.switch/` 为准；key 值不打印进
   对话/文档/日志。
 - 提交仓库需用户明确同意。

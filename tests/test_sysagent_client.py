@@ -2521,6 +2521,33 @@ class ClientTests(unittest.TestCase):
             import os
             os.unlink(path)
 
+    def test_default_titlekeys_path_uses_home_switch_only(self) -> None:
+        import os
+        import tempfile
+        from client.sysagent import _default_titlekeys_path
+
+        with tempfile.TemporaryDirectory() as home:
+            switch = os.path.join(home, ".switch")
+            os.makedirs(switch)
+            titlekeys = os.path.join(switch, "title.keys")
+            with open(titlekeys, "w", encoding="utf-8") as output:
+                output.write("# test fixture\n")
+            with patch.dict(os.environ, {"HOME": home}):
+                self.assertEqual(_default_titlekeys_path(), titlekeys)
+
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            old_dir = os.path.join(cwd, "SDcard", "switch")
+            os.makedirs(old_dir)
+            with open(os.path.join(old_dir, "title.keys"), "w", encoding="utf-8") as output:
+                output.write("# old path must not be used\n")
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(cwd)
+                with patch.dict(os.environ, {"HOME": home}):
+                    self.assertIsNone(_default_titlekeys_path())
+            finally:
+                os.chdir(old_cwd)
+
     def test_game_launch_headless_auto_registers_titlekeys(self) -> None:
         import contextlib
         import io

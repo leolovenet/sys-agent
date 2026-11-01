@@ -154,7 +154,7 @@ second positional argument forces a specific storage:
 
 For updates whose code NCA uses rights-id encryption, `launch-headless` also registers the
 external key before starting: it resolves the update's rights id and looks the rights id up
-in the workspace `SDcard/switch/title.keys` mirror (override with `--titlekeys <path>`).
+in `~/.switch/title.keys` (override with `--titlekeys <path>`).
 Preferred: a customized line `rightsId = <title_key_block hex> <keygen>` — the client asks
 the sysmodule (`gameExternalKeyPrepareCommon`) to compute the current boot's AccessKey via
 `spl:es PrepareCommonEsTitleKey` and register it, reported as
