@@ -440,7 +440,7 @@ static void debugWatchThreadMain(void* arg)
 cleanup:
     if (attached && !processExited) {
         Result quiesceRc =
-            debugHwBpQuiesce(debugHandle, !resumed || eventPending);
+            debugHwBpQuiesce(debugHandle, !resumed || eventPending, NULL);
         if (R_FAILED(quiesceRc))
             cleanupRc = quiesceRc;
     }

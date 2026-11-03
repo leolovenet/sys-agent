@@ -198,16 +198,21 @@ For a single process, profile declaration order is the trace target order.
 ### Trace options
 
 The optional `trace` object supplies defaults for `hits`, `ring`, `duration`, `durationFrom`,
-`args` and legacy global `snapshots`. Command-line options override them. `durationFrom` is
-`arm` by default and may be `first-hit`; the latter starts the duration failsafe at the first
-matching target hit instead of when arming completes. `trace-run --duration-from` overrides the
-profile value. In `first-hit` mode the implicit `trace-run --wait` timeout starts only after the
-first hit; an explicit `--wait-timeout` remains a hard limit from trace start. The sysmodule's
-normal safety rules still apply:
+`args`, `snapshotHits` and legacy global `snapshots`. Command-line options override them.
+`snapshotHits` defaults to one matching hit at the sysmodule; set it to `0` when every hit must
+capture memory. It applies only to single-process profiles because multitrace does not yet
+support a snapshot-hit limit. `trace-run --snapshot-hits` overrides the profile value.
+`durationFrom` is `arm` by default and may be `first-hit`; the latter starts the duration
+failsafe at the first matching target hit instead of when arming completes.
+`trace-run --duration-from` overrides the profile value. In `first-hit` mode the implicit
+`trace-run --wait` timeout starts only after the first hit; an explicit `--wait-timeout`
+remains a hard limit from trace start. The sysmodule's normal safety rules still apply:
 
 - `hits 0` requires a ring;
 - ring size is 1 through 64;
 - captured arguments are limited to `x0` through `x7`.
+- even with user limits disabled, a single-process trace ends after 120 seconds or 4096 hits;
+- `snapshotHits 0` restores snapshot reads on every matching hit.
 - snapshot specifications use `REG[+/-OFFSET]:SIZE`, are limited to two entries and may read at
   most 0x100 bytes per snapshot.
 
@@ -228,7 +233,8 @@ python3 client/sysagent.py --host switch debug trace-run profile.json \
 
 Use this only when the current UI state has already been verified. For interactive work, run
 `trace-run` without `--wait`, perform the action, then use `multitrace-stop`/`trace-stop` and
-the existing dump commands.
+the existing dump commands. The Python client's `trace-stop` waits for `active=0` by default;
+use `trace-stop --no-wait` only when the caller will poll `trace-status` itself.
 
 `debug wait-title TITLE_ID [TIMEOUT_MS]` and `debug wait-application [TIMEOUT_MS]` are also
 available directly. PM allows one program-ID hook at a time, so profiles that wait for two

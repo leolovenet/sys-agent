@@ -335,6 +335,36 @@ Result debugHwBpContinueAll(Handle debugHandle)
         threadIds, 1);
 }
 
+Result debugHwBpDrainAndContinueAll(Handle debugHandle, bool* processExited)
+{
+    if (debugHandle == INVALID_HANDLE)
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    if (processExited != NULL)
+        *processExited = false;
+
+    Result rc = 0;
+    for (u32 attempt = 0; attempt < 4; attempt++) {
+        while (true) {
+            DebugEventInfo event;
+            Result eventRc = svcGetDebugEvent(&event, debugHandle);
+            if (R_FAILED(eventRc))
+                break;
+            if (event.type == DebugEventType_ExitProcess) {
+                if (processExited != NULL)
+                    *processExited = true;
+                return 0;
+            }
+        }
+
+        rc = debugHwBpContinueAll(debugHandle);
+        if (R_SUCCEEDED(rc))
+            return 0;
+        if (attempt + 1 < 4)
+            svcSleepThread(1000000LL);
+    }
+    return rc;
+}
+
 Result debugHwBpStepOverInstruction(Handle debugHandle, u64 threadId,
     u32 instructionSlot, u32 contextSlot, u64 address)
 {
@@ -395,7 +425,7 @@ Result debugHwBpStepOverInstruction(Handle debugHandle, u64 threadId,
             break;
     }
     if (R_SUCCEEDED(rc) && !stepEventSeen) {
-        Result stopRc = debugHwBpQuiesce(debugHandle, false);
+        Result stopRc = debugHwBpQuiesce(debugHandle, false, NULL);
         rc = R_SUCCEEDED(stopRc) ? KERNELRESULT(TimedOut) : stopRc;
     }
 
@@ -419,9 +449,12 @@ rearm:
     return rc;
 }
 
-Result debugHwBpQuiesce(Handle debugHandle, bool exceptionPending)
+Result debugHwBpQuiesce(Handle debugHandle, bool exceptionPending,
+    bool* processExited)
 {
     Result rc = 0;
+    if (processExited != NULL)
+        *processExited = false;
     if (!exceptionPending) {
         rc = svcBreakDebugProcess(debugHandle);
         if (R_FAILED(rc))
@@ -444,6 +477,9 @@ Result debugHwBpQuiesce(Handle debugHandle, bool exceptionPending)
                 if (R_FAILED(eventRc))
                     break;
                 stopSeen = true;
+                if (event.type == DebugEventType_ExitProcess
+                    && processExited != NULL)
+                    *processExited = true;
             }
             if (stopSeen)
                 break;
@@ -456,6 +492,9 @@ Result debugHwBpQuiesce(Handle debugHandle, bool exceptionPending)
             Result eventRc = svcGetDebugEvent(&event, debugHandle);
             if (R_FAILED(eventRc))
                 break;
+            if (event.type == DebugEventType_ExitProcess
+                && processExited != NULL)
+                *processExited = true;
         }
     }
     return 0;

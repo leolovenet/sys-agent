@@ -13,6 +13,7 @@ typedef struct {
     bool durationFromFirstHit;
     u32 ringSize;
     u32 argsCount;
+    u32 snapshotHitLimit;
     DebugTraceSnapshotSpec snapshots[DEBUG_TRACE_SNAPSHOT_MAX];
     u32 snapshotCount;
     DebugTraceSnapshotSpec targetSnapshots[DEBUG_TRACE_TARGET_MAX]
@@ -27,6 +28,7 @@ typedef struct {
     bool stale;
     bool memoryBlocked;
     bool dmntClosed;
+    bool stopRequested;
     u64 processId;
     u64 address;
     u32 targetCount;
@@ -42,6 +44,7 @@ typedef struct {
     u32 ringSize;
     u32 ringCount;
     u32 argsCount;
+    u32 snapshotHitLimit;
     u32 contextSlot;
     u32 instructionSlot;
     u32 ignoredHits;

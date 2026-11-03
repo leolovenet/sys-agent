@@ -1,5 +1,9 @@
 # sys-agent headless 启动与 external key 调查笔记（ACNH）
 
+> **弃用状态**：`game launch-headless` 不再作为正常实验启动路径。
+> 游戏应通过 HOME/qlaunch 以前台方式启动：回到 HOME、选中游戏图标并模拟 `A`。
+> 本文只保留 external-key 逆向机制、历史验证和兼容诊断价值。
+
 > 本文是 `src/sys-agent/commands.md` 的详细补记：记录一次从现象到根因、再到
 > 修复的完整逆向调查（2026-08-19 → 2026-08-21），包括所有踩过的坑和走过的
 > 弯路，以及最终如何找到正确方向。目的：**下次遇到同类问题，直接照着本文的

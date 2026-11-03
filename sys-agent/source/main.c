@@ -1007,10 +1007,11 @@ int argmain(int argc, char** argv)
             /*
              * debug trace <address|main+offset>
              *     [pid=PID] [hits N] [ring N] [duration N] [args N]
+             *     [snapshotHits N] [snap=SPEC]
              *
              * `ring` controls retention, not the lifetime safety bound. A
              * ring session defaults to 64 total hits and `hits 0` removes
-             * that cap explicitly. Without `ring`, the default is one hit and
+             * only that user cap. Without `ring`, the default is one hit and
              * `trace-read 0` returns the last event.
              */
             if (argc < 3) {
@@ -1032,6 +1033,8 @@ int argmain(int argc, char** argv)
             bool durationFromFirstHit = false;
             u32 ringSize = 0;
             u32 argsCount = DEBUG_TRACE_ARGS_MAX;
+            u32 snapshotHitLimit =
+                DEBUG_TRACE_DEFAULT_SNAPSHOT_HITS;
 
             int index = 2;
             while (index < argc) {
@@ -1094,6 +1097,16 @@ int argmain(int argc, char** argv)
                     }
                     argsCount = (u32)parsed;
                     index += 2;
+                } else if (!strcmp(argv[index], "snapshotHits")
+                    && index + 1 < argc) {
+                    u64 parsed = 0;
+                    if (!tryParseStringToInt(argv[index + 1], &parsed)
+                        || parsed > 0xFFFFFFFFULL) {
+                        printf("ERR code=INVALID_SNAPSHOT_HITS\n");
+                        return 0;
+                    }
+                    snapshotHitLimit = (u32)parsed;
+                    index += 2;
                 } else if (!strncmp(argv[index], "snap=", 5)) {
                     if (snapshotCount >= DEBUG_TRACE_SNAPSHOT_MAX
                         || !debugTraceParseSnapshotSpec(
@@ -1126,7 +1139,8 @@ int argmain(int argc, char** argv)
                 } else if (!strcmp(argv[index], "hits")
                     || !strcmp(argv[index], "ring")
                     || !strcmp(argv[index], "duration")
-                    || !strcmp(argv[index], "args")) {
+                    || !strcmp(argv[index], "args")
+                    || !strcmp(argv[index], "snapshotHits")) {
                     printf("ERR code=INVALID_ARGUMENTS detail=missing_value\n");
                     return 0;
                 } else {
@@ -1216,6 +1230,7 @@ int argmain(int argc, char** argv)
             config.durationFromFirstHit = durationFromFirstHit;
             config.ringSize = ringSize;
             config.argsCount = argsCount;
+            config.snapshotHitLimit = snapshotHitLimit;
             config.snapshotCount = snapshotCount;
             memcpy(config.snapshots, snapshots, sizeof(config.snapshots));
             memcpy(config.targetSnapshotCounts, targetSnapshotCounts,
@@ -1276,9 +1291,10 @@ int argmain(int argc, char** argv)
                     printf(",");
                 printf("%u", status.instructionSlots[i]);
             }
-            printf(" snapshots=%u"
+            printf(" snapshots=%u snapshotHits=%u"
                 " dmntClosed=%d lastError=0x%X stage=%s\n",
-                status.snapshotCount, status.dmntClosed,
+                status.snapshotCount, status.snapshotHitLimit,
+                status.dmntClosed,
                 status.lastError, status.stage);
             return 0;
         }
@@ -1291,10 +1307,12 @@ int argmain(int argc, char** argv)
             DebugTraceStatus status;
             debugTraceGetStatus(&status);
             printf("OK active=%d armed=%d everArmed=%d stale=%d memoryBlocked=%d"
+                " stopRequested=%d"
                 " dmntClosed=%d pid=%016lX address=%016lX targetCount=%u"
                 " targets=",
                 status.active, status.armed, status.everArmed, status.stale,
-                status.memoryBlocked, status.dmntClosed, status.processId,
+                status.memoryBlocked, status.stopRequested,
+                status.dmntClosed, status.processId,
                 status.address, status.targetCount);
             for (u32 i = 0; i < status.targetCount; i++) {
                 if (i != 0)
@@ -1329,8 +1347,9 @@ int argmain(int argc, char** argv)
                     printf(",");
                 printf("%u", status.instructionSlots[i]);
             }
-            printf(" ignoredHits=%u snapshots=%u snapSpecs=",
-                status.ignoredHits, status.snapshotCount);
+            printf(" ignoredHits=%u snapshots=%u snapshotHits=%u snapSpecs=",
+                status.ignoredHits, status.snapshotCount,
+                status.snapshotHitLimit);
             for (u32 i = 0; i < status.snapshotCount; i++) {
                 if (i != 0)
                     printf(",");
@@ -1398,8 +1417,10 @@ int argmain(int argc, char** argv)
                     status.ringCount);
                 return 0;
             }
-            printf("OK state=stopped hitCount=%lu ringCount=%u"
-                " lastError=0x%X stage=%s\n",
+            printf("OK state=%s stopRequested=%d active=%d"
+                " hitCount=%lu ringCount=%u lastError=0x%X stage=%s\n",
+                status.active ? "stop-requested" : "stopped",
+                status.stopRequested, status.active,
                 status.hitCount, status.ringCount, status.lastError,
                 status.stage);
             return 0;

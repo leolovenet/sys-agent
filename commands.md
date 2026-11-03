@@ -43,7 +43,11 @@ The system-management protocol is additive and uses single-line `OK key=value` o
 |bootUnlock disarm|Drops the arm file|none|`bootUnlock disarm`|
 |bootUnlock run|Runs the schedule right now instead of waiting for a boot (calibration; on the HOME menu a stray `A` starts the selected game)|none|`bootUnlock run`|
 |applicationTerminate|Experimental: terminates only the current foreground application (system-level final termination; the forced fallback after the HOME-menu graceful-close timeout; a hard kill that makes the Switch show the standard software-error dialog and return to the game-selection screen)|none|`applicationTerminate`|
-|gameLaunchHeadless|Experimental: headless-launches a game by Title ID: starts the process without bringing it to the screen (16 hex digits, non-zero; optional storage name forces that storage)|titleId [storage]|`gameLaunchHeadless 01006F8002326000`|
+|gameLaunchHeadless|**Deprecated compatibility command**: starts a game process without bringing it to the screen. Use the normal HOME/qlaunch foreground launch instead (16 hex digits, non-zero; optional storage name forces that storage)|titleId [storage]|`gameLaunchHeadless 01006F8002326000`|
+
+Normal experiments must start games through the foreground qlaunch flow: return to HOME,
+focus the game icon, and simulate `A`. The headless command remains documented for historical
+external-key diagnostics and compatibility, but it is not the supported test-start path.
 
 Arbitrary strings are returned as uppercase hexadecimal bytes with an adjacent `*Len` field.
 All byte-payload arguments (the data of `poke`/`pokeAbsolute`/`pokeMain`/`pointerPoke` and
@@ -337,15 +341,22 @@ session detaches at `hits` (default 1), and `debug trace-read 0` returns the mos
 In ring mode, it keeps the most recent N events, overwrites the oldest, and stops at `hits`,
 `duration`, or `debug trace-stop`. The default ring safety limit is 64 total hits because a
 hot instruction can otherwise generate hundreds of thousands of debugger stops and starve the
-target; `hits 0` explicitly removes that cap and is valid only with `ring`. Each event contains
+target; `hits 0` removes that user cap and is valid only with `ring`. Each event contains
 a monotonically increasing sequence number, the target index and configured address, thread ID,
 current core, system tick, PC/LR/SP, selected `x0`-`x7` values, and 12 instruction bytes at the
 PC. If the context or core query fails, the relevant native Result is retained per event.
 
+Two non-optional ceilings remain active even with `hits 0` and `duration 0`: at 4096 total
+hits the session stops with `stage=hardHitLimit`, and after 120 seconds it stops with
+`stage=hardWatchdog`. These ceilings bound runaway sessions; they do not make a high hit rate
+safe.
+
 At each hit, up to two optional memory snapshots are read while the target is stopped:
 `snap=REG[+/-OFFSET]:SIZE`. `REG` is `x0` through `x30`, `sp`, `pc`, or `lr`; `SIZE` is 1 through
 256 bytes. The event records the resolved address, bytes, and a per-snapshot native Result, so
-an unmapped or overflowed pointer does not fail the whole trace. Example:
+an unmapped or overflowed pointer does not fail the whole trace. Snapshots default to the first
+matching hit only; `snapshotHits N` selects N retained-snapshot hits, and `snapshotHits 0`
+restores every-hit reads. Example:
 `snap=x0+0x10:0x40 snap=lr-8:8`.
 
 This first tracer is deliberately an entry-event recorder. It does not automatically set a
@@ -356,10 +367,10 @@ observation points.
 
 |Command|Description|Parameters|Usage|
 |--|--|--|--|
-|debug trace|Arms one to four hardware execution breakpoints and returns after every configured target is armed. `ring` controls retention; `hits` is always a total-hit safety limit. Without `ring`, `hits` defaults to 1; with `ring`, it defaults to 64. `hits 0` means unlimited and requires `ring`|1-4 absolute instruction addresses or `main+offset` values<br>optional: `pid=PID`, `hits N` (default 1, or 64 with ring; 0 = unlimited with ring), `ring N` (1-64), `duration N` seconds (default 60, 0 = unlimited), `durationFrom=arm\|first-hit` (default arm), `args N` (0-8, default 8), repeated `snap=xN+OFFSET:SIZE` (max 2)|`debug trace main+0x123456 main+0x123460 pid=0x71 ring 64 snap=x0:0x40`<br>`debug trace 0x2B5D9CF4C8 ring 64 duration 300 durationFrom=first-hit`|
+|debug trace|Arms one to four hardware execution breakpoints and returns after every configured target is armed. `ring` controls retention; `hits` is always a total-hit safety limit. Without `ring`, `hits` defaults to 1; with `ring`, it defaults to 64. `hits 0` requires `ring`, but the hard 4096-hit cap still applies|1-4 absolute instruction addresses or `main+offset` values<br>optional: `pid=PID`, `hits N` (default 1, or 64 with ring; 0 = no user cap with ring), `ring N` (1-64), `duration N` seconds (default 60; 0 disables only the user timer), `snapshotHits N` (default 1; 0 = every hit), `durationFrom=arm\|first-hit` (default arm), `args N` (0-8, default 8), repeated `snap=xN+OFFSET:SIZE` (max 2)|`debug trace main+0x123456 main+0x123460 pid=0x71 ring 64 snap=x0:0x40`<br>`debug trace 0x2B5D9CF4C8 ring 64 duration 300 durationFrom=first-hit snapshotHits 1`|
 |debug trace-status|Reports active/armed state (`everArmed` distinguishes a completed session from one that never armed), all target addresses and per-target hit counts, ring counts, ignored unexpected hits, breakpoint slots, snapshot specs, last event summary, and attach errors|none|`debug trace-status`|
 |debug trace-read|Reads one retained event, oldest first in ring mode; index defaults to 0|optional ring entry index|`debug trace-read 0`|
-|debug trace-stop|Requests detach, waits for the trace thread, clears every configured breakpoint on every core, and releases the debug handle|none|`debug trace-stop`|
+|debug trace-stop|Requests asynchronous detach. The raw protocol command returns immediately; the trace worker clears every configured breakpoint on every core and releases the debug handle. The Python client waits for `active=0` unless `--no-wait` is supplied|none|`debug trace-stop`|
 
 The Python client adds `debug trace-dump --output FILE`, which paginates the retained ring into
 versioned JSONL: one metadata record (`schemaVersion=1`, session ID, host, export time and the
@@ -446,6 +457,8 @@ python3 client/sysagent.py --host switch debug trace-run profile.json \
 python3 client/sysagent.py --host switch debug trace-run profile.json \
   --wait --output trace.jsonl
 python3 client/sysagent.py --host switch debug trace-run profile.json \
+  --snapshot-hits 0 --wait --output trace.jsonl
+python3 client/sysagent.py --host switch debug trace-run profile.json \
   --wait-process --output trace.jsonl
 python3 client/sysagent.py debug trace-report trace.jsonl profile.json --json
 ```
@@ -476,6 +489,10 @@ Profile `trace.durationFrom` accepts `arm` or `first-hit`. The `trace-run` optio
 `debug multitrace` expose the equivalent wire option. With `--wait` or `--output`, an implicit
 timeout starts at the first hit in `first-hit` mode, so a long manual setup does not cancel the
 trace. An explicit `--wait-timeout` remains a hard limit from trace start.
+
+Single-process profiles may set `trace.snapshotHits`; `trace-run --snapshot-hits N` overrides
+it. The sysmodule defaults to snapshots on the first matching hit, and `0` restores reads on
+every hit. Multitrace profiles do not support a snapshot-hit limit.
 
 The schema, selector rules, target ordering and current limitations are documented in
 `docs/trace-profiles.md`. Profile files belong to the consumer project; sys-agent does not ship
@@ -535,12 +552,14 @@ patch-code, maps, and threads commands that need a conflicting debug handle retu
 `OwnedByAnotherProcess`; query `debug trace-status` and stop the trace first. A standalone
 gdbstub remains a conflicting owner and must be disabled.
 
-`duration` and `hits` are safety bounds, not sampling intervals. A hot instruction can make the
+The hard 120-second watchdog and 4096-hit limit are always active for single-process trace;
+`duration 0` and `hits 0` only disable the user-level limits. `duration` and `hits` are safety
+ceilings, not sampling intervals. A hot instruction can make the
 debugger stop and resume frequently, so trace a low-frequency boundary (request entry, worker
 entry, initialization function) rather than a per-frame leaf. Real-device testing hit one
 `svcWaitSynchronization` instruction 224,256 times in 8 seconds. Even 4096 rapid hits were
-enough for ACNH's watchdog to terminate the process. Use an explicit larger cap or an unlimited
-ring only when the instruction rate is known to be low.
+enough for ACNH's watchdog to terminate the process, so keep the default low unless the
+instruction rate is known to be low. `hits 0` does not remove these ceilings.
 
 ## Hardware watchpoint (debug watch)
 

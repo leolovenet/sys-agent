@@ -15,6 +15,7 @@ typedef struct {
     Mutex mutex;
     Thread thread;
     bool threadStarted;
+    bool completed;
     bool active;
     bool armed;
     bool everArmed;
@@ -37,6 +38,7 @@ typedef struct {
     u32 ringCount;
     u32 ringNext;
     u32 argsCount;
+    u32 snapshotHitLimit;
     u32 contextSlot;
     u32 instructionSlot;
     u32 ignoredHits;
@@ -58,6 +60,26 @@ typedef struct {
 } DebugTraceState;
 
 static DebugTraceState traceState;
+
+static void reapCompletedThread(void)
+{
+    Thread finished;
+    bool reap = false;
+
+    mutexLock(&traceState.mutex);
+    if (traceState.threadStarted && traceState.completed) {
+        finished = traceState.thread;
+        traceState.threadStarted = false;
+        traceState.completed = false;
+        reap = true;
+    }
+    mutexUnlock(&traceState.mutex);
+
+    if (reap) {
+        threadWaitForExit(&finished);
+        threadClose(&finished);
+    }
+}
 
 static void setError(const char* stage, Result rc)
 {
@@ -114,6 +136,18 @@ static bool durationExpired(void)
         >= (u64)armGetSystemTickFreq() * duration;
 }
 
+static bool hardDurationExpired(void)
+{
+    mutexLock(&traceState.mutex);
+    const u64 started = traceState.startedTick;
+    mutexUnlock(&traceState.mutex);
+    if (started == 0)
+        return false;
+    return (armGetSystemTick() - started)
+        >= (u64)armGetSystemTickFreq()
+            * DEBUG_TRACE_HARD_DURATION_SECONDS;
+}
+
 static bool hitLimitReached(void)
 {
     mutexLock(&traceState.mutex);
@@ -121,6 +155,23 @@ static bool hitLimitReached(void)
         traceState.maxHits);
     mutexUnlock(&traceState.mutex);
     return done;
+}
+
+static bool hardHitLimitReached(void)
+{
+    mutexLock(&traceState.mutex);
+    const bool done = debugTraceHardHitLimitReached(traceState.hitCount);
+    mutexUnlock(&traceState.mutex);
+    return done;
+}
+
+static bool snapshotAllowedForCurrentHit(void)
+{
+    mutexLock(&traceState.mutex);
+    const bool allowed = debugTraceSnapshotAllowed(traceState.hitCount,
+        traceState.snapshotHitLimit);
+    mutexUnlock(&traceState.mutex);
+    return allowed;
 }
 
 /*
@@ -303,7 +354,6 @@ static void traceThreadMain(void* arg)
     bool attached = false;
     bool resumed = false;
     bool processExited = false;
-    bool eventPending = false;
     bool traceArmed = false;
     Result rc = 0;
     Result cleanupRc = 0;
@@ -413,6 +463,10 @@ static void traceThreadMain(void* arg)
     mutexUnlock(&traceState.mutex);
 
     while (!stopRequested()) {
+        if (hardDurationExpired()) {
+            setStage("hardWatchdog");
+            break;
+        }
         if (durationExpired()) {
             setStage("durationReached");
             break;
@@ -432,8 +486,6 @@ static void traceThreadMain(void* arg)
             Result eventRc = svcGetDebugEvent(&event, debugHandle);
             if (R_FAILED(eventRc))
                 break;
-            eventPending = true;
-
             if (event.type == DebugEventType_ExitProcess) {
                 processExited = true;
                 setStage("exitProcess");
@@ -453,8 +505,12 @@ static void traceThreadMain(void* arg)
                     continue;
                 }
                 DebugTraceEvent captured;
-                const u32 eventSnapshotCount = targetSnapshotCounts[targetIndex]
-                    ? targetSnapshotCounts[targetIndex] : snapshotCount;
+                const bool captureSnapshots =
+                    snapshotAllowedForCurrentHit();
+                const u32 eventSnapshotCount = captureSnapshots
+                    ? (targetSnapshotCounts[targetIndex]
+                        ? targetSnapshotCounts[targetIndex] : snapshotCount)
+                    : 0;
                 const DebugTraceSnapshotSpec* eventSnapshots =
                     targetSnapshotCounts[targetIndex]
                     ? targetSnapshots[targetIndex] : snapshots;
@@ -462,16 +518,20 @@ static void traceThreadMain(void* arg)
                     targets[targetIndex], argsCount, eventSnapshots,
                     eventSnapshotCount, &captured);
                 recordEvent(&captured);
-                if (hitLimitReached()) {
-                    setStage("hitsReached");
-                    rc = 0;
-                    goto cleanup;
-                }
+                /* Consume the breakpoint event before honoring the hit
+                 * limit so cleanup never starts with a pending exception. */
+                const bool hardLimit = hardHitLimitReached();
+                const bool hitLimit = hitLimitReached();
                 rc = debugHwBpStepOverInstruction(debugHandle,
                     event.thread_id, instructionSlots[targetIndex],
                     contextSlot, targets[targetIndex]);
                 if (R_FAILED(rc)) {
                     setError("stepInstruction", rc);
+                    goto cleanup;
+                }
+                if (hardLimit || hitLimit) {
+                    setStage(hardLimit ? "hardHitLimit" : "hitsReached");
+                    rc = 0;
                     goto cleanup;
                 }
             }
@@ -482,7 +542,6 @@ static void traceThreadMain(void* arg)
             setError("continue", rc);
             break;
         }
-        eventPending = false;
     }
     /* A stop request or duration expiry normally leaves the last wait result
      * as TimedOut. That is the loop tick, not a cleanup failure. */
@@ -496,9 +555,20 @@ cleanup:
     memcpy(completionStage, traceState.stage, completionLength);
     mutexUnlock(&traceState.mutex);
     setStage("cleanup");
-    if (attached && !processExited)
-        debugHwBpQuiesce(debugHandle, !resumed || eventPending);
 
+    /* Stop and drain before clearing slots; ContinueAll then consumes any
+     * exception that was already delivered, while cleared slots prevent a
+     * re-hit when the target resumes. */
+    bool quiesced = false;
+    if (attached && !processExited) {
+        Result quiesceRc = debugHwBpQuiesce(debugHandle, !resumed,
+            &processExited);
+        if (R_FAILED(quiesceRc) && R_SUCCEEDED(cleanupRc))
+            cleanupRc = quiesceRc;
+        quiesced = R_SUCCEEDED(quiesceRc);
+    }
+
+    bool slotsCleared = true;
     if (traceArmed) {
         u32 registers[DEBUG_TRACE_TARGET_MAX + 1];
         registers[0] = traceState.contextSlot;
@@ -506,8 +576,20 @@ cleanup:
             registers[i + 1] = instructionSlots[i];
         Result clearRc = debugHwBpClearRegistersAllCores(registers,
             targetCount + 1);
-        if (R_FAILED(clearRc) && R_SUCCEEDED(cleanupRc))
-            cleanupRc = clearRc;
+        if (R_FAILED(clearRc)) {
+            slotsCleared = false;
+            if (R_SUCCEEDED(cleanupRc))
+                cleanupRc = clearRc;
+        }
+    }
+
+    if (attached && !processExited && resumed && quiesced && slotsCleared) {
+        bool drainExited = false;
+        Result continueRc = debugHwBpDrainAndContinueAll(
+            debugHandle, &drainExited);
+        if (R_FAILED(continueRc) && R_SUCCEEDED(cleanupRc))
+            cleanupRc = continueRc;
+        processExited = drainExited;
     }
     if (attached && debugHandle != INVALID_HANDLE)
         svcCloseHandle(debugHandle);
@@ -527,6 +609,7 @@ cleanup:
     }
     if (R_FAILED(rc) && traceState.lastError == 0)
         traceState.lastError = rc;
+    traceState.completed = true;
     mutexUnlock(&traceState.mutex);
     threadExit();
 }
@@ -536,10 +619,12 @@ void debugTraceInitialize(void)
     memset(&traceState, 0, sizeof(traceState));
     mutexInit(&traceState.mutex);
     traceState.durationSeconds = DEBUG_TRACE_DEFAULT_DURATION_SECONDS;
+    traceState.snapshotHitLimit = DEBUG_TRACE_DEFAULT_SNAPSHOT_HITS;
 }
 
 bool debugTraceStart(const DebugTraceConfig* config)
 {
+    reapCompletedThread();
     if (config == 0)
         return false;
     if (config->processId == 0) {
@@ -579,10 +664,7 @@ bool debugTraceStart(const DebugTraceConfig* config)
     }
     if (traceState.threadStarted) {
         mutexUnlock(&traceState.mutex);
-        threadWaitForExit(&traceState.thread);
-        threadClose(&traceState.thread);
-        mutexLock(&traceState.mutex);
-        traceState.threadStarted = false;
+        return false;
     }
     if (!debugTraceConfigIsValid(&model)) {
         traceState.lastError =
@@ -628,6 +710,7 @@ bool debugTraceStart(const DebugTraceConfig* config)
     traceState.ringCount = 0;
     traceState.ringNext = 0;
     traceState.argsCount = config->argsCount;
+    traceState.snapshotHitLimit = config->snapshotHitLimit;
     traceState.contextSlot = 0;
     traceState.instructionSlot = 0;
     traceState.ignoredHits = 0;
@@ -649,6 +732,7 @@ bool debugTraceStart(const DebugTraceConfig* config)
     traceState.stage[0] = 0;
     traceState.hint[0] = 0;
     traceState.stopRequested = false;
+    traceState.completed = false;
     traceState.active = true;
     traceState.armed = false;
     traceState.everArmed = false;
@@ -680,26 +764,21 @@ bool debugTraceStart(const DebugTraceConfig* config)
 
 void debugTraceStop(void)
 {
+    reapCompletedThread();
     mutexLock(&traceState.mutex);
     const bool running = traceState.active || traceState.threadStarted;
-    traceState.stopRequested = true;
-    mutexUnlock(&traceState.mutex);
-    if (!running)
-        return;
-
-    threadWaitForExit(&traceState.thread);
-    threadClose(&traceState.thread);
-
-    mutexLock(&traceState.mutex);
-    traceState.threadStarted = false;
-    traceState.active = false;
-    traceState.armed = false;
-    traceState.stopRequested = false;
+    if (running) {
+        traceState.stopRequested = true;
+        strncpy(traceState.stage, "stopRequested",
+            sizeof(traceState.stage) - 1);
+        traceState.stage[sizeof(traceState.stage) - 1] = 0;
+    }
     mutexUnlock(&traceState.mutex);
 }
 
 bool debugTraceGetStatus(DebugTraceStatus* out)
 {
+    reapCompletedThread();
     memset(out, 0, sizeof(*out));
     mutexLock(&traceState.mutex);
     out->active = traceState.active;
@@ -709,6 +788,7 @@ bool debugTraceGetStatus(DebugTraceStatus* out)
         && (traceState.address != 0 || traceState.hitCount != 0);
     out->memoryBlocked = traceState.active;
     out->dmntClosed = traceState.dmntClosed;
+    out->stopRequested = traceState.stopRequested;
     out->processId = traceState.processId;
     out->address = traceState.address;
     out->targetCount = traceState.targetCount;
@@ -727,6 +807,7 @@ bool debugTraceGetStatus(DebugTraceStatus* out)
     out->ringSize = traceState.ringSize;
     out->ringCount = traceState.ringCount;
     out->argsCount = traceState.argsCount;
+    out->snapshotHitLimit = traceState.snapshotHitLimit;
     out->contextSlot = traceState.contextSlot;
     out->instructionSlot = traceState.instructionSlot;
     out->ignoredHits = traceState.ignoredHits;
@@ -755,6 +836,7 @@ bool debugTraceGetStatus(DebugTraceStatus* out)
 
 bool debugTraceGetEvent(u32 index, DebugTraceEvent* out)
 {
+    reapCompletedThread();
     mutexLock(&traceState.mutex);
     if (!traceState.hasEvent) {
         mutexUnlock(&traceState.mutex);

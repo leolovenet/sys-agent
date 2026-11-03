@@ -63,7 +63,9 @@ commands should follow this rule:
   defaults ring sessions to a 64-hit safety cap so a hot instruction cannot starve the target,
   exposes `trace-status` / `trace-read` / `trace-stop`, and never modifies target instructions.
   The duration failsafe starts at arming by default; `--duration-from first-hit` waits until
-  the first matching target executes before starting that clock.
+  the first matching target executes before starting that clock. Memory snapshots default to
+  the first hit only; the Python `trace-stop` waits for cleanup unless `--no-wait` is used.
+  A hard 120-second/4096-hit ceiling always remains enabled.
   The client `trace-dump` writes versioned JSONL with session metadata; `trace-analyze` and
   `trace-diff` summarize, pair explicit entry/return sites and compare A/B captures.
   Versioned trace profiles resolve foreground/title-ID process selectors, verify Build ID,
@@ -186,6 +188,9 @@ trusted isolated network and restrict it with the surrounding network firewall.
   records entry hits at an absolute or `main+offset` instruction for the foreground
   application or an explicit `pid=`. It is an entry-event recorder, not a full call/return
   unwinder.
+- Start games through the normal HOME/qlaunch foreground flow by selecting the title and
+  simulating `A`. `game launch-headless` is deprecated compatibility/external-key diagnostic
+  surface and must not be used as the normal experiment startup path.
 - `log` lists the recent commands the console received, with a system tick.
 
 ### Screen Capture:

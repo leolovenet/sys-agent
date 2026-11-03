@@ -51,6 +51,7 @@ class FakeState:
         self.repeat_support = True
         self.sequence_error = False
         self.trace_busy = False
+        self.trace_active = False
         self.multi_trace_active = False
         self.parked_process_count = 0
         self.trace_target_addresses = [0x2B00001000]
@@ -157,6 +158,7 @@ class FakeHandler(socketserver.StreamRequestHandler):
                     if state.trace_busy:
                         response = "ERR code=TRACE_BUSY result=0x0 stage="
                     else:
+                        state.trace_active = True
                         response = (
                             "OK state=started pid=0000000000000071 address=0000002B00001000 "
                             "args=8 hits=1 ring=0 duration=60 ctxSlot=1 insnSlot=0 "
@@ -167,8 +169,10 @@ class FakeHandler(socketserver.StreamRequestHandler):
                         f"{index}:0x{address:X}"
                         for index, address in enumerate(
                             state.trace_target_addresses))
+                    active = 1 if state.trace_active else 0
                     response = (
-                        "OK active=1 armed=1 stale=0 memoryBlocked=1 dmntClosed=0 "
+                        f"OK active={active} armed={active} stale=0 "
+                        f"memoryBlocked={active} dmntClosed=0 "
                         "pid=0000000000000071 address=0000002B00001000 "
                         f"targetCount={len(state.trace_target_addresses)} "
                         f"targets={target_text} maxHits=1 "
@@ -187,7 +191,15 @@ class FakeHandler(socketserver.StreamRequestHandler):
                         "x1=0000000000000002"
                     )
                 elif command[1] == "trace-stop":
-                    response = "OK state=stopped hitCount=1 ringCount=0 lastError=0x0 stage=hitsReached"
+                    if state.trace_active:
+                        state.trace_active = False
+                        response = (
+                            "OK state=stop-requested stopRequested=1 active=1 "
+                            "hitCount=1 ringCount=0 lastError=0x0 stage=stopRequested")
+                    else:
+                        response = (
+                            "OK state=stopped stopRequested=0 active=0 "
+                            "hitCount=1 ringCount=0 lastError=0x0 stage=hitsReached")
                 elif command[1] == "multitrace":
                     state.multi_trace_active = state.parked_process_count > 0
                     response = (
@@ -843,11 +855,11 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(main(base + [
             "trace", "main+0x1000", "--pid", "0x71", "--hits", "2",
             "--ring", "16", "--duration", "30", "--duration-from",
-            "first-hit", "--args", "4"]), 0)
+            "first-hit", "--args", "4", "--snapshot-hits", "1"]), 0)
         self.assertEqual(self.server.state.last_command, [
             "debug", "trace", "main+0x1000", "pid=0x71", "hits", "2",
-            "ring", "16", "duration", "30", "durationFrom=first-hit",
-            "args", "4"])
+            "ring", "16", "duration", "30", "snapshotHits", "1",
+            "durationFrom=first-hit", "args", "4"])
 
         self.assertEqual(main(base + [
             "trace", "main+0x1000", "--duration-from", "arm"]), 0)
@@ -868,6 +880,13 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(self.server.state.last_command,
                          ["debug", "trace-read", "0"])
         self.assertEqual(main(base + ["trace-stop"]), 0)
+        self.assertIn(["debug", "trace-stop"], self.server.state.commands)
+        self.assertEqual(self.server.state.last_command,
+                         ["debug", "trace-status"])
+        self.assertFalse(self.server.state.trace_active)
+
+        self.assertEqual(main(base + ["trace", "0x1000"]), 0)
+        self.assertEqual(main(base + ["trace-stop", "--no-wait"]), 0)
         self.assertEqual(self.server.state.last_command,
                          ["debug", "trace-stop"])
         self.assertEqual(main(base + ["start-process", "0x88"]), 0)
@@ -876,6 +895,10 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(main(base + ["trace", "0x1000", "--ring", "65"]), 2)
         self.assertEqual(main(base + ["trace", "0x1000", "--hits", "0"]), 2)
+        self.assertEqual(
+            main(base + ["trace", "0x1000", "--snapshot-hits", "-1"]), 2)
+        self.assertEqual(
+            main(base + ["trace", "0x1000", "--snapshot-hits", "0x100000000"]), 2)
         self.assertEqual(main(base + [
             "trace", "0x1000", "0x2000", "0x3000", "0x4000", "0x5000"]), 2)
         self.assertEqual(
@@ -1129,6 +1152,14 @@ class ClientTests(unittest.TestCase):
             run_base = ["--host", "127.0.0.1", "--port",
                         str(self.server.server_address[1]), "--timeout", "1",
                         "debug", "trace-run", profile_path]
+            self.assertEqual(main(run_base + ["--snapshot-hits", "0"]), 2)
+            limited_profile = json.loads(json.dumps(profile_data))
+            limited_profile["trace"]["snapshotHits"] = 0
+            limited_path = os.path.join(directory, "limited-multitrace.json")
+            with open(limited_path, "w", encoding="utf-8") as handle:
+                json.dump(limited_profile, handle)
+            with self.assertRaisesRegex(ValueError, "single-process"):
+                load_trace_profile(limited_path)
             self.server.state.application_running = False
             self.server.state.application_hook_busy = True
             self.server.state.processes = {}
@@ -1246,7 +1277,14 @@ class ClientTests(unittest.TestCase):
                     {"id": "b", "process": "client", "offset": "0x3DB65C4"},
                     {"id": "c", "process": "client", "offset": "0x3DB65C8"},
                 ],
-                "trace": {"hits": 4, "ring": 4, "duration": 5, "args": 2},
+                "trace": {
+                    "hits": 4,
+                    "ring": 4,
+                    "duration": 5,
+                    "args": 2,
+                    "snapshots": ["x1:0x100"],
+                    "snapshotHits": 0,
+                },
             }
             single_path = os.path.join(directory, "single.json")
             with open(single_path, "w", encoding="utf-8") as handle:
@@ -1258,6 +1296,17 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(self.server.state.last_command[:6], [
                 "debug", "trace", "0x290C1BC5C0", "0x290C1BC5C4",
                 "0x290C1BC5C8", "pid=0x1234"])
+            snapshot_limit = self.server.state.last_command.index("snapshotHits")
+            self.assertEqual(
+                self.server.state.last_command[snapshot_limit + 1], "0")
+            self.assertIn("tsnap=0:x1:0x100", self.server.state.last_command)
+            self.assertEqual(main([
+                "--host", "127.0.0.1", "--port",
+                str(self.server.server_address[1]), "--timeout", "1",
+                "debug", "trace-run", single_path, "--snapshot-hits", "2"]), 0)
+            snapshot_limit = self.server.state.last_command.index("snapshotHits")
+            self.assertEqual(
+                self.server.state.last_command[snapshot_limit + 1], "2")
 
     def test_hipc_cmif_decode_and_trace_scan(self) -> None:
         import json

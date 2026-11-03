@@ -50,9 +50,16 @@ Result debugHwBpStepOverInstruction(Handle debugHandle, u64 threadId,
     u32 instructionSlot, u32 contextSlot, u64 address);
 
 /*
- * Stop the target and drain its debug-event queue before clearing hardware
- * breakpoint registers. Set `exceptionPending` when the caller has already
- * consumed a stop exception and has not resumed. Closing the debug handle
- * resumes the target.
+ * Drain queued debug events and continue every thread with the exception
+ * handled. Clear the tracing hardware slots first so a pending breakpoint
+ * cannot immediately fire again while cleanup resumes the target.
  */
-Result debugHwBpQuiesce(Handle debugHandle, bool exceptionPending);
+Result debugHwBpDrainAndContinueAll(Handle debugHandle, bool* processExited);
+
+/*
+ * Quiesce the target and drain its debug-event queue. Set `exceptionPending`
+ * when the caller has already consumed an exception and must not request a
+ * second debugger break. Closing the debug handle resumes the target.
+ */
+Result debugHwBpQuiesce(Handle debugHandle, bool exceptionPending,
+    bool* processExited);

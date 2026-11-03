@@ -7,6 +7,9 @@
 #define DEBUG_TRACE_ARGS_MAX 8
 #define DEBUG_TRACE_INSN_BYTES 12
 #define DEBUG_TRACE_DEFAULT_RING_HITS 64
+#define DEBUG_TRACE_HARD_HIT_LIMIT 4096
+#define DEBUG_TRACE_HARD_DURATION_SECONDS 120
+#define DEBUG_TRACE_DEFAULT_SNAPSHOT_HITS 1
 #define DEBUG_TRACE_TARGET_MAX 4
 #define DEBUG_TRACE_SNAPSHOT_MAX 2
 #define DEBUG_TRACE_SNAPSHOT_BYTES_MAX 0x100
@@ -73,3 +76,6 @@ uint32_t debugTraceRingOldestIndex(uint32_t next, uint32_t capacity,
     uint32_t count, uint32_t index);
 uint64_t debugTraceOverwrittenCount(uint64_t hitCount, uint32_t storedCount);
 bool debugTraceHitLimitReached(uint64_t hitCount, uint32_t maxHits);
+bool debugTraceHardHitLimitReached(uint64_t hitCount);
+bool debugTraceSnapshotAllowed(uint64_t previousHitCount,
+    uint32_t snapshotHitLimit);

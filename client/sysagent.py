@@ -25,6 +25,7 @@ CLIENT_VERSION = "1.2.1"
 TRACE_SCHEMA_VERSION = 1
 TRACE_PROFILE_SCHEMA_VERSION = 2
 TRACE_BOOT_EPOCH_TOLERANCE_MS = 2000
+TRACE_STOP_TIMEOUT_SECONDS = 30.0
 
 # The console's default keySleepTime (25 ms) is fast enough for the home menu but too
 # fast for the game's on-screen keyboard: measured in ACNH 3.0.3's chat field, 25/30 ms
@@ -323,6 +324,7 @@ ERROR_CODE_NOTES = {
     "TRACE_BUSY": "another watch/trace session is active or the trace parameters are invalid",
     "DEBUG_BUSY": "an active watch/trace owns the process debug handle",
     "INVALID_SNAPSHOT": "snapshot must be REG[+/-OFFSET]:SIZE, with REG in x0..x30, sp, pc, or lr",
+    "INVALID_SNAPSHOT_HITS": "snapshot-hit count must fit in an unsigned 32-bit integer",
     "DUPLICATE_TARGET": "trace target addresses must be distinct",
     "MULTITRACE_BUSY": "another watch/trace session is active or multitrace could not start",
     "MULTITRACE_START_FAILED": "the dual-process trace could not attach and arm its targets",
@@ -2236,11 +2238,17 @@ def load_trace_profile(path: str) -> dict[str, object]:
     trace_options = profile.get("trace", {})
     if trace_options is not None:
         trace_options = _profile_object(trace_options, "trace")
-        for name in ("hits", "ring", "duration", "args"):
+        for name in ("hits", "ring", "duration", "args", "snapshotHits"):
             if name in trace_options and (
                     not isinstance(trace_options[name], int)
                     or trace_options[name] < 0):
                 raise ValueError(f"trace.{name} must be a non-negative integer")
+        if "snapshotHits" in trace_options and len(processes) != 1:
+            raise ValueError(
+                "trace.snapshotHits is only supported for single-process profiles")
+        if trace_options.get("snapshotHits", 0) > 0xFFFFFFFF:
+            raise ValueError(
+                "trace.snapshotHits must fit in an unsigned 32-bit integer")
         duration_from = trace_options.get("durationFrom", "arm")
         if duration_from not in {"arm", "first-hit"}:
             raise ValueError("trace.durationFrom must be arm or first-hit")
@@ -4336,6 +4344,11 @@ def _cmd_game_status(client: SysAgentClient, args: argparse.Namespace) -> None:
 
 
 def _cmd_game_launch_headless(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print(
+        "warning: `game launch-headless` is deprecated; start games through "
+        "the HOME/qlaunch foreground flow (select the title and simulate A)",
+        file=sys.stderr,
+    )
     titlekeys_path = args.titlekeys
     if titlekeys_path is None:
         titlekeys_path = _default_titlekeys_path()
@@ -4410,11 +4423,14 @@ def _cmd_debug_trace(client: SysAgentClient, args: argparse.Namespace) -> None:
     if args.hits is not None and args.hits < 0:
         raise ValueError("hits must be non-negative")
     if args.hits == 0 and args.ring is None:
-        raise ValueError("hits 0 (unlimited) requires --ring")
+        raise ValueError("hits 0 (no user cap) requires --ring")
     if args.ring is not None and not 1 <= args.ring <= 64:
         raise ValueError("ring must be in 1..64")
     if args.duration is not None and args.duration < 0:
         raise ValueError("duration must be non-negative")
+    if (args.snapshot_hits is not None
+            and not 0 <= args.snapshot_hits <= 0xFFFFFFFF):
+        raise ValueError("snapshot-hits must be in 0..0xFFFFFFFF")
     if args.args is not None and not 0 <= args.args <= 8:
         raise ValueError("args must be in 0..8")
     # Arming hardware breakpoints on all four cores can take several seconds
@@ -4433,6 +4449,8 @@ def _cmd_debug_trace(client: SysAgentClient, args: argparse.Namespace) -> None:
         parts.extend(("ring", str(args.ring)))
     if args.duration is not None:
         parts.extend(("duration", str(args.duration)))
+    if args.snapshot_hits is not None:
+        parts.extend(("snapshotHits", str(args.snapshot_hits)))
     if args.duration_from == "first-hit":
         parts.append("durationFrom=first-hit")
     if args.args is not None:
@@ -4454,7 +4472,28 @@ def _cmd_debug_trace_read(client: SysAgentClient, args: argparse.Namespace) -> N
 
 def _cmd_debug_trace_stop(client: SysAgentClient, args: argparse.Namespace) -> None:
     client.timeout = max(client.timeout, 30.0)
-    _emit(require_ok(client.command("debug trace-stop")), args)
+    response = require_ok(client.command("debug trace-stop"))
+    if args.no_wait or response.get("active") != "1":
+        _emit(response, args)
+        return
+
+    deadline = time.monotonic() + TRACE_STOP_TIMEOUT_SECONDS
+    while True:
+        status = require_ok(client.command("debug trace-status", retry=True))
+        last_error = parse_int(status.get("lastError", "0"))
+        if last_error:
+            raise SysAgentProtocolError(
+                f"trace cleanup failed in stage {status.get('stage', '')}: "
+                f"result=0x{last_error:X}")
+        if status.get("active") != "1":
+            status["state"] = "stopped"
+            _emit(status, args)
+            return
+        if time.monotonic() >= deadline:
+            raise SysAgentProtocolError(
+                "trace did not release its debug handle within "
+                f"{TRACE_STOP_TIMEOUT_SECONDS:g} seconds")
+        time.sleep(0.1)
 
 
 def _trace_process_metadata(client: SysAgentClient,
@@ -4783,16 +4822,18 @@ def _trace_profile_options(profile: dict[str, object],
     configured = configured if isinstance(configured, dict) else {}
     options = {
         name: configured.get(name)
-        for name in ("hits", "ring", "duration", "args")
+        for name in ("hits", "ring", "duration", "args", "snapshotHits")
     }
-    for name in options:
+    for name in ("hits", "ring", "duration", "args"):
         value = getattr(args, name, None)
         if value is not None:
             options[name] = value
+    if getattr(args, "snapshot_hits", None) is not None:
+        options["snapshotHits"] = args.snapshot_hits
     if options["hits"] is not None and int(options["hits"]) < 0:
         raise ValueError("hits must be non-negative")
     if options["hits"] == 0 and options["ring"] is None:
-        raise ValueError("hits 0 (unlimited) requires a ring")
+        raise ValueError("hits 0 (no user cap) requires a ring")
     if (options["ring"] is not None
             and not 1 <= int(options["ring"]) <= 64):
         raise ValueError("ring must be in 1..64")
@@ -4800,6 +4841,9 @@ def _trace_profile_options(profile: dict[str, object],
         raise ValueError("duration must be non-negative")
     if options["args"] is not None and not 0 <= int(options["args"]) <= 8:
         raise ValueError("args must be in 0..8")
+    if (options["snapshotHits"] is not None
+            and not 0 <= int(options["snapshotHits"]) <= 0xFFFFFFFF):
+        raise ValueError("snapshot-hits must be in 0..0xFFFFFFFF")
     parsed_options: dict[str, object] = {
         name: (int(value) if value is not None else None)
         for name, value in options.items()
@@ -4822,6 +4866,10 @@ def _start_plan_trace(client: SysAgentClient, plan: dict[str, object],
                       options: dict[str, object]) -> dict[str, str]:
     processes = _profile_list(plan["processes"], "plan processes")
     targets = _profile_list(plan["targets"], "plan targets")
+    if (plan["mode"] != "single"
+            and options.get("snapshotHits") is not None):
+        raise ValueError(
+            "snapshot-hits is only supported for single-process trace profiles")
     parts: list[str]
     if plan["mode"] == "single":
         address_args = [
@@ -4852,6 +4900,8 @@ def _start_plan_trace(client: SysAgentClient, plan: dict[str, object],
             parts.extend((name, str(value)))
         if name == "duration" and options.get("durationFromFirstHit"):
             parts.append("durationFrom=first-hit")
+    if options.get("snapshotHits") is not None:
+        parts.extend(("snapshotHits", str(options["snapshotHits"])))
     for snapshot in options.get("globalSnapshots", []):
         parts.append(f"snap={snapshot}")
     for raw_target in targets:
@@ -5651,9 +5701,9 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 _cmd_game_status, (JSON_ARG, OUT_ARG)),
         Command("wait", "Wait until a game is running", _cmd_game_wait,
                 (WAIT_TIMEOUT_ARG, POLL_ARG)),
-        Command("launch-headless", "Experimental: start a game process without showing it "
-                                   "on screen (headless; foreground launch is not possible "
-                                   "from a sysmodule)", _cmd_game_launch_headless,
+        Command("launch-headless", "Deprecated: start a game process without showing it on "
+                                   "screen. Use HOME/qlaunch foreground launch instead",
+                _cmd_game_launch_headless,
                 (Arg("title_id", "Title ID (hex or decimal)", type=parse_int),
                  Arg("storage", "storage to force (auto-detected when omitted); see below",
                      nargs="?", choices=("SdCard", "BuiltInUser", "GameCard", "None"),
@@ -5701,19 +5751,25 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      nargs="+", metavar="ADDRESS"),
                  Arg("pid", "target process ID (default: foreground application)",
                      type=parse_int, default=None, flags=("--pid",)),
-                 Arg("hits", "total-hit safety limit; 0 means unlimited with --ring",
+                 Arg("hits", "user hit limit; 0 removes it within the hard cap",
                      type=parse_int, default=None, flags=("--hits",)),
                  Arg("ring", "keep the most recent N hits (1..64); duration/stop ends it",
                      type=parse_int, default=None, flags=("--ring",)),
-                 Arg("duration", "failsafe duration in seconds; 0 means unlimited",
+                 Arg("duration",
+                     "user failsafe duration in seconds; 0 disables only "
+                     "this timer (hard 120-second ceiling remains)",
                      type=parse_int, default=None, flags=("--duration",)),
+                 Arg("snapshot_hits",
+                     "capture snapshots for only the first N hits; "
+                     "0 captures every hit (server default: 1)",
+                     type=parse_int, default=None, flags=("--snapshot-hits",)),
                  Arg("duration_from",
                      "start duration when armed or at the first matching hit",
                      choices=("arm", "first-hit"), default=None,
                      flags=("--duration-from",)),
                  Arg("args", "capture x0 through x(N-1), N=0..8",
                      type=parse_int, default=None, flags=("--args",)),
-                 Arg("snapshots", "capture REG[+/-OFFSET]:SIZE at each hit "
+                 Arg("snapshots", "capture REG[+/-OFFSET]:SIZE at matching hits "
                                   "(for example x0+0x10:0x40; max 2)",
                      action="append", default=None, flags=("--snapshot",)),
                  JSON_ARG, OUT_ARG),
@@ -5726,16 +5782,21 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                     "Without --ring, --hits (default 1) ends the session and `trace read 0`",
                     "returns the last hit. With --ring, the session keeps the most recent N",
                     "and also stops at --hits (default 64) to protect a hot instruction;",
-                    "--hits 0 removes that cap. --duration (default 60) and `trace stop`",
+                    "--hits 0 removes the user cap within the hard 4096-hit limit.",
+                    "--duration (default 60) and `trace-stop`",
                     "remain independent lifetime bounds. --duration-from first-hit starts",
                     "the duration clock at the first matching hit instead of at arming.",
+                    "A 120-second/4096-hit hard ceiling always remains enabled.",
+                    "trace-stop waits until cleanup finishes; --no-wait returns after",
+                    "requesting cleanup so the caller can poll trace-status.",
                     "",
                     "While the trace owns the target debug handle, memory commands are",
                     "rejected. Trace records are opt-in: no unsolicited data is written.",
                     "",
                     "Each --snapshot reads memory through x0..x30, sp, pc, or lr (plus an",
-                    "optional signed byte offset) while the target is stopped. Snapshot read",
-                    "failures are recorded per event instead of failing the whole trace.",
+                    "optional signed byte offset) while the target is stopped. Snapshots",
+                    "default to the first hit only; --snapshot-hits 0 restores every-hit reads.",
+                    "Snapshot read failures are recorded per event.",
                 ))),
         Command("trace-status", "Show tracer state, counters and last hit",
                 _cmd_debug_trace_status, (JSON_ARG, OUT_ARG)),
@@ -5743,8 +5804,13 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 _cmd_debug_trace_read,
                 (Arg("index", "ring index (default 0)", type=parse_int,
                      nargs="?", default=0), JSON_ARG, OUT_ARG)),
-        Command("trace-stop", "Stop the active trace and release the debug handle",
-                _cmd_debug_trace_stop, (JSON_ARG, OUT_ARG)),
+        Command("trace-stop", "Stop the active trace and wait for debug-handle release",
+                _cmd_debug_trace_stop,
+                (Arg("no_wait",
+                     "return after requesting cleanup without waiting for active=0",
+                     action="store_true", default=False,
+                     flags=("--no-wait",)),
+                 JSON_ARG, OUT_ARG)),
         Command("multitrace", "Trace up to two instructions in each of two processes",
                 _cmd_debug_multitrace,
                 (Arg("pid1", "first process ID", type=parse_int),
@@ -5804,19 +5870,25 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
         Command("trace-run", "Arm a trace from a versioned profile",
                 _cmd_debug_trace_run,
                 (Arg("profile", "versioned trace profile JSON", metavar="PROFILE"),
-                 Arg("hits", "total-hit safety limit; 0 means unlimited with --ring",
+                 Arg("hits",
+                     "user hit limit; 0 removes it within the single-trace hard cap",
                      type=parse_int, default=None, flags=("--hits",)),
                  Arg("ring", "keep the most recent N hits (1..64)",
                      type=parse_int, default=None, flags=("--ring",)),
-                 Arg("duration", "failsafe duration in seconds; 0 means unlimited",
+                 Arg("duration",
+                     "user failsafe duration in seconds; 0 disables only the user timer",
                      type=parse_int, default=None, flags=("--duration",)),
+                 Arg("snapshot_hits",
+                     "single-process profiles: capture snapshots for only the first N "
+                     "hits; 0 captures every hit",
+                     type=parse_int, default=None, flags=("--snapshot-hits",)),
                  Arg("duration_from",
                      "override profile duration clock start",
                      choices=("arm", "first-hit"), default=None,
                      flags=("--duration-from",)),
                  Arg("args", "capture x0 through x(N-1), N=0..8",
                      type=parse_int, default=None, flags=("--args",)),
-                 Arg("snapshots", "capture REG[+/-OFFSET]:SIZE at each hit "
+                 Arg("snapshots", "capture REG[+/-OFFSET]:SIZE at matching hits "
                                   "(for example x1:0x100; max 2)",
                      action="append", default=None, flags=("--snapshot",)),
                  Arg("wait_process",
@@ -5837,6 +5909,7 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 "\n".join((
                     "Resolves the profile immediately, then arms the matching",
                     "single-process or dual-process hardware trace.",
+                    "--snapshot-hits applies only to single-process profiles.",
                     "--output implies --wait and additionally exports the retained ring.",
                 ))),
         Command("trace-report", "Correlate a trace with its profile target roles",

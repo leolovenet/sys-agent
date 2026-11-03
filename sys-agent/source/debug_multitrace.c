@@ -268,7 +268,6 @@ static void multiTraceThreadMain(void* arg)
     bool attached[DEBUG_MULTITRACE_PROCESS_COUNT] = { false, false };
     bool resumed[DEBUG_MULTITRACE_PROCESS_COUNT] = { false, false };
     bool exited[DEBUG_MULTITRACE_PROCESS_COUNT] = { false, false };
-    bool pending[DEBUG_MULTITRACE_PROCESS_COUNT] = { false, false };
     bool armed = false;
     Result rc = 0;
     Result cleanupRc = 0;
@@ -416,7 +415,6 @@ static void multiTraceThreadMain(void* arg)
             Result eventRc = svcGetDebugEvent(&event, handles[processIndex]);
             if (R_FAILED(eventRc))
                 break;
-            pending[processIndex] = true;
             if (event.type == DebugEventType_ExitProcess) {
                 exited[processIndex] = true;
                 setError("exitProcess", MAKERESULT(Module_Libnx,
@@ -447,14 +445,9 @@ static void multiTraceThreadMain(void* arg)
                         addresses[targetIndex], argsCount, eventSnapshots,
                         eventSnapshotCount, &captured);
                     recordEvent(&captured);
-                    if (hitLimitReached()) {
-                        mutexLock(&multiState.mutex);
-                        strncpy(multiState.stage, "hitsReached",
-                            sizeof(multiState.stage) - 1);
-                        multiState.stage[sizeof(multiState.stage) - 1] = 0;
-                        mutexUnlock(&multiState.mutex);
-                        goto cleanup;
-                    }
+                    /* See debug_trace.c: step over before a hit-limit
+                     * cleanup so detaching cannot leave a pending exception. */
+                    const bool hitLimit = hitLimitReached();
                     rc = debugHwBpStepOverInstruction(
                         handles[processIndex], event.thread_id,
                         slots[targetIndex], processIndex == 0
@@ -462,6 +455,14 @@ static void multiTraceThreadMain(void* arg)
                         addresses[targetIndex]);
                     if (R_FAILED(rc)) {
                         setError("stepInstruction", rc);
+                        goto cleanup;
+                    }
+                    if (hitLimit) {
+                        mutexLock(&multiState.mutex);
+                        strncpy(multiState.stage, "hitsReached",
+                            sizeof(multiState.stage) - 1);
+                        multiState.stage[sizeof(multiState.stage) - 1] = 0;
+                        mutexUnlock(&multiState.mutex);
                         goto cleanup;
                     }
                 } else {
@@ -474,19 +475,23 @@ static void multiTraceThreadMain(void* arg)
             setError("continue", rc);
             break;
         }
-        pending[processIndex] = false;
     }
     rc = 0;
 
 cleanup:
+    /* Stop both targets before touching the shared per-core slots. */
+    bool quiesced[DEBUG_MULTITRACE_PROCESS_COUNT] = { false, false };
     for (u32 i = 0; i < DEBUG_MULTITRACE_PROCESS_COUNT; i++) {
         if (attached[i] && !exited[i]) {
-            Result quiesceRc = debugHwBpQuiesce(handles[i],
-                !resumed[i] || pending[i]);
+            Result quiesceRc = debugHwBpQuiesce(handles[i], !resumed[i],
+                &exited[i]);
             if (R_FAILED(quiesceRc) && R_SUCCEEDED(cleanupRc))
                 cleanupRc = quiesceRc;
+            quiesced[i] = R_SUCCEEDED(quiesceRc);
         }
     }
+
+    bool slotsCleared = true;
     if (armed) {
         u32 registers[2 + DEBUG_MULTITRACE_TARGET_MAX];
         for (u32 i = 0; i < 2; i++)
@@ -496,8 +501,22 @@ cleanup:
         const u32 clearCount = 2 + targetCount;
         Result clearRc = debugHwBpClearRegistersAllCores(registers,
             clearCount);
-        if (R_FAILED(clearRc) && R_SUCCEEDED(cleanupRc))
-            cleanupRc = clearRc;
+        if (R_FAILED(clearRc)) {
+            slotsCleared = false;
+            if (R_SUCCEEDED(cleanupRc))
+                cleanupRc = clearRc;
+        }
+    }
+    for (u32 i = 0; i < DEBUG_MULTITRACE_PROCESS_COUNT; i++) {
+        if (attached[i] && !exited[i] && resumed[i] && quiesced[i]
+            && slotsCleared) {
+            bool drainExited = false;
+            Result continueRc = debugHwBpDrainAndContinueAll(
+                handles[i], &drainExited);
+            if (R_FAILED(continueRc) && R_SUCCEEDED(cleanupRc))
+                cleanupRc = continueRc;
+            exited[i] = drainExited;
+        }
     }
     for (u32 i = 0; i < DEBUG_MULTITRACE_PROCESS_COUNT; i++) {
         if (attached[i])

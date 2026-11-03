@@ -51,7 +51,7 @@ python3 client/sysagent.py --host switch raw debug threads PID
 python3 client/sysagent.py --host switch debug trace \
   main+0x123456 main+0x123460 \
   --pid 0x71 --ring 64 --duration 30 \
-  --snapshot x1:0x100
+  --snapshot x1:0x100 --snapshot-hits 1
 
 python3 client/sysagent.py --host switch debug trace-status
 python3 client/sysagent.py --host switch debug trace-dump --output trace.jsonl
@@ -213,7 +213,14 @@ python3 client/sysagent.py debug trace-timeline trace.jsonl \
 ## 安全边界
 
 - 硬件执行断点不修改目标代码；`debug patch-code` 是另一项显式写操作。
+- 内存快照默认只读取第一次命中；需要多次对象快照时显式设置 `--snapshot-hits N`。
+- 即使 `hits 0` 或 `duration 0`，单进程 trace 仍有 4096 次命中、120 秒两道硬上限；
+  它们是失控保护上限，不代表 4096 次快速命中属于安全负载。
+- Python 客户端的 `trace-stop` 默认等待到 `active=0`；`trace-stop --no-wait` 才只发出异步
+  请求，调用方随后应轮询 `trace-status` 到 `active=0` 再执行内存命令。
 - `hits` 和 `duration` 是安全上限，不是采样周期。热点指令会拖慢甚至触发 watchdog。
+- 达到 `hits` 上限时，trace/multitrace 会先单步越过当前硬件断点；cleanup 在暂停目标、
+  排空调试事件、清除硬件槽后，以 `ContinueAll` 处理残留异常，再释放 debug handle。
 - 跨进程 multitrace 最多两个进程、每进程两个目标，共享 64 条 ring 上限。
 - 活跃 trace 占用调试句柄，期间内存/patch/maps/threads 等命令可能返回
   `OwnedByAnotherProcess`。

@@ -172,6 +172,19 @@ static void testOverwriteAndLimit(void)
         DEBUG_TRACE_DEFAULT_RING_HITS));
 }
 
+static void testSafetyLimits(void)
+{
+    assert(!debugTraceHardHitLimitReached(
+        DEBUG_TRACE_HARD_HIT_LIMIT - 1));
+    assert(debugTraceHardHitLimitReached(DEBUG_TRACE_HARD_HIT_LIMIT));
+
+    assert(debugTraceSnapshotAllowed(0, 1));
+    assert(!debugTraceSnapshotAllowed(1, 1));
+    assert(debugTraceSnapshotAllowed(3, 4));
+    assert(!debugTraceSnapshotAllowed(4, 4));
+    assert(debugTraceSnapshotAllowed(1000000, 0));
+}
+
 int main(void)
 {
     testAddressValidation();
@@ -181,6 +194,7 @@ int main(void)
     testTargetLookup();
     testRingOrder();
     testOverwriteAndLimit();
+    testSafetyLimits();
     printf("debug_trace_model tests passed\n");
     return 0;
 }

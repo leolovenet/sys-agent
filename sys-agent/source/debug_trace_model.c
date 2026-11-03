@@ -233,3 +233,15 @@ bool debugTraceHitLimitReached(uint64_t hitCount, uint32_t maxHits)
 {
     return maxHits != 0 && hitCount >= maxHits;
 }
+
+bool debugTraceHardHitLimitReached(uint64_t hitCount)
+{
+    return hitCount >= DEBUG_TRACE_HARD_HIT_LIMIT;
+}
+
+bool debugTraceSnapshotAllowed(uint64_t previousHitCount,
+    uint32_t snapshotHitLimit)
+{
+    return snapshotHitLimit == 0
+        || previousHitCount < (uint64_t)snapshotHitLimit;
+}

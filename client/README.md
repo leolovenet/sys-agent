@@ -42,8 +42,8 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.2.0
-sys-agent 2.17.0  (switch:6000)
+client    1.2.1
+sys-agent 2.18.0  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
@@ -124,23 +124,23 @@ the local BAAS registration but leaves the local user and game saves. It is neve
 ```bash
 python3 client/sysagent.py --host switch game status
 python3 client/sysagent.py --host switch game wait --wait-timeout 60
-python3 client/sysagent.py --host switch game launch-headless 0x01006F8002326000
 python3 client/sysagent.py --host switch game terminate
 python3 client/sysagent.py --host switch game name
 python3 client/sysagent.py --host switch game version
 python3 client/sysagent.py --host switch game icon --output icon.bin
 ```
 
-Game subcommands are `status`, `wait`, `launch-headless`, `terminate`, `name`, `author`,
+Game subcommands are `status`, `wait`, deprecated `launch-headless`, `terminate`, `name`, `author`,
 `rating`, `version`, and `icon`. `wait` polls until a game is running (bounded by
 `--wait-timeout`, default 60s) instead of leaving the polling to the caller.
 `status` reports the running application identity, version, memory
 bases, Build ID, and name; `icon` writes a binary icon file with `--output` (default
-`game-icon-<unix time>.bin`). `launch-headless` starts the game process without showing it on
-screen (foreground launch requires the home-menu/applet flow, which a sysmodule cannot drive);
+`game-icon-<unix time>.bin`). Start games through the normal foreground qlaunch flow: go HOME,
+focus the game icon, then simulate `A`. `launch-headless` is deprecated compatibility and
+external-key diagnostic surface; it starts the process without showing it on screen;
 `terminate` is the system-level final termination (the same forced path the HOME-menu close
 flow falls back to after its graceful-close timeout), because the graceful `RequestExit` API is
-only reachable by system applets. `launch-headless` and `terminate` take effect immediately
+only reachable by system applets. Deprecated `launch-headless` and `terminate` take effect immediately
 with no confirmation. Numeric arguments (including Title IDs) accept `0x`-prefixed hex, bare
 hex, or decimal.
 
@@ -202,18 +202,24 @@ python3 client/sysagent.py debug trace-timeline first.jsonl second.jsonl --json
 `debug trace` arms one to four hardware execution breakpoints without patching target code. It
 records target index/address, thread/core/PC/LR/SP, `x0`–`x7`, and instruction bytes. Use
 `--ring 64 --duration 300` to keep recent hits, or `--hits N` for a one-shot hit limit. Ring
-mode defaults to a 64-hit safety cap; `--hits 0 --ring 64` explicitly removes it. Each
+mode defaults to a 64-hit safety cap; `--hits 0 --ring 64` removes the user cap while the
+hard 4096-hit and 120-second ceilings remain. Each
 `--duration-from first-hit` starts the duration clock at the first matching hit, which is useful
 when the trace must stay armed while a person reaches the operation. The default, `arm`, starts
 the clock as soon as the breakpoints are armed. Each
 `--snapshot REG[+/-OFFSET]:SIZE` reads memory through `x0`–`x30`, `sp`, `pc`, or `lr` while the
-target is stopped and records its own Result; two snapshots are supported. On each retained hit
+target is stopped and records its own Result; two snapshots are supported. Snapshots default to
+the first matching hit only; `--snapshot-hits N` sets a different limit and `0` restores
+every-hit reads. On each retained hit
 the tracer clears that execution slot, single-steps the stopped thread once, restores the slot,
 and then resumes, so later targets can execute. The selected PID defaults to the foreground
 application; `main+OFFSET` is resolved against that process. Configure a caller return address
 as another target to capture its return-time `x0`; the trace itself is not a call-stack tracer.
-`debug trace-stop`
-releases the debug handle, after which memory commands can attach normally again. `trace-dump`
+`debug trace-stop` waits for asynchronous worker cleanup to reach `active=0` before returning;
+`debug trace-stop --no-wait` returns immediately, after which the caller must poll
+`trace-status`. Memory commands can attach normally once cleanup completes. A hard
+120-second/4096-hit ceiling remains active even when user-level duration/hit limits are
+disabled. `trace-dump`
 writes the retained ring as versioned JSONL (`schemaVersion=1`, one metadata record and event
 records, including best-effort PID/Title ID/main-module/Build ID identity) and rejects a ring
 that changed during the dump. `trace-analyze` combines one or more
@@ -240,7 +246,9 @@ PID, verify title/Build IDs, resolve main-module offsets, and retain stable targ
 entry/return reporting. `trace-run --output FILE` waits for completion and exports JSONL;
 without that option it returns immediately after the breakpoints are armed so the caller can
 trigger the operation. A profile can set `trace.durationFrom` to `first-hit`; the explicit
-`--duration-from arm|first-hit` option overrides it.
+`--duration-from arm|first-hit` option overrides it. A single-process profile can set
+`trace.snapshotHits` or pass `trace-run --snapshot-hits`; the default is the first matching
+hit, and `0` captures every hit. Multitrace profiles do not support this limit.
 
 Profile v2 adds a consumer-owned symbol-offset table, per-target named/typed snapshots and
 optional `expectBytes` validation through the generic `debug read PID ADDRESS SIZE` command.
