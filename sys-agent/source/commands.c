@@ -1464,6 +1464,19 @@ void release(HidNpadButton btn)
     mutexUnlock(&controllerMutex);
 }
 
+void controllerNeutralize(void)
+{
+    mutexLock(&controllerMutex);
+    controllerState.buttons = 0;
+    controllerState.analog_stick_l.x = 0;
+    controllerState.analog_stick_l.y = 0;
+    controllerState.analog_stick_r.x = 0;
+    controllerState.analog_stick_r.y = 0;
+    if (bControllerIsInitialised)
+        writeControllerStateLocked();
+    mutexUnlock(&controllerMutex);
+}
+
 void setStickState(int side, int dxVal, int dyVal)
 {
     mutexLock(&controllerMutex);
@@ -1600,7 +1613,7 @@ void key(HiddbgKeyboardAutoPilotState* states, u64 sequentialCount)
     hiddbgUnsetKeyboardAutoPilotState();
 }
 
-void clickSequence(char* seq, u8* token)
+bool clickSequence(char* seq, u8* token)
 {
     const char startWait = 'W';
     const char startPress = '+';
@@ -1616,10 +1629,13 @@ void clickSequence(char* seq, u8* token)
     ensureControllerLocked();
     mutexUnlock(&controllerMutex);
     controllerSequenceActive = true;
+    bool cancelled = false;
     while (command != NULL)
     {
-        if ((*token) == 1)
+        if (__atomic_load_n(token, __ATOMIC_SEQ_CST) != 0) {
+            cancelled = true;
             break;
+        }
 
         if (!strncmp(command, &startLStick, 1))
         {
@@ -1665,7 +1681,19 @@ void clickSequence(char* seq, u8* token)
         {
             // wait
             currentWait = parseStringToInt(&command[1]);
-            svcSleepThread(currentWait * 1e+6l);
+            while (currentWait > 0) {
+                if (__atomic_load_n(token, __ATOMIC_SEQ_CST) != 0) {
+                    cancelled = true;
+                    break;
+                }
+                /* Poll cancellation while sleeping so a long W item does not
+                 * make clickCancel wait for the whole requested duration. */
+                const u64 slice = currentWait > 10 ? 10 : currentWait;
+                svcSleepThread(slice * 1e+6l);
+                currentWait -= slice;
+            }
+            if (cancelled)
+                break;
         }
         else
         {
@@ -1682,7 +1710,14 @@ void clickSequence(char* seq, u8* token)
         controllerLastInputTick = armGetSystemTick();
         mutexUnlock(&controllerMutex);
 
+        if (__atomic_load_n(token, __ATOMIC_SEQ_CST) != 0) {
+            cancelled = true;
+            break;
+        }
         command = sequenceTokenNext(&cursor);
     }
+    if (cancelled)
+        controllerNeutralize();
     controllerSequenceActive = false;
+    return cancelled;
 }

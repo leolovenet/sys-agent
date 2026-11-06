@@ -60,6 +60,8 @@ u8 clickThreadState = 0; // 1 = break thread
 KeyData currentKeyEvent = { 0 };
 TouchData currentTouchEvent = { 0 };
 char* currentClick = NULL;
+int currentClickFd = -1;
+int commandClientFd = -1;
 
 // for cancelling the touch/click thread
 u8 touchToken = 0;
@@ -184,10 +186,21 @@ void makeKeys(HiddbgKeyboardAutoPilotState* states, u64 sequentialCount)
     mutexUnlock(&keyMutex);
 }
 
-void makeClickSeq(char* seq)
+void makeClickSeq(char* seq, int clientFd)
 {
+    /* Keep a private handle for the final result. The command loop may close
+     * the original client fd during a long sequence; without the duplicate,
+     * its number could be reused and the result sent to another client. */
+    const int sequenceFd = clientFd >= 0 ? dup(clientFd) : -1;
     mutexLock(&clickMutex);
+    if (currentClick != NULL) {
+        free(currentClick);
+        if (currentClickFd >= 0)
+            close(currentClickFd);
+    }
+    __atomic_store_n(&clickToken, 0, __ATOMIC_SEQ_CST);
     currentClick = seq;
+    currentClickFd = sequenceFd;
     mutexUnlock(&clickMutex);
 }
 
@@ -2577,7 +2590,7 @@ int argmain(int argc, char** argv)
         printf("OK tokens=%lu estMs=%lu\n",
             (unsigned long)expandInfo.tokenCount, (unsigned long)expandInfo.estimatedMs);
         fflush(stdout);
-        makeClickSeq(seqNew);
+        makeClickSeq(seqNew, commandClientFd);
     }
 
     /* What the compile-time repeat limits are, so a client can report "this
@@ -2590,8 +2603,16 @@ int argmain(int argc, char** argv)
         fflush(stdout);
     }
 
-    if (!strcmp(argv[0], "clickCancel"))
-        clickToken = 1;
+    if (!strcmp(argv[0], "clickCancel")) {
+        if (argc != 1) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            fflush(stdout);
+            return 0;
+        }
+        __atomic_store_n(&clickToken, 1, __ATOMIC_SEQ_CST);
+        printf("OK cancel=requested\n");
+        fflush(stdout);
+    }
 
     //hold <buttontype>
     if (!strcmp(argv[0], "press"))
@@ -3389,6 +3410,7 @@ static void printOperationLog(u32 requested)
  * a worker thread's late diagnostic still reaches it. */
 static void dispatchCommand(int clientFd, char* linebuf)
 {
+    commandClientFd = clientFd;
     dup2(clientFd, STDOUT_FILENO);
     if (echoCommands) {
         printf("%s\n", linebuf);
@@ -3727,16 +3749,28 @@ void sub_click(void* arg)
         if (clickThreadState == 1)
             break;
 
+        char* sequence = NULL;
+        int clientFd = -1;
+        mutexLock(&clickMutex);
         if (currentClick != NULL)
         {
-            mutexLock(&clickMutex);
-            clickSequence(currentClick, &clickToken);
-            free(currentClick); currentClick = NULL;
-            mutexUnlock(&clickMutex);
-            printf("done\n");
+            sequence = currentClick;
+            clientFd = currentClickFd;
+            currentClick = NULL;
+            currentClickFd = -1;
         }
+        mutexUnlock(&clickMutex);
 
-        clickToken = 0;
+        if (sequence != NULL)
+        {
+            const bool cancelled = clickSequence(sequence, &clickToken);
+            free(sequence);
+            if (clientFd >= 0) {
+                const char* result = cancelled ? "cancelled\n" : "done\n";
+                (void)write(clientFd, result, strlen(result));
+                close(clientFd);
+            }
+        }
 
         svcSleepThread(1e+6L);
     }

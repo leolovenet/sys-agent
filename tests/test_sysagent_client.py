@@ -50,6 +50,7 @@ class FakeState:
         self.flaky_peek_remaining = 0
         self.repeat_support = True
         self.sequence_error = False
+        self.sequence_cancelled = False
         self.trace_busy = False
         self.trace_active = False
         self.multi_trace_active = False
@@ -427,7 +428,7 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 response = None
             elif command[0] == "freezeCount":
                 response = "03"
-            elif command[0] in {"press", "release", "click", "setStick", "clickCancel",
+            elif command[0] in {"press", "release", "click", "setStick",
                                  "detachController", "touch", "touchHold", "touchDraw",
                                  "touchCancel", "key", "keyMod", "keyMulti",
                                  "screenOff", "screenOn"}:
@@ -465,12 +466,15 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 repeat = "repeat=paren-star" if state.repeat_support else "repeat=absent"
                 response = ("OK version=1 syntax=click,press,release,wait,stick "
                             f"{repeat} maxCount=1000 maxDepth=4 maxTokens=1024 maxBytes=65536")
+            elif command[0] == "clickCancel":
+                response = "OK cancel=requested"
             elif command[0] == "clickSeq":
                 if state.sequence_error:
                     response = "ERR code=BAD_SEQUENCE index=3 detail=bad-syntax"
                 else:
                     tokens = len([token for token in command[1].split(",") if token])
-                    response = f"OK tokens={tokens} estMs={tokens * 50}\ndone"
+                    final = "cancelled" if state.sequence_cancelled else "done"
+                    response = f"OK tokens={tokens} estMs={tokens * 50}\n{final}"
             elif command[0] == "game":
                 if command[1] == "icon":
                     response = (b"\xFF\xD8" + b"ICON").hex().upper()
@@ -572,6 +576,12 @@ class FakeServer(socketserver.ThreadingTCPServer):
     def __init__(self) -> None:
         super().__init__(("127.0.0.1", 0), FakeHandler)
         self.state = FakeState()
+
+    def handle_error(self, request, client_address) -> None:
+        import sys
+        if isinstance(sys.exc_info()[1], ConnectionResetError):
+            return
+        super().handle_error(request, client_address)
 
 
 class ClientTests(unittest.TestCase):
@@ -2420,6 +2430,30 @@ class ClientTests(unittest.TestCase):
             with self.assertRaises(SysAgentProtocolError) as raised:
                 client.click_seq("(A*2")
             self.assertIn("BAD_SEQUENCE", str(raised.exception))
+
+    def test_click_seq_server_cancellation(self) -> None:
+        self.server.state.sequence_cancelled = True
+        with self.client() as client:
+            result = client.click_seq("A,W60000,A")
+        self.assertFalse(result.done)
+        self.assertTrue(result.cancelled)
+
+    def test_click_seq_ctrl_c_cancels_on_console(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import main
+
+        stderr = io.StringIO()
+        with patch.object(SysAgentClient, "click_seq", side_effect=KeyboardInterrupt):
+            with contextlib.redirect_stderr(stderr):
+                code = main([
+                    "--host", "127.0.0.1",
+                    "--port", str(self.server.server_address[1]),
+                    "--timeout", "1", "input", "click-seq", "A,W60000,A",
+                ])
+        self.assertEqual(code, 130)
+        self.assertIn("cancel requested", stderr.getvalue())
+        self.assertIn(["clickCancel"], self.server.state.commands)
 
     def test_late_diagnostic_does_not_desync_next_command(self) -> None:
         """A diagnostic printed after a silent command must not become the answer."""
