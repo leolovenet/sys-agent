@@ -21,6 +21,11 @@
 #include "util.h"
 
 #define PROCESS_PAGE_MAX 64
+#define TIME_SET_VERIFY_TOLERANCE_SECONDS 2
+
+/* Manual clock changes need the menu/admin service. The user service can read
+ * the clocks, but Horizon rejects SetCurrentTime for both local and user time. */
+TimeServiceType __nx_time_service_type = TimeServiceType_Menu;
 
 static void printHex(const void* data, size_t size)
 {
@@ -114,7 +119,7 @@ static void systemTimeCommand(void)
 {
     Result rc = timeInitialize();
     if (R_FAILED(rc)) {
-        printServiceError("time:s", rc);
+        printServiceError("time:a", rc);
         return;
     }
     u64 timestamp = 0;
@@ -130,6 +135,214 @@ static void systemTimeCommand(void)
     if (R_SUCCEEDED(locationRc)) printf("%zu timezone=", boundedLength(location.name, sizeof(location.name))); else printf("NA timezone=");
     if (R_SUCCEEDED(locationRc)) printHex(location.name, boundedLength(location.name, sizeof(location.name))); else printf("NA");
     printf(" uptimeMs=%lu errors=unix:0x%X,timezone:0x%X\n", uptimeMs, timestampRc, locationRc);
+}
+
+static bool parseTimeClock(const char* text, TimeType* type, const char** name)
+{
+    if (text == NULL || type == NULL || name == NULL)
+        return false;
+    if (!strcmp(text, "local")) {
+        *type = TimeType_LocalSystemClock;
+        *name = "local";
+        return true;
+    }
+    if (!strcmp(text, "user")) {
+        *type = TimeType_UserSystemClock;
+        *name = "user";
+        return true;
+    }
+    return false;
+}
+
+static Result getPersistentInternetTimeSync(bool* enabled);
+static Result setPersistentInternetTimeSync(bool enabled);
+static Result getRuntimeInternetTimeSync(bool* enabled);
+static Result setRuntimeInternetTimeSync(bool enabled);
+
+static void systemTimeSetCommand(u64 timestamp, TimeType type, const char* clockName)
+{
+    bool previousPersistentSync = false, previousRuntimeSync = false;
+    Result persistentGetRc = getPersistentInternetTimeSync(&previousPersistentSync);
+    Result runtimeGetRc = getRuntimeInternetTimeSync(&previousRuntimeSync);
+    if (R_FAILED(persistentGetRc) || R_FAILED(runtimeGetRc)) {
+        printf("ERR code=COMMAND_FAILED stage=readCurrentTimeSync result=0x%X "
+            "persistentResult=0x%X runtimeResult=0x%X\n",
+            R_FAILED(persistentGetRc) ? persistentGetRc : runtimeGetRc,
+            persistentGetRc, runtimeGetRc);
+        return;
+    }
+
+    Result persistentDisableRc = setPersistentInternetTimeSync(false);
+    if (R_FAILED(persistentDisableRc)) {
+        printf("ERR code=COMMAND_FAILED stage=setPersistentTimeSync result=0x%X\n",
+            persistentDisableRc);
+        return;
+    }
+
+    Result runtimeDisableRc = setRuntimeInternetTimeSync(false);
+    if (R_FAILED(runtimeDisableRc)) {
+        Result rollbackRc = setPersistentInternetTimeSync(previousPersistentSync);
+        printf("ERR code=COMMAND_FAILED stage=setRuntimeTimeSync result=0x%X "
+            "rollbackResult=0x%X\n", runtimeDisableRc, rollbackRc);
+        return;
+    }
+
+    Result rc = timeInitialize();
+    if (R_FAILED(rc)) {
+        Result persistentRollbackRc = setPersistentInternetTimeSync(previousPersistentSync);
+        Result runtimeRollbackRc = setRuntimeInternetTimeSync(previousRuntimeSync);
+        printf("ERR code=COMMAND_FAILED stage=initializeTime result=0x%X "
+            "persistentRollbackResult=0x%X runtimeRollbackResult=0x%X\n",
+            rc, persistentRollbackRc, runtimeRollbackRc);
+        return;
+    }
+
+    u64 previous = 0, observed = 0;
+    Result previousRc = timeGetCurrentTime(type, &previous);
+    Result setRc = timeSetCurrentTime(type, timestamp);
+    Result readbackRc = 0;
+    if (R_SUCCEEDED(setRc))
+        readbackRc = timeGetCurrentTime(type, &observed);
+    timeExit();
+
+    if (R_FAILED(setRc)) {
+        Result persistentRollbackRc = setPersistentInternetTimeSync(previousPersistentSync);
+        Result runtimeRollbackRc = setRuntimeInternetTimeSync(previousRuntimeSync);
+        printf("ERR code=COMMAND_FAILED stage=setCurrentTime result=0x%X clock=%s "
+            "persistentRollbackResult=0x%X runtimeRollbackResult=0x%X\n",
+            setRc, clockName, persistentRollbackRc, runtimeRollbackRc);
+        return;
+    }
+
+    bool persistentSyncAfter = false, runtimeSyncAfter = false;
+    Result persistentAfterRc = getPersistentInternetTimeSync(&persistentSyncAfter);
+    Result runtimeAfterRc = getRuntimeInternetTimeSync(&runtimeSyncAfter);
+    const bool syncVerified = R_SUCCEEDED(persistentAfterRc) && R_SUCCEEDED(runtimeAfterRc)
+        && !persistentSyncAfter && !runtimeSyncAfter;
+    u64 drift = 0;
+    bool verified = false;
+    if (R_SUCCEEDED(readbackRc)) {
+        drift = observed > timestamp ? observed - timestamp : timestamp - observed;
+        verified = drift <= TIME_SET_VERIFY_TOLERANCE_SECONDS;
+    }
+
+    printf("OK clock=%s requestedUnix=%lu previousUnix=", clockName, timestamp);
+    if (R_SUCCEEDED(previousRc)) printf("%lu", previous); else printf("NA");
+    printf(" observedUnix=");
+    if (R_SUCCEEDED(readbackRc)) printf("%lu", observed); else printf("NA");
+    printf(" driftSeconds=");
+    if (R_SUCCEEDED(readbackRc)) printf("%lu", drift); else printf("NA");
+    printf(" verified=%d previousSyncPersistent=%d previousSyncRuntime=%d "
+        "syncPersistent=", verified ? 1 : 0,
+        previousPersistentSync ? 1 : 0, previousRuntimeSync ? 1 : 0);
+    if (R_SUCCEEDED(persistentAfterRc)) printf("%d", persistentSyncAfter); else printf("NA");
+    printf(" syncRuntime=");
+    if (R_SUCCEEDED(runtimeAfterRc)) printf("%d", runtimeSyncAfter); else printf("NA");
+    printf(" syncVerified=%d errors=previous:0x%X,readback:0x%X,"
+        "syncPersistent:0x%X,syncRuntime:0x%X\n",
+        syncVerified ? 1 : 0, previousRc, readbackRc,
+        persistentAfterRc, runtimeAfterRc);
+}
+
+static Result getPersistentInternetTimeSync(bool* enabled)
+{
+    Result rc = setsysInitialize();
+    if (R_FAILED(rc))
+        return rc;
+    rc = setsysIsUserSystemClockAutomaticCorrectionEnabled(enabled);
+    setsysExit();
+    return rc;
+}
+
+static Result setPersistentInternetTimeSync(bool enabled)
+{
+    Result rc = setsysInitialize();
+    if (R_FAILED(rc))
+        return rc;
+    rc = setsysSetUserSystemClockAutomaticCorrectionEnabled(enabled);
+    setsysExit();
+    return rc;
+}
+
+static Result getRuntimeInternetTimeSync(bool* enabled)
+{
+    Result rc = timeInitialize();
+    if (R_FAILED(rc))
+        return rc;
+    u8 value = 0;
+    rc = serviceDispatchOut(timeGetServiceSession(), 100, value);
+    timeExit();
+    if (R_SUCCEEDED(rc))
+        *enabled = (value & 1) != 0;
+    return rc;
+}
+
+static Result setRuntimeInternetTimeSync(bool enabled)
+{
+    Result rc = timeInitialize();
+    if (R_FAILED(rc))
+        return rc;
+    u8 value = enabled ? 1 : 0;
+    rc = serviceDispatchIn(timeGetServiceSession(), 101, value);
+    timeExit();
+    return rc;
+}
+
+static void systemTimeSyncCommand(const char* state)
+{
+    bool persistent = false, runtime = false;
+    Result persistentGetRc = getPersistentInternetTimeSync(&persistent);
+    Result runtimeGetRc = getRuntimeInternetTimeSync(&runtime);
+
+    if (state == NULL) {
+        printf("OK enabled=");
+        if (R_SUCCEEDED(persistentGetRc)) printf("%d", persistent); else printf("NA");
+        printf(" persistent=");
+        if (R_SUCCEEDED(persistentGetRc)) printf("%d", persistent); else printf("NA");
+        printf(" runtime=");
+        if (R_SUCCEEDED(runtimeGetRc)) printf("%d", runtime); else printf("NA");
+        printf(" consistent=%d errors=persistent:0x%X,runtime:0x%X\n",
+            R_SUCCEEDED(persistentGetRc) && R_SUCCEEDED(runtimeGetRc)
+                && persistent == runtime ? 1 : 0,
+            persistentGetRc, runtimeGetRc);
+        return;
+    }
+
+    const bool requested = !strcmp(state, "enabled");
+    if (R_FAILED(persistentGetRc) || R_FAILED(runtimeGetRc)) {
+        printf("ERR code=COMMAND_FAILED stage=readCurrentTimeSync result=0x%X "
+            "persistentResult=0x%X runtimeResult=0x%X\n",
+            R_FAILED(persistentGetRc) ? persistentGetRc : runtimeGetRc,
+            persistentGetRc, runtimeGetRc);
+        return;
+    }
+
+    Result persistentSetRc = setPersistentInternetTimeSync(requested);
+    if (R_FAILED(persistentSetRc)) {
+        printf("ERR code=COMMAND_FAILED stage=setPersistentTimeSync result=0x%X\n",
+            persistentSetRc);
+        return;
+    }
+
+    Result runtimeSetRc = setRuntimeInternetTimeSync(requested);
+    if (R_FAILED(runtimeSetRc)) {
+        Result rollbackRc = setPersistentInternetTimeSync(persistent);
+        printf("ERR code=COMMAND_FAILED stage=setRuntimeTimeSync result=0x%X "
+            "rollbackResult=0x%X\n", runtimeSetRc, rollbackRc);
+        return;
+    }
+
+    bool persistentAfter = false, runtimeAfter = false;
+    Result persistentAfterRc = getPersistentInternetTimeSync(&persistentAfter);
+    Result runtimeAfterRc = getRuntimeInternetTimeSync(&runtimeAfter);
+    const bool verified = R_SUCCEEDED(persistentAfterRc) && R_SUCCEEDED(runtimeAfterRc)
+        && persistentAfter == requested && runtimeAfter == requested;
+    printf("OK enabled=%d persistent=", requested ? 1 : 0);
+    if (R_SUCCEEDED(persistentAfterRc)) printf("%d", persistentAfter); else printf("NA");
+    printf(" runtime=");
+    if (R_SUCCEEDED(runtimeAfterRc)) printf("%d", runtimeAfter); else printf("NA");
+    printf(" verified=%d errors=persistent:0x%X,runtime:0x%X\n",
+        verified ? 1 : 0, persistentAfterRc, runtimeAfterRc);
 }
 
 static void powerStatus(void)
@@ -2187,7 +2400,9 @@ bool systemCommandsDispatch(int argc, char** argv)
     if (argc <= 0) return false;
     const char* command = argv[0];
     bool known = !strcmp(command, "systemCapabilities") || !strcmp(command, "systemInfo")
-        || !strcmp(command, "systemTime") || !strcmp(command, "powerStatus")
+        || !strcmp(command, "systemTime") || !strcmp(command, "systemTimeSet")
+        || !strcmp(command, "systemTimeSync")
+        || !strcmp(command, "powerStatus")
         || !strcmp(command, "storageStatus") || !strcmp(command, "networkStatus")
         || !strcmp(command, "networkProfile") || !strcmp(command, "accountStatus")
         || !strcmp(command, "networkPublicIp") || !strcmp(command, "urlReq")
@@ -2217,6 +2432,30 @@ bool systemCommandsDispatch(int argc, char** argv)
         || !strcmp(command, "gameNcaProbe")
         || !strcmp(command, "gameNcaDump");
     if (!known) return false;
+
+    if (!strcmp(command, "systemTimeSet")) {
+        u64 timestamp = 0;
+        TimeType type = TimeType_LocalSystemClock;
+        const char* clockName = "local";
+        if (argc < 2 || argc > 3 || !tryParseStringToInt(argv[1], &timestamp)
+            || timestamp == 0 || timestamp > 0x7FFFFFFFFFFFFFFFULL
+            || (argc == 3 && !parseTimeClock(argv[2], &type, &clockName))) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        systemTimeSetCommand(timestamp, type, clockName);
+        return true;
+    }
+
+    if (!strcmp(command, "systemTimeSync")) {
+        if (argc > 2 || (argc == 2 && strcmp(argv[1], "enabled")
+                         && strcmp(argv[1], "disabled"))) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        systemTimeSyncCommand(argc == 2 ? argv[1] : NULL);
+        return true;
+    }
 
     if (!strcmp(command, "gameNcaProbe")) {
         if (argc != 2) {
@@ -2482,7 +2721,7 @@ bool systemCommandsDispatch(int argc, char** argv)
     }
 
     if (!strcmp(command, "systemCapabilities"))
-        printf("OK version=1 queries=systemInfo,systemTime,powerStatus,storageStatus,networkStatus,networkProfile,networkResolve,networkPublicIp,urlReq,accountStatus,accountBindings,applicationStatus,processList,lockScreenStatus actions=systemReboot,systemRebootEmuMMC,systemShutdown,systemSleep,networkSet,networkHostsReload,lockScreenSet,applicationTerminate,programTerminate,systemSaveDump,accountUnlink bootUnlock=status,arm,disarm,run unlockOnReboot=default,skipWithNoUnlock game=launchHeadless processPageMax=%d audio=volume,mute sensitiveData=serial,account,wifiPassphrase authentication=none sleep=experimental rebootEmuMMCMariko=validated rebootEmuMMCErista=experimental\n", PROCESS_PAGE_MAX);
+        printf("OK version=1 queries=systemInfo,systemTime,powerStatus,storageStatus,networkStatus,networkProfile,networkResolve,networkPublicIp,urlReq,accountStatus,accountBindings,applicationStatus,processList,lockScreenStatus actions=systemTimeSet,systemTimeSync,systemReboot,systemRebootEmuMMC,systemShutdown,systemSleep,networkSet,networkHostsReload,lockScreenSet,applicationTerminate,programTerminate,systemSaveDump,accountUnlink bootUnlock=status,arm,disarm,run unlockOnReboot=default,skipWithNoUnlock game=launchHeadless processPageMax=%d audio=volume,mute timeSet=local,user timeSetVerifySeconds=2 internetTimeSync=get,set sensitiveData=serial,account,wifiPassphrase authentication=none sleep=experimental rebootEmuMMCMariko=validated rebootEmuMMCErista=experimental\n", PROCESS_PAGE_MAX);
     else if (!strcmp(command, "systemInfo")) systemInfo();
     else if (!strcmp(command, "systemTime")) systemTimeCommand();
     else if (!strcmp(command, "powerStatus")) powerStatus();

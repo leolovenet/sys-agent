@@ -15,7 +15,9 @@ The system-management protocol is additive and uses single-line `OK key=value` o
 |--|--|--|--|
 |systemCapabilities|Lists protocol version, query groups, actions, limits, and sensitive-data policy|none|`systemCapabilities`|
 |systemInfo|Reports firmware, hardware model, region, language, device nickname, and serial number|none|`systemInfo`|
-|systemTime|Reports Unix time, timezone, and uptime|none|`systemTime`|
+|systemTime|Reports Unix time, timezone, and uptime. The client also exposes this as `system get-time`|none|`systemTime`|
+|systemTimeSet|Disables Horizon's Internet time synchronization, sets a device clock from a UTC Unix timestamp, then reads both states back. The default `local` clock is the one used for displayed local time; `user` selects the user-system clock. Clock verification allows a two-second readback drift; `syncVerified` confirms both the persistent and runtime synchronization values are disabled|unixSeconds, optional `local` or `user`|`systemTimeSet 1762387200` / `systemTimeSet 1762387200 user`|
+|systemTimeSync|Reports or changes Horizon's "Synchronize Clock via Internet" setting. Reads report both the persisted `set:sys` value and the live `time:a` value; writes update both and verify them|none, or `enabled` / `disabled`|`systemTimeSync` / `systemTimeSync enabled` / `systemTimeSync disabled`|
 |powerStatus|Reports battery, charger, voltage, health, temperature, and current-limit fields|none|`powerStatus`|
 |storageStatus|Reports SD mount state and total/free/used bytes|none|`storageStatus`|
 |networkStatus|Reports link state, signal strength, and current IPv4 configuration|none|`networkStatus`|
@@ -78,6 +80,25 @@ searches, FTP transfers, open files, and the command connection. A successful re
 reach the client before the requested state change takes effect. Clients must never retry these
 non-idempotent commands automatically. `systemSleep` remains experimental until real-device
 acceptance succeeds and is advertised as such by `systemCapabilities`.
+
+`systemTimeSet` takes a UTC Unix timestamp in seconds, not a local wall-clock date. Set the
+timezone separately through Horizon if needed. The command uses `time:a` and changes the
+`local` clock by default because that is the clock whose value feeds the user clock and displayed
+system time; `user` remains available for explicit user-system-clock maintenance. Before
+changing the clock it disables "Synchronize Clock via Internet" in both `set:sys` and `time:a`,
+so network correction cannot overwrite the requested time. The response reports the previous
+persistent/runtime synchronization values, their state after the write, `verified` for the
+clock readback, and `syncVerified` for the disabled state. If setting the clock fails, the
+command attempts to restore both previous synchronization values. Setting an incorrect clock
+can invalidate TLS and other time-sensitive operations. The command is never retried
+automatically.
+
+`systemTimeSync` is the equivalent of Horizon's "Synchronize Clock via Internet" option. It
+controls whether the user-system clock follows network time; it does not itself fetch a time
+from an NTP server. Reads return `persistent` from `set:sys` and `runtime` from `time:a`, with
+`consistent` indicating whether they agree. Writes first persist the setting through `set:sys`,
+then update the live `time:a` user clock, and read both back as `verified`. The client command is
+`system time-sync [status|enabled|disabled]`. Writes are never retried automatically.
 
 `systemRebootEmuMMC` reads `sdmc:/bootloader/hekate_ipl.ini` on every invocation and requires
 exactly one main-file boot entry with `id=Atm-Emu`. It refuses to reboot if the ID is missing,

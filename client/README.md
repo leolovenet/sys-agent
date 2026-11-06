@@ -42,8 +42,8 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.2.1
-sys-agent 2.18.0  (switch:6000)
+client    1.2.3
+sys-agent 2.19.0  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
@@ -97,6 +97,13 @@ standalone debugger behavior and will fail if dmnt already owns the game's debug
 ```bash
 python3 client/sysagent.py --host switch system capabilities
 python3 client/sysagent.py --host switch system query info
+python3 client/sysagent.py --host switch system get-time
+python3 client/sysagent.py --host switch system query time
+python3 client/sysagent.py --host switch system set-time 1762387200
+python3 client/sysagent.py --host switch system set-time 1762387200 --clock user
+python3 client/sysagent.py --host switch system time-sync status
+python3 client/sysagent.py --host switch system time-sync enabled
+python3 client/sysagent.py --host switch system time-sync disabled
 python3 client/sysagent.py --host switch system log --count 8
 python3 client/sysagent.py --host switch system query network
 python3 client/sysagent.py --host switch system account-bindings
@@ -114,6 +121,18 @@ python3 client/sysagent.py --host switch system action reboot --no-unlock
 `system query network-profile` returns the Wi-Fi passphrase over an unauthenticated,
 unencrypted TCP connection. Use it only on a trusted isolated network. The client never
 automatically retries reboot, shutdown, sleep, wireless changes, or application termination.
+`system set-time` takes UTC Unix seconds and changes the displayed `local` clock by default;
+use `--clock user` for the user-system clock. The sysmodule reads the clock back after setting
+it and reports `verified=1` when the observed value is within two seconds. It first disables
+Horizon's "Synchronize Clock via Internet" setting and reports `syncVerified=1` after confirming
+both its persistent and runtime values are off. If the clock write fails, the sysmodule attempts
+to restore the previous synchronization setting. A wrong clock can break TLS and other
+time-sensitive operations, and clock changes are never retried.
+`system get-time` is an alias for `system query time`.
+`system time-sync` reads or changes Horizon's "Synchronize Clock via Internet" setting. It
+reports both the persisted `set:sys` value and the live `time:a` runtime value; sets update
+both and verify the readback. This controls automatic network correction but does not itself
+fetch a time from an NTP server.
 `system save-dump` copies a System Save read-only to
 `/switch/sys-agent/backups/<name>` and refuses to overwrite an existing backup name.
 `system account-unlink` is an explicit destructive Account administrator operation: it removes

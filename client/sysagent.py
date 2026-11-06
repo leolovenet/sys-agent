@@ -21,7 +21,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.2.2"
+CLIENT_VERSION = "1.2.3"
 TRACE_SCHEMA_VERSION = 1
 TRACE_PROFILE_SCHEMA_VERSION = 2
 TRACE_BOOT_EPOCH_TOLERANCE_MS = 2000
@@ -771,6 +771,23 @@ class SysAgentClient:
         if name not in queries:
             raise ValueError("unsupported system query")
         return require_ok(self.command(queries[name], retry=True))
+
+    def time_sync(self, enabled: bool | None = None) -> dict[str, str]:
+        """Read or change Horizon's synchronize-clock-via-Internet setting."""
+        if enabled is None:
+            return require_ok(self.command("systemTimeSync", retry=True))
+        state = "enabled" if enabled else "disabled"
+        return require_ok(self.command(f"systemTimeSync {state}", retry=False))
+
+    def set_system_time(self, unix_timestamp: int,
+                        clock: str = "local") -> dict[str, str]:
+        """Set the clock and disable Internet correction, then return readbacks."""
+        if not 1 <= unix_timestamp <= 0x7FFFFFFFFFFFFFFF:
+            raise ValueError("Unix timestamp must be in 1..0x7FFFFFFFFFFFFFFF")
+        if clock not in {"local", "user"}:
+            raise ValueError("clock must be local or user")
+        return require_ok(self.command(
+            f"systemTimeSet {unix_timestamp} {clock}", retry=False))
 
     def account_bindings(self) -> dict[str, str]:
         return require_ok(self.command("accountBindings", retry=True))
@@ -3992,6 +4009,19 @@ def _cmd_system_query(client: SysAgentClient, args: argparse.Namespace) -> None:
     _emit(client.system_query(args.query), args)
 
 
+def _cmd_system_get_time(client: SysAgentClient, args: argparse.Namespace) -> None:
+    _emit(client.system_query("time"), args)
+
+
+def _cmd_system_time_sync(client: SysAgentClient, args: argparse.Namespace) -> None:
+    enabled = None if args.state == "status" else args.state == "enabled"
+    print_fields(client.time_sync(enabled))
+
+
+def _cmd_system_time_set(client: SysAgentClient, args: argparse.Namespace) -> None:
+    print_fields(client.set_system_time(args.unix_timestamp, args.clock))
+
+
 def _cmd_account_bindings(client: SysAgentClient, args: argparse.Namespace) -> None:
     _emit(client.account_bindings(), args)
 
@@ -5636,6 +5666,20 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      metavar="QUERY"),
                  JSON_ARG, OUT_ARG),
                 SYSTEM_QUERY_HELP),
+        Command("get-time", "Alias for `system query time`", _cmd_system_get_time,
+                (JSON_ARG, OUT_ARG)),
+        Command("set-time", "Set the device clock and disable Internet time sync",
+                _cmd_system_time_set,
+                (Arg("unix_timestamp", "UTC Unix timestamp in seconds",
+                     type=parse_int, metavar="UNIX"),
+                 Arg("clock", "clock to change (default local)",
+                     choices=("local", "user"), default="local",
+                     flags=("--clock",)))),
+        Command("time-sync", "Read or change the Internet time-synchronization setting",
+                _cmd_system_time_sync,
+                (Arg("state", "status, enabled, or disabled",
+                     choices=("status", "enabled", "disabled"),
+                     nargs="?", default="status"),)),
         Command("account-bindings", "List local users and their local BAAS/NAS binding state",
                 _cmd_account_bindings, (JSON_ARG, OUT_ARG)),
         Command("save-dump", "Export a read-only NAND System Save tree to SD",

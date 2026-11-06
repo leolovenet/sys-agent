@@ -279,6 +279,20 @@ class FakeHandler(socketserver.StreamRequestHandler):
             elif command[0] in {"systemInfo", "systemTime", "powerStatus", "storageStatus",
                                "networkStatus", "networkProfile", "accountStatus"}:
                 response = f"OK command={command[0]} sample=1 errors=field:0x0"
+            elif command[0] == "systemTimeSet":
+                response = (
+                    f"OK clock={command[2]} requestedUnix={command[1]} "
+                    f"previousUnix=1700000000 observedUnix={command[1]} "
+                    "driftSeconds=0 verified=1 previousSyncPersistent=1 "
+                    "previousSyncRuntime=1 syncPersistent=0 syncRuntime=0 syncVerified=1 "
+                    "errors=previous:0x0,readback:0x0,syncPersistent:0x0,syncRuntime:0x0"
+                )
+            elif command[0] == "systemTimeSync":
+                enabled = 1 if len(command) == 1 or command[1] == "enabled" else 0
+                response = (
+                    f"OK enabled={enabled} persistent={enabled} runtime={enabled} "
+                    "consistent=1 verified=1 errors=persistent:0x0,runtime:0x0"
+                )
             elif command[0] == "accountBindings":
                 response = (
                     "OK count=1 users=0:0123456789ABCDEF:"
@@ -614,6 +628,20 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(client.set_wireless(False)["wireless"], "0")
             self.assertEqual(client.lock_screen_status()["lockScreen"], "0")
             self.assertEqual(client.set_lock_screen(True)["lockScreen"], "1")
+            response = client.set_system_time(1700000000)
+            self.assertEqual(response["verified"], "1")
+            self.assertEqual(response["syncVerified"], "1")
+            self.assertEqual(self.server.state.last_command,
+                             ["systemTimeSet", "1700000000", "local"])
+            response = client.set_system_time(1700000123, "user")
+            self.assertEqual(response["clock"], "user")
+            self.assertEqual(self.server.state.last_command,
+                             ["systemTimeSet", "1700000123", "user"])
+            self.assertEqual(client.time_sync()["enabled"], "1")
+            self.assertEqual(self.server.state.last_command, ["systemTimeSync"])
+            self.assertEqual(client.time_sync(False)["enabled"], "0")
+            self.assertEqual(self.server.state.last_command,
+                             ["systemTimeSync", "disabled"])
             self.assertEqual(client.system_action("reboot")["action"], "systemReboot")
             self.assertEqual(self.server.state.last_command, ["systemReboot"])
             # Lock/unlock is server-side by default; the flag opts out.
@@ -628,6 +656,10 @@ class ClientTests(unittest.TestCase):
                 client.system_action("sleep", unlock=False)
             with self.assertRaises(ValueError):
                 client.process_list(0, 65)
+            with self.assertRaises(ValueError):
+                client.set_system_time(0)
+            with self.assertRaises(ValueError):
+                client.set_system_time(1700000000, "network")
             with self.assertRaises(ValueError):
                 client.system_action("payload")
 
@@ -660,6 +692,50 @@ class ClientTests(unittest.TestCase):
                 client.program_terminate(0)
             with self.assertRaises(ValueError):
                 client.account_unlink(0, 0)
+
+    def test_system_set_time_cli(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import main
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = main([
+                "--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                "--timeout", "1", "system", "set-time", "1700000000", "--clock", "user",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn("clock=user", output.getvalue())
+        self.assertEqual(self.server.state.last_command,
+                         ["systemTimeSet", "1700000000", "user"])
+
+    def test_system_time_alias_and_sync_cli(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import main
+
+        base = [
+            "--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+            "--timeout", "1", "system",
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main([*base, "get-time"]), 0)
+        self.assertIn("command=systemTime", output.getvalue())
+        self.assertEqual(self.server.state.last_command, ["systemTime"])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main([*base, "time-sync"]), 0)
+        self.assertIn("enabled=1", output.getvalue())
+        self.assertEqual(self.server.state.last_command, ["systemTimeSync"])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main([*base, "time-sync", "disabled"]), 0)
+        self.assertIn("enabled=0", output.getvalue())
+        self.assertEqual(self.server.state.last_command,
+                         ["systemTimeSync", "disabled"])
 
     def test_url_request_and_required_url(self) -> None:
         with self.client() as client:

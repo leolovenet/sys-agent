@@ -1,3 +1,3 @@
 #pragma once
 
-#define SYS_AGENT_VERSION "2.18.1"
+#define SYS_AGENT_VERSION "2.19.0"
