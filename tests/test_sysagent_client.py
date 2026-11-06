@@ -2065,6 +2065,8 @@ class ClientTests(unittest.TestCase):
             require_ok(parse_response("ERR code=DEBUG_BUSY result=0x10201"))
         with self.assertRaisesRegex(SysAgentProtocolError, "bluetooth"):
             require_ok(parse_response("ERR code=WEIRD result=0x2F4471"))
+        with self.assertRaisesRegex(SysAgentProtocolError, "allocate enough memory"):
+            require_ok(parse_response("ERR code=NO_MEMORY"))
 
     def test_unknown_search_commands_and_status_fields(self) -> None:
         with self.client() as client:
@@ -2789,6 +2791,48 @@ class ClientTests(unittest.TestCase):
         code = main(["--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
                      "--timeout", "1", "search", "refine", "9223372036854775809", "changed"])
         self.assertEqual(code, 0)
+
+    def test_search_run_closes_finished_session(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import main
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = main([
+                "--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                "--timeout", "1", "search", "run", "0x80000000", "0x80001000", "DEADBEEF",
+                "--poll-interval", "0",
+            ])
+        self.assertEqual(code, 0)
+        self.assertIn(["searchClose", "7"], self.server.state.commands)
+
+    def test_search_run_closes_cancelled_session(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import SysAgentClient, main
+
+        original_wait = SysAgentClient.wait
+        interrupted = False
+
+        def interrupt_once(
+            client: SysAgentClient, session: int, poll_interval: float = 0.25,
+        ):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return original_wait(client, session, poll_interval)
+
+        with patch.object(SysAgentClient, "wait", interrupt_once):
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                code = main([
+                    "--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+                    "--timeout", "1", "search", "run", "0x80000000", "0x80001000",
+                    "DEADBEEF", "--poll-interval", "0",
+                ])
+        self.assertEqual(code, 130)
+        self.assertIn(["searchCancel", "7"], self.server.state.commands)
+        self.assertIn(["searchClose", "7"], self.server.state.commands)
 
     def test_legacy_cli_and_raw(self) -> None:
         from client.sysagent import main

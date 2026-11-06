@@ -27,6 +27,7 @@ typedef struct {
     size_t patternSize;
     size_t alignment;
     u64* results;
+    size_t resultsCapacity;
 } SearchManager;
 
 typedef struct {
@@ -111,7 +112,7 @@ static void recordMatch(u64 address, void* context)
     MatchContext* matchContext = (MatchContext*)context;
     SearchManager* current = matchContext->manager;
     current->status.totalMatches++;
-    if (current->status.storedMatches < SEARCH_MAX_RESULTS) {
+    if (current->status.storedMatches < current->resultsCapacity) {
         current->results[current->status.storedMatches] = address;
         current->status.storedMatches++;
     }
@@ -268,7 +269,17 @@ void searchShutdown(void)
     }
     free(manager.results);
     manager.results = NULL;
+    manager.resultsCapacity = 0;
     unknownSearchCleanup();
+}
+
+static size_t maximumResultCount(u64 start, u64 end, u64 alignment)
+{
+    const u64 span = end - start;
+    u64 count = span / alignment + (span % alignment != 0);
+    if (count > SEARCH_MAX_RESULTS)
+        count = SEARCH_MAX_RESULTS;
+    return (size_t)count;
 }
 
 static SearchStartResult queueSearch(u64 processId, u64 start, u64 end, const u8* pattern,
@@ -289,13 +300,16 @@ static SearchStartResult queueSearch(u64 processId, u64 start, u64 end, const u8
         return SearchStartBusy;
     }
 
-    u64* results = malloc(sizeof(u64) * SEARCH_MAX_RESULTS);
-    if (results == NULL) {
-        mutexUnlock(&manager.mutex);
-        return SearchStartNoMemory;
+    const size_t requiredCapacity = maximumResultCount(start, end, alignment);
+    if (manager.resultsCapacity < requiredCapacity) {
+        u64* results = realloc(manager.results, sizeof(u64) * requiredCapacity);
+        if (results == NULL) {
+            mutexUnlock(&manager.mutex);
+            return SearchStartNoMemory;
+        }
+        manager.results = results;
+        manager.resultsCapacity = requiredCapacity;
     }
-    free(manager.results);
-    manager.results = results;
     memcpy(manager.pattern, pattern, patternSize);
     manager.patternSize = patternSize;
     manager.alignment = alignment;
@@ -481,6 +495,7 @@ bool searchClose(u64 sessionId)
     if (found && manager.status.state != SearchStateQueued && manager.status.state != SearchStateRunning) {
         free(manager.results);
         manager.results = NULL;
+        manager.resultsCapacity = 0;
         memset(&manager.status, 0, sizeof(manager.status));
         manager.status.state = SearchStateIdle;
         closed = true;

@@ -21,7 +21,7 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.2.1"
+CLIENT_VERSION = "1.2.2"
 TRACE_SCHEMA_VERSION = 1
 TRACE_PROFILE_SCHEMA_VERSION = 2
 TRACE_BOOT_EPOCH_TOLERANCE_MS = 2000
@@ -335,7 +335,7 @@ ERROR_CODE_NOTES = {
     "WAIT_TIMEOUT": "the requested process was not created before the timeout",
     "DNS_RESOLVE_FAILED": "the console resolver could not resolve the hostname",
     "DNS_NO_ADDRESS": "the hostname resolved without an IPv4 address",
-    "NO_MEMORY": "there was not enough memory to format the response",
+    "NO_MEMORY": "the sys-agent could not allocate enough memory for the requested operation",
     "NETWORK_BUSY": "another console-side URL request is still running",
     "NETWORK_UNAVAILABLE": "the console-side network worker is unavailable",
     "HTTP_TIMEOUT": "the URL request timed out",
@@ -5414,17 +5414,27 @@ def _cmd_search(client: SysAgentClient, args: argparse.Namespace) -> int:
     session = client.start(args.start, args.end, args.pattern)
     print(f"session={session}", file=sys.stderr)
     try:
-        status = client.wait(session, args.poll_interval)
-    except KeyboardInterrupt:
-        client.cancel(session)
-        print("cancel requested", file=sys.stderr)
-        return 130
-    print(dataclasses.asdict(status), file=sys.stderr)
-    if status.state == "error":
-        return 2
-    for address in client.iter_results(session, args.page_size):
-        print(f"0x{address:016X}")
-    return 0 if status.state == "done" else 1
+        try:
+            status = client.wait(session, args.poll_interval)
+        except KeyboardInterrupt:
+            print("cancel requested", file=sys.stderr)
+            return 130
+        print(dataclasses.asdict(status), file=sys.stderr)
+        if status.state == "error":
+            return 2
+        for address in client.iter_results(session, args.page_size):
+            print(f"0x{address:016X}")
+        return 0 if status.state == "done" else 1
+    finally:
+        try:
+            status = client.status(session)
+            if status.state not in TERMINAL_STATES:
+                client.cancel(session)
+                client.wait(session, args.poll_interval)
+            client.close_session(session)
+        except (OSError, SysAgentProtocolError) as error:
+            print(f"warning: could not close search session {session}: {error}",
+                  file=sys.stderr)
 
 
 # ---- input button table -----------------------------------------------------

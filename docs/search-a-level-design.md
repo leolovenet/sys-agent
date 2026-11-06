@@ -40,7 +40,7 @@ most approximately:
 
 |Allocation|Maximum|
 |--|--:|
-|Stored result addresses|512 KiB|
+|Stored result addresses|up to 512 KiB|
 |Scan buffer plus overlap|about 256.25 KiB|
 |Search worker stack|64 KiB|
 |Pattern and session metadata|less than 1 KiB|
@@ -49,6 +49,13 @@ The search-specific peak is about 833 KiB. Existing worker stacks, TCP line buff
 state, and temporary legacy-command allocations still share the 4.5 MiB heap. Large legacy
 `peekMulti` or screenshot allocations can increase the concurrent peak, so real-device stress
 testing must include those commands while a search is active.
+
+The exact-search result table is sized to the theoretical maximum number of aligned candidate
+addresses in the requested range, capped at 65,536 entries. A small range therefore allocates
+only the addresses it could possibly fill rather than the full 512 KiB maximum. The table is
+reused when it already has enough capacity, so starting a new exact search while a completed
+session still exists does not allocate a second table. `searchClose` remains the operation that
+releases the table and clears the session.
 
 ## Failure behavior
 
