@@ -438,22 +438,46 @@ static void debugWatchThreadMain(void* arg)
     rc = 0;
 
 cleanup:
+    bool quiesced = false;
     if (attached && !processExited) {
         Result quiesceRc =
-            debugHwBpQuiesce(debugHandle, !resumed || eventPending, NULL);
-        if (R_FAILED(quiesceRc))
+            debugHwBpQuiesce(debugHandle, !resumed || eventPending,
+                &processExited);
+        if (R_FAILED(quiesceRc)) {
             cleanupRc = quiesceRc;
+        } else {
+            quiesced = true;
+        }
     }
 
+    bool slotsCleared = true;
     if (ctxArmed) {
         Result clearRc = debugHwBpClearAllCores(ctxSlot);
-        if (R_FAILED(clearRc) && R_SUCCEEDED(cleanupRc))
-            cleanupRc = clearRc;
+        if (R_FAILED(clearRc)) {
+            slotsCleared = false;
+            if (R_SUCCEEDED(cleanupRc))
+                cleanupRc = clearRc;
+        }
     }
     if (dataArmed) {
         Result clearRc = debugHwBpClearAllCores(wpSlot);
-        if (R_FAILED(clearRc) && R_SUCCEEDED(cleanupRc))
-            cleanupRc = clearRc;
+        if (R_FAILED(clearRc)) {
+            slotsCleared = false;
+            if (R_SUCCEEDED(cleanupRc))
+                cleanupRc = clearRc;
+        }
+    }
+
+    /* A hit-limit exit can leave the watched store's hardware-data exception
+     * pending. Clear the slots first so resuming cannot immediately re-hit,
+     * then acknowledge the exception before closing the debug handle. */
+    if (attached && !processExited && resumed && quiesced && slotsCleared) {
+        bool drainExited = false;
+        Result continueRc = debugHwBpDrainAndContinueAll(
+            debugHandle, &drainExited);
+        if (R_FAILED(continueRc) && R_SUCCEEDED(cleanupRc))
+            cleanupRc = continueRc;
+        processExited = drainExited;
     }
 
     if (attached && debugHandle != INVALID_HANDLE)

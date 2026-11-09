@@ -43,7 +43,7 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 
 ```text
 client    1.2.4
-sys-agent 2.19.1  (switch:6000)
+sys-agent 2.19.2  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
