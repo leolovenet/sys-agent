@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import ipaddress
 import json
 import os
 import re
@@ -21,11 +22,12 @@ TERMINAL_STATES = {"done", "cancelled", "error"}
 # The client is versioned on its own: this number moves when this file changes, while the
 # sysmodule on the console keeps its own version (whatever `getVersion` answers).  `version`
 # prints both, labelled, so a mismatch is obvious; `--version` prints this one alone.
-CLIENT_VERSION = "1.2.4"
+CLIENT_VERSION = "1.3.0"
 TRACE_SCHEMA_VERSION = 1
 TRACE_PROFILE_SCHEMA_VERSION = 2
 TRACE_BOOT_EPOCH_TOLERANCE_MS = 2000
 TRACE_STOP_TIMEOUT_SECONDS = 30.0
+NETWORK_RECONFIGURE_TIMEOUT_SECONDS = 20.0
 
 # The console's default keySleepTime (25 ms) is fast enough for the home menu but too
 # fast for the game's on-screen keyboard: measured in ACNH 3.0.3's chat field, 25/30 ms
@@ -42,7 +44,10 @@ RESPONSE_LIMIT = 4 * 1024 * 1024
 
 
 class SysAgentProtocolError(RuntimeError):
-    pass
+    def __init__(self, message: str,
+                 response: dict[str, str] | None = None) -> None:
+        super().__init__(message)
+        self.response = response
 
 
 # --- AES-128 (FIPS-197), single-block ECB decrypt, dependency-free ----------
@@ -288,7 +293,9 @@ def require_ok(response: dict[str, str]) -> dict[str, str]:
             if key in response
         )
         suffix = f" ({details})" if details else ""
-        raise SysAgentProtocolError(f"sys-agent error: {code}{suffix}{_describe_error(response)}")
+        raise SysAgentProtocolError(
+            f"sys-agent error: {code}{suffix}{_describe_error(response)}",
+            response=response)
     return response
 
 
@@ -335,6 +342,8 @@ ERROR_CODE_NOTES = {
     "WAIT_TIMEOUT": "the requested process was not created before the timeout",
     "DNS_RESOLVE_FAILED": "the console resolver could not resolve the hostname",
     "DNS_NO_ADDRESS": "the hostname resolved without an IPv4 address",
+    "NETWORK_NOT_CONNECTED": "the console has no connected Wi-Fi or Ethernet profile",
+    "NETWORK_VERIFY_FAILED": "the profile did not read back with the requested network settings",
     "NO_MEMORY": "the sys-agent could not allocate enough memory for the requested operation",
     "NETWORK_BUSY": "another console-side URL request is still running",
     "NETWORK_UNAVAILABLE": "the console-side network worker is unavailable",
@@ -383,6 +392,30 @@ def validate_dns_hostname(hostname: str) -> str:
         if any(not (character.isalnum() or character == "-") for character in label):
             raise ValueError("hostname must not contain URL syntax or other punctuation")
     return hostname
+
+
+def validate_ipv4(value: str, field: str = "address",
+                  allow_unspecified: bool = False) -> str:
+    """Return a canonical dotted IPv4 token for a console command argument."""
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError as exc:
+        raise ValueError(f"{field} must be a dotted IPv4 address") from exc
+    if address.is_unspecified and not allow_unspecified:
+        raise ValueError(f"{field} must not be 0.0.0.0")
+    return str(address)
+
+
+def validate_ipv4_mask(value: str) -> str:
+    """Return a canonical contiguous IPv4 subnet mask."""
+    try:
+        mask = ipaddress.IPv4Address(value)
+        ipaddress.IPv4Network(f"0.0.0.0/{mask}")
+    except (ipaddress.AddressValueError, ipaddress.NetmaskValueError) as exc:
+        raise ValueError("mask must be a contiguous IPv4 subnet mask") from exc
+    if mask == ipaddress.IPv4Address("0.0.0.0"):
+        raise ValueError("mask must be a contiguous IPv4 subnet mask")
+    return str(mask)
 
 
 def parse_log_line(line: str) -> dict[str, str]:
@@ -765,13 +798,50 @@ class SysAgentClient:
             "power": "powerStatus",
             "storage": "storageStatus",
             "network": "networkStatus",
-            "network-profile": "networkProfile",
             "account": "accountStatus",
             "application": "applicationStatus",
         }
         if name not in queries:
             raise ValueError("unsupported system query")
         return require_ok(self.command(queries[name], retry=True))
+
+    def network_get(self) -> dict[str, str]:
+        """Read link state and the active IPv4/DNS configuration."""
+        return require_ok(self.command("networkStatus", retry=True))
+
+    def network_get_profile(self) -> dict[str, str]:
+        """Read the current network profile, including its Wi-Fi passphrase."""
+        return require_ok(self.command("networkProfile", retry=True))
+
+    def set_network_address(self, ip: str, mask: str,
+                            gateway: str) -> dict[str, str]:
+        """Persist manual IPv4 settings on the current network profile."""
+        address = validate_ipv4(ip, "ip")
+        subnet_mask = validate_ipv4_mask(mask)
+        gateway_address = validate_ipv4(gateway, "gateway", allow_unspecified=True)
+        return require_ok(self.command(
+            f"networkIpSet {address} {subnet_mask} {gateway_address}", retry=False))
+
+    def set_network_address_automatic(self) -> dict[str, str]:
+        """Switch the current network profile back to automatic IPv4 addressing."""
+        return require_ok(self.command("networkIpSet auto", retry=False))
+
+    def network_get_dns(self) -> dict[str, str]:
+        """Read configured and currently active DNS servers."""
+        return require_ok(self.command("networkDnsGet", retry=True))
+
+    def network_set_dns(self, primary: str,
+                        secondary: str = "0.0.0.0") -> dict[str, str]:
+        """Persist manual DNS servers on the current network profile."""
+        primary_dns = validate_ipv4(primary, "primary DNS")
+        secondary_dns = validate_ipv4(
+            secondary, "secondary DNS", allow_unspecified=True)
+        return require_ok(self.command(
+            f"networkDnsSet {primary_dns} {secondary_dns}", retry=False))
+
+    def set_network_dns_automatic(self) -> dict[str, str]:
+        """Switch the current network profile back to automatic DNS."""
+        return require_ok(self.command("networkDnsSet auto", retry=False))
 
     def time_sync(self, enabled: bool | None = None) -> dict[str, str]:
         """Read or change Horizon's synchronize-clock-via-Internet setting."""
@@ -4033,6 +4103,92 @@ def _cmd_system_query(client: SysAgentClient, args: argparse.Namespace) -> None:
     _emit(client.system_query(args.query), args)
 
 
+def _cmd_network_get(client: SysAgentClient, args: argparse.Namespace) -> None:
+    _emit(client.network_get(), args)
+
+
+def _cmd_network_get_profile(client: SysAgentClient,
+                             args: argparse.Namespace) -> None:
+    _emit(client.network_get_profile(), args)
+
+
+def _probe_network_after_reconfigure(client: SysAgentClient, host: str) -> None:
+    """Poll a reconfigured address until NIFM reports a usable IPv4 configuration."""
+    print(f"IP change applied; checking network at {host} ...")
+    probe_timeout = min(max(client.timeout, 0.5), 2.0)
+    deadline = time.monotonic() + NETWORK_RECONFIGURE_TIMEOUT_SECONDS
+    last_error: BaseException | None = None
+    last_status: dict[str, str] | None = None
+    while time.monotonic() < deadline:
+        try:
+            with SysAgentClient(host, client.port, probe_timeout, retries=0) as probe:
+                status = probe.network_get()
+                if (status.get("status") == "4"
+                        and status.get("ip") not in {None, "NA"}
+                        and status.get("mask") not in {None, "NA"}):
+                    print_fields(status)
+                    return
+                last_status = status
+        except (OSError, SysAgentProtocolError) as probe_error:
+            last_error = probe_error
+        time.sleep(0.5)
+    detail = last_status if last_status is not None else last_error
+    raise SysAgentProtocolError(
+        f"IP change was sent, but network at {host} did not become ready within "
+        f"{NETWORK_RECONFIGURE_TIMEOUT_SECONDS:.0f}s: {detail}") from last_error
+
+
+def _cmd_network_set(client: SysAgentClient, args: argparse.Namespace) -> None:
+    automatic = args.ip == "auto"
+    if automatic:
+        if args.mask is not None or args.gateway is not None:
+            raise ValueError("network set auto does not accept mask or gateway")
+        requested_ip = None
+    else:
+        if args.ip is None or args.mask is None or args.gateway is None:
+            raise ValueError("network set requires ip mask gateway, or the single word auto")
+        requested_ip = validate_ipv4(args.ip, "ip")
+    try:
+        if automatic:
+            response = client.set_network_address_automatic()
+        else:
+            response = client.set_network_address(
+                requested_ip, args.mask, args.gateway)
+    except SysAgentProtocolError as error:
+        response = error.response or {}
+        if (response.get("code") == "NETWORK_VERIFY_FAILED"
+                and response.get("stage") == "verifyAddress"):
+            probe_host = requested_ip or client.host
+            if automatic:
+                try:
+                    readback_ip = validate_ipv4(
+                        response.get("ip", ""), "readback ip")
+                    probe_host = readback_ip
+                except ValueError:
+                    pass
+            _probe_network_after_reconfigure(client, probe_host)
+            return
+        raise
+    print_fields(response)
+
+
+def _cmd_network_get_dns(client: SysAgentClient, args: argparse.Namespace) -> None:
+    _emit(client.network_get_dns(), args)
+
+
+def _cmd_network_set_dns(client: SysAgentClient, args: argparse.Namespace) -> None:
+    if args.primary == "auto":
+        if args.secondary is not None:
+            raise ValueError("network set-dns auto does not accept DNS servers")
+        print_fields(client.set_network_dns_automatic())
+        return
+    if args.primary is None:
+        raise ValueError(
+            "network set-dns requires a primary DNS server, or the single word auto")
+    print_fields(client.network_set_dns(
+        args.primary, args.secondary or "0.0.0.0"))
+
+
 def _cmd_system_get_time(client: SysAgentClient, args: argparse.Namespace) -> None:
     _emit(client.system_query("time"), args)
 
@@ -4113,8 +4269,14 @@ def _cmd_system_action(client: SysAgentClient, args: argparse.Namespace) -> None
     print_fields(client.system_action(args.command, unlock=not args.no_unlock))
 
 
-def _cmd_wireless(client: SysAgentClient, args: argparse.Namespace) -> None:
-    print_fields(client.set_wireless(args.state == "enabled"))
+def _cmd_network_wireless_enabled(client: SysAgentClient,
+                                  args: argparse.Namespace) -> None:
+    print_fields(client.set_wireless(True))
+
+
+def _cmd_network_wireless_disabled(client: SysAgentClient,
+                                   args: argparse.Namespace) -> None:
+    print_fields(client.set_wireless(False))
 
 
 def _cmd_lock_screen(client: SysAgentClient, args: argparse.Namespace) -> None:
@@ -5655,8 +5817,7 @@ SYSTEM_QUERY_HELP = "\n".join((
     "  time             Unix time, timezone and uptime (uptimeMs = the boot clock)",
     "  power            battery, charger, voltage, health, temperature",
     "  storage          SD mount state and total/free/used bytes",
-    "  network          link state, signal strength, IPv4 configuration",
-    "  network-profile  current profile, SSID, Wi-Fi passphrase, IPv4/DNS, MTU",
+    "  network          link state and IPv4/DNS (legacy alias; prefer `network get`)",
     "  account          last-opened account UID and nickname",
     "  application      running application identity, version, memory bases, name",
     "",
@@ -5701,7 +5862,7 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
         Command("query", "Query grouped system state", _cmd_system_query,
                 (Arg("query", "query group to read; see the table below",
                      choices=("info", "time", "power", "storage", "network",
-                              "network-profile", "account", "application"),
+                              "account", "application"),
                      metavar="QUERY"),
                  JSON_ARG, OUT_ARG),
                 SYSTEM_QUERY_HELP),
@@ -5754,14 +5915,44 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                      action="store_true", default=False,
                      flags=("--no-unlock",))),
                 SYSTEM_ACTION_HELP),
-        Command("wireless", "Enable or disable wireless communication", _cmd_wireless,
-                (Arg("state", "enabled or disabled", choices=("enabled", "disabled")),)),
         Command("lock-screen", "Show or change the lock-screen flag", _cmd_lock_screen,
                 (Arg("state", "status, enabled, or disabled",
                      choices=("status", "enabled", "disabled")),)),
     )),
 
-    CommandGroup("network", "Resolve names, inspect DNS state, or send requests", (
+    CommandGroup("network", "Inspect/configure IPv4 and DNS, resolve names, or send requests", (
+        Command("get", "Show link state, signal strength, and active IPv4/DNS settings",
+                _cmd_network_get, (JSON_ARG, OUT_ARG)),
+        Command("get-dns", "Show configured and active DNS servers",
+                _cmd_network_get_dns, (JSON_ARG, OUT_ARG)),
+        Command("get-profile",
+                "Show the current profile, SSID, Wi-Fi passphrase, IPv4/DNS, and MTU",
+                _cmd_network_get_profile, (JSON_ARG, OUT_ARG),
+                "Reads the current network profile. The response contains the Wi-Fi "
+                "passphrase."),
+        Command("set", "Use automatic DHCP or set manual IPv4 addressing",
+                _cmd_network_set,
+                (Arg("ip", "IPv4 address, or `auto` to use DHCP", nargs="?",
+                     default=None),
+                 Arg("mask", "contiguous subnet mask for a manual address",
+                     nargs="?", default=None),
+                 Arg("gateway", "manual IPv4 gateway (0.0.0.0 clears it)",
+                     nargs="?", default=None)),
+                "Use `network set auto` for DHCP, or `network set <ip> <mask> <gateway>` "
+                "for manual addressing. The setting is saved to the current Wi-Fi or "
+                "Ethernet profile and verified by reading it back. Use "
+                "`network wireless-enabled` or `network wireless-disabled` for the "
+                "wireless switch."),
+        Command("set-dns", "Use automatic DNS or set manual DNS servers",
+                _cmd_network_set_dns,
+                (Arg("primary", "primary IPv4 DNS server, or `auto`",
+                     nargs="?", default=None),
+                 Arg("secondary", "secondary IPv4 DNS server; defaults to 0.0.0.0",
+                     nargs="?", default=None)),
+                "Use `network set-dns auto` for DHCP-provided DNS, or "
+                "`network set-dns <primary> [secondary]` for manual DNS. Manual settings "
+                "disable automatic DNS and are verified by reading the current profile "
+                "back. Omit the secondary server or pass 0.0.0.0 to leave it empty."),
         Command("hosts-reload", "Reload Atmosphere's DNS.mitm hosts file",
                 _cmd_hosts_reload),
         Command("resolve", "Resolve IPv4 addresses for a hostname on the console",
@@ -5776,6 +5967,10 @@ COMMANDS: tuple[Command | CommandGroup, ...] = (
                 _cmd_url_request,
                 (Arg("url", "HTTP(S) URL (the protocol may be omitted for HTTPS)"),
                  JSON_ARG, DECODE_BODY_ARG, OUT_ARG)),
+        Command("wireless-disabled", "Disable wireless communication",
+                _cmd_network_wireless_disabled),
+        Command("wireless-enabled", "Enable wireless communication",
+                _cmd_network_wireless_enabled),
     )),
 
     CommandGroup("audio", "Query or control system audio", (
@@ -6419,7 +6614,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "write commands never retry)")
     subparsers = parser.add_subparsers(dest="action", required=True, metavar="COMMAND",
                                        title="commands", parser_class=_HelpfulParser)
-    for item in COMMANDS:
+    # Help is intentionally alphabetical at every level. Keep command
+    # registration grouped by implementation area; build_parser enforces the
+    # user-visible order instead of relying on tuple order.
+    for item in sorted(COMMANDS, key=lambda command: command.name):
         if isinstance(item, CommandGroup):
             group_parser = subparsers.add_parser(item.name, help=item.help,
                                                  description=item.help,
@@ -6427,7 +6625,7 @@ def build_parser() -> argparse.ArgumentParser:
             group_subparsers = group_parser.add_subparsers(
                 dest=f"{item.name}_action", required=True, metavar="COMMAND",
                 title="commands")
-            for child in item.children:
+            for child in sorted(item.children, key=lambda command: command.name):
                 child_parser = group_subparsers.add_parser(
                     child.name, help=child.help,
                     description=child.description or child.help,

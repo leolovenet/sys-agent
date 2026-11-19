@@ -36,6 +36,12 @@ docker run --rm \
 - 发布产物是**本地产物**(`build/` 被忽略,不进仓库):发布说明写 `build/release/v<版本>-notes.md`(正文格式见 `v2.7.6-notes.md`),SD 布局放 `build/release/v<版本>/atmosphere/contents/43000000000000A6/{exefs.nsp,toolbox.json,flags/boot2.flag}`,再压成 `build/release/sys-agent-v<版本>.zip`。
 - **两条独立的版本线**:sysmodule 的 `VERSION_S`(`sys-agent/source/main.c`)与客户端的 `CLIENT_VERSION`(`client/sysagent.py`)各自升降——客户端没改就不动它的号,sysmodule 改了也一样,不要求两者相等。各自的查询入口:客户端自己的用 `python3 client/sysagent.py --version`(单行、不需要主机),主机上跑的用 `utility version`,并排看用顶层 `version`(两行都带标签;主机连不上时客户端那行照打、错误走 stderr、退出码 2)。改动客户端命令或文档时要一并升 `CLIENT_VERSION`(Patch 级即可),sysmodule 仍按工作区规则升。
 
+## 客户端帮助排序
+
+- `sysagent.py` 的所有帮助输出中,顶层命令和每个子命令组里的命令条目都必须按命令名的字母顺序排列。
+- 顺序由 `client/sysagent.py` 的 `build_parser()` 在构建解析器时统一排序;新增命令只需加入 `COMMANDS`,不得依赖注册位置,也不得在其他路径另建未排序的命令列表。
+- `tests/test_sysagent_client.py` 必须检查顶层及所有子命令组的帮助排序;新增或改名的命令也要同步更新帮助、文档与回归测试。
+
 ## 协议约定
 
 - 字节载荷只接受 hex 字节对(可选 `0x` 前缀;奇数长度或非 hex 字符拒绝,错误码 `INVALID_HEX_PAYLOAD`)。

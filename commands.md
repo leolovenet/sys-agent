@@ -20,8 +20,11 @@ The system-management protocol is additive and uses single-line `OK key=value` o
 |systemTimeSync|Reports or changes Horizon's "Synchronize Clock via Internet" setting. Reads report both the persisted `set:sys` value and the live `time:a` value; writes update both and verify them|none, or `enabled` / `disabled`|`systemTimeSync` / `systemTimeSync enabled` / `systemTimeSync disabled`|
 |powerStatus|Reports battery, charger, voltage, health, temperature, and current-limit fields|none|`powerStatus`|
 |storageStatus|Reports SD mount state and total/free/used bytes|none|`storageStatus`|
-|networkStatus|Reports link state, signal strength, and current IPv4 configuration|none|`networkStatus`|
-|networkProfile|Reports the current profile, SSID, **Wi-Fi passphrase**, IPv4/DNS settings, and MTU|none|`networkProfile`|
+|networkStatus|Reports link state, signal strength, and current IPv4/DNS configuration|none|`networkStatus`|
+|networkIpSet|Switches the current Wi-Fi/Ethernet profile between automatic DHCP (`auto`) and manual IPv4 addressing, then reads the profile back. Requires a connected profile. The client exposes this as `network set`|`auto`, or IPv4 address + contiguous subnet mask + gateway|`networkIpSet auto` / `networkIpSet 192.168.1.20 255.255.255.0 192.168.1.1`|
+|networkDnsGet|Reports the current profile's automatic-DNS flag and configured DNS addresses, plus the currently active NIFM DNS addresses, MTU, and per-read Result codes. The client exposes this as `network get-dns`|none|`networkDnsGet`|
+|networkDnsSet|Switches the current profile between automatic DHCP-provided DNS (`auto`) and manual DNS, then reads the profile back. Requires a connected profile. The client exposes this as `network set-dns`|`auto`, or primary IPv4 DNS + optional secondary IPv4 DNS (omitted means `0.0.0.0`)|`networkDnsSet auto` / `networkDnsSet 1.1.1.1 1.0.0.1`|
+|networkProfile|Reports the current profile, SSID, **Wi-Fi passphrase**, IPv4/DNS settings, and MTU. The client exposes this as `network get-profile`|none|`networkProfile`|
 |networkHostsReload|Asks Atmosphere DNS.mitm to re-read and reparse the active hosts file|none|`networkHostsReload`|
 |networkResolve|Resolves a DNS hostname through the console's normal `getaddrinfo`/`sfdnsres` path and returns deduplicated IPv4 addresses. Resolution failure returns `ERR code=DNS_RESOLVE_FAILED`; a successful lookup without IPv4 returns `ERR code=DNS_NO_ADDRESS`|ASCII hostname without URL syntax|`networkResolve api.hac.lp1.acbaa.srv.nintendo.net`|
 |accountStatus|Reports the last-opened account UID and nickname|none|`accountStatus`|
@@ -37,7 +40,7 @@ The system-management protocol is additive and uses single-line `OK key=value` o
 |systemRebootEmuMMC|One-shot reboot directly to the Hekate entry with `id=Atm-Emu`; does not change global autoboot. Arms the boot unlock the same way|`noUnlock` (optional)|`systemRebootEmuMMC` / `systemRebootEmuMMC noUnlock`|
 |systemShutdown|Requests an orderly shutdown|none|`systemShutdown`|
 |systemSleep|Invokes the experimental system-sleep SVC|none|`systemSleep`|
-|networkSet|Enables or disables wireless communication|`enabled` or `disabled`|`networkSet disabled`|
+|networkSet|Enables or disables wireless communication. The client exposes this as `network wireless-enabled` and `network wireless-disabled`|`enabled` or `disabled`|`networkSet disabled`|
 |lockScreenStatus|Reports Horizon's persistent sleep-mode lock-screen flag|none|`lockScreenStatus`|
 |lockScreenSet|Enables or disables Horizon's persistent sleep-mode lock-screen flag|`enabled` or `disabled`|`lockScreenSet disabled`|
 |bootUnlock|Reports the boot-unlock schedule and what this boot did with it (`mode`, `source`, `reason`, `schedule`, `armed`, `phase`, `homePresses`/`aPresses`/`aSent`, the `screen` frame timeline; `*Ms` are milliseconds since boot, the same clock `systemInfo` reports as `uptimeMs`)|none|`bootUnlock`|

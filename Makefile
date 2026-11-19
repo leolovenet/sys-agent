@@ -41,4 +41,4 @@ test:
 	/tmp/sys-agent-sequence-repeat-test
 	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Isys-agent/source tests/debug_trace_model_test.c sys-agent/source/debug_trace_model.c -o /tmp/sys-agent-debug-trace-model-test
 	/tmp/sys-agent-debug-trace-model-test
-	python3 -m unittest -v tests/test_sysagent_client.py
+	python3 -m unittest -v tests/test_sysagent_client.py tests/test_deploy_sysagent.py

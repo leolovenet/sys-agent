@@ -51,6 +51,8 @@ class FakeState:
         self.repeat_support = True
         self.sequence_error = False
         self.sequence_cancelled = False
+        self.network_ip_verify_failed = False
+        self.network_status_responses: list[str] = []
         self.trace_busy = False
         self.trace_active = False
         self.multi_trace_active = False
@@ -277,8 +279,17 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 )
             elif command[0] == "systemCapabilities":
                 response = "OK version=1 processPageMax=64 sensitiveData=serial,account,wifiPassphrase"
+            elif command[0] == "networkStatus":
+                if state.network_status_responses:
+                    response = state.network_status_responses.pop(0)
+                else:
+                    response = (
+                        "OK command=networkStatus wireless=1 ethernet=1 type=1 status=4 "
+                        "strength=3 ip=192.168.1.20 mask=255.255.255.0 "
+                        "gateway=192.168.1.1 dns1=1.1.1.1 dns2=1.0.0.1 "
+                        "errors=wireless:0x0,ethernet:0x0,status:0x0,ip:0x0")
             elif command[0] in {"systemInfo", "systemTime", "powerStatus", "storageStatus",
-                               "networkStatus", "networkProfile", "accountStatus"}:
+                               "networkProfile", "accountStatus"}:
                 response = f"OK command={command[0]} sample=1 errors=field:0x0"
             elif command[0] == "systemTimeSet":
                 response = (
@@ -348,6 +359,32 @@ class FakeHandler(socketserver.StreamRequestHandler):
                 response = f"OK action={command[0]}"
             elif command[0] == "networkSet":
                 response = f"OK wireless={1 if command[1] == 'enabled' else 0}"
+            elif command[0] == "networkIpSet":
+                if state.network_ip_verify_failed:
+                    response = (
+                        "ERR code=NETWORK_VERIFY_FAILED stage=verifyAddress "
+                        "ip=192.168.8.160 mask=255.255.255.0 "
+                        "gateway=192.168.8.1 automatic=0")
+                elif command[1] == "auto":
+                    response = (
+                        "OK action=set-ip-automatic automatic=1 mtu=1500 verified=1")
+                else:
+                    response = (
+                        f"OK action=set-ip automatic=0 ip={command[1]} mask={command[2]} "
+                        f"gateway={command[3]} mtu=1500 verified=1")
+            elif command[0] == "networkDnsGet":
+                response = (
+                    "OK automatic=0 dns1=1.1.1.1 dns2=1.0.0.1 "
+                    "activeDns1=1.1.1.1 activeDns2=1.0.0.1 mtu=1500 "
+                    "errors=profile:0x0,active:0x0")
+            elif command[0] == "networkDnsSet":
+                if command[1] == "auto":
+                    response = (
+                        "OK action=set-dns-automatic automatic=1 mtu=1500 verified=1")
+                else:
+                    response = (
+                        f"OK action=set-dns automatic=0 dns1={command[1]} "
+                        f"dns2={command[2]} mtu=1500 verified=1")
             elif command[0] == "lockScreenStatus":
                 response = "OK lockScreen=0"
             elif command[0] == "lockScreenSet":
@@ -633,7 +670,8 @@ class ClientTests(unittest.TestCase):
     def test_system_queries_and_actions(self) -> None:
         with self.client() as client:
             self.assertEqual(client.system_capabilities()["processPageMax"], "64")
-            self.assertEqual(client.system_query("network-profile")["sample"], "1")
+            with self.assertRaises(ValueError):
+                client.system_query("network-profile")
             self.assertEqual(client.process_list(1, 2)["offset"], "1")
             self.assertEqual(client.set_wireless(False)["wireless"], "0")
             self.assertEqual(client.lock_screen_status()["lockScreen"], "0")
@@ -672,6 +710,11 @@ class ClientTests(unittest.TestCase):
                 client.set_system_time(1700000000, "network")
             with self.assertRaises(ValueError):
                 client.system_action("payload")
+
+        from client.sysagent import build_parser
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args([
+                "system", "query", "network-profile"])
 
     def test_account_and_save_maintenance_commands(self) -> None:
         with self.client() as client:
@@ -861,6 +904,173 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(
                 self.server.state.last_command,
                 ["networkHostsReload"])
+
+    def test_network_configuration_commands(self) -> None:
+        with self.client() as client:
+            self.assertEqual(client.network_get()["command"], "networkStatus")
+            self.assertEqual(self.server.state.last_command, ["networkStatus"])
+            self.assertEqual(
+                client.network_get_profile()["command"], "networkProfile")
+            self.assertEqual(self.server.state.last_command, ["networkProfile"])
+
+            response = client.set_network_address(
+                "192.168.1.20", "255.255.255.0", "192.168.1.1")
+            self.assertEqual(response["verified"], "1")
+            self.assertEqual(
+                self.server.state.last_command,
+                ["networkIpSet", "192.168.1.20", "255.255.255.0", "192.168.1.1"])
+            response = client.set_network_address_automatic()
+            self.assertEqual(response["automatic"], "1")
+            self.assertEqual(self.server.state.last_command, ["networkIpSet", "auto"])
+
+            response = client.network_get_dns()
+            self.assertEqual(response["dns1"], "1.1.1.1")
+            self.assertEqual(response["activeDns2"], "1.0.0.1")
+            self.assertEqual(self.server.state.last_command, ["networkDnsGet"])
+
+            response = client.network_set_dns("1.1.1.1", "1.0.0.1")
+            self.assertEqual(response["dns1"], "1.1.1.1")
+            self.assertEqual(
+                self.server.state.last_command,
+                ["networkDnsSet", "1.1.1.1", "1.0.0.1"])
+            client.network_set_dns("8.8.8.8")
+            self.assertEqual(
+                self.server.state.last_command,
+                ["networkDnsSet", "8.8.8.8", "0.0.0.0"])
+            response = client.set_network_dns_automatic()
+            self.assertEqual(response["automatic"], "1")
+            self.assertEqual(self.server.state.last_command,
+                             ["networkDnsSet", "auto"])
+
+            for address, mask, gateway in (
+                    ("0.0.0.0", "255.255.255.0", "192.168.1.1"),
+                    ("192.168.1.20", "255.0.255.0", "192.168.1.1"),
+                    ("192.168.1.20", "0.0.0.0", "192.168.1.1"),
+                    ("not-an-ip", "255.255.255.0", "192.168.1.1"),
+            ):
+                with self.subTest(address=address, mask=mask), \
+                        self.assertRaises(ValueError):
+                    client.set_network_address(address, mask, gateway)
+            with self.assertRaises(ValueError):
+                client.network_set_dns("0.0.0.0")
+
+            self.server.state.network_ip_verify_failed = True
+            with self.assertRaises(SysAgentProtocolError) as raised:
+                client.set_network_address(
+                    "192.168.8.161", "255.255.255.0", "192.168.8.1")
+            self.assertEqual(
+                raised.exception.response,
+                {
+                    "ok": "ERR",
+                    "code": "NETWORK_VERIFY_FAILED",
+                    "stage": "verifyAddress",
+                    "ip": "192.168.8.160",
+                    "mask": "255.255.255.0",
+                    "gateway": "192.168.8.1",
+                    "automatic": "0",
+                })
+
+    def test_network_configuration_cli(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import main
+
+        base = [
+            "--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+            "--timeout", "1", "network",
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main([*base, "get"]), 0)
+        self.assertIn("command=networkStatus", output.getvalue())
+        self.assertEqual(self.server.state.last_command, ["networkStatus"])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main([*base, "get-profile"]), 0)
+        self.assertIn("command=networkProfile", output.getvalue())
+        self.assertEqual(self.server.state.last_command, ["networkProfile"])
+
+        self.assertEqual(main([*base, "set", "192.168.1.20",
+                               "255.255.255.0", "192.168.1.1"]), 0)
+        self.assertEqual(
+            self.server.state.last_command,
+            ["networkIpSet", "192.168.1.20", "255.255.255.0", "192.168.1.1"])
+        self.assertEqual(main([*base, "set", "auto"]), 0)
+        self.assertEqual(
+            self.server.state.last_command, ["networkIpSet", "auto"])
+        self.assertEqual(main([*base, "get-dns"]), 0)
+        self.assertEqual(self.server.state.last_command, ["networkDnsGet"])
+        self.assertEqual(main([*base, "set-dns", "1.1.1.1"]), 0)
+        self.assertEqual(
+            self.server.state.last_command,
+            ["networkDnsSet", "1.1.1.1", "0.0.0.0"])
+        self.assertEqual(main([*base, "set-dns", "auto"]), 0)
+        self.assertEqual(self.server.state.last_command,
+                         ["networkDnsSet", "auto"])
+        self.assertEqual(main([*base, "wireless-disabled"]), 0)
+        self.assertEqual(self.server.state.last_command,
+                         ["networkSet", "disabled"])
+        self.assertEqual(main([*base, "wireless-enabled"]), 0)
+        self.assertEqual(self.server.state.last_command,
+                         ["networkSet", "enabled"])
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(main([*base, "set"]), 2)
+            self.assertEqual(main([
+                *base, "set", "auto", "255.255.255.0"]), 2)
+            self.assertEqual(main([
+                *base, "set-dns", "auto", "1.1.1.1"]), 2)
+        self.assertIn("requires ip mask gateway, or the single word auto",
+                      errors.getvalue())
+        from client.sysagent import build_parser
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["system", "wireless", "enabled"])
+
+    def test_network_cli_explains_reconfiguration_and_orders_help(self) -> None:
+        import contextlib
+        import io
+        from client.sysagent import NETWORK_RECONFIGURE_TIMEOUT_SECONDS, build_parser, main
+
+        self.assertEqual(NETWORK_RECONFIGURE_TIMEOUT_SECONDS, 20.0)
+
+        base = [
+            "--host", "127.0.0.1", "--port", str(self.server.server_address[1]),
+            "--timeout", "1", "network",
+        ]
+        self.server.state.network_ip_verify_failed = True
+        self.server.state.network_status_responses = [
+            "OK command=networkStatus wireless=1 ethernet=1 type=1 status=0 "
+            "strength=0 ip=NA mask=NA gateway=NA dns1=NA dns2=NA "
+            "errors=wireless:0x0,ethernet:0x0,status:0x0,ip:0x2586E",
+            "OK command=networkStatus wireless=1 ethernet=1 type=1 status=4 "
+            "strength=3 ip=127.0.0.1 mask=255.255.255.0 gateway=192.168.8.1 "
+            "dns1=192.168.8.1 dns2=0.0.0.0 "
+            "errors=wireless:0x0,ethernet:0x0,status:0x0,ip:0x0",
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main([
+                *base, "set", "127.0.0.1", "255.255.255.0", "192.168.8.1",
+            ]), 0)
+        message = output.getvalue()
+        self.assertIn("checking network at 127.0.0.1", message)
+        self.assertNotIn("ip=NA", message)
+        self.assertIn("status=4", message)
+        self.assertIn("command=networkStatus", message)
+        self.assertNotIn("NETWORK_VERIFY_FAILED", message)
+
+        help_output = io.StringIO()
+        with contextlib.redirect_stdout(help_output), self.assertRaises(SystemExit):
+            build_parser().parse_args(["network", "--help"])
+        help_text = help_output.getvalue()
+        ordered = (
+            "get", "get-dns", "get-profile", "hosts-reload", "public-ip",
+            "resolve", "set", "set-dns", "url-req", "wireless-disabled",
+            "wireless-enabled",
+        )
+        positions = [help_text.index(f"    {name} ") for name in ordered]
+        self.assertEqual(positions, sorted(positions))
 
     def test_audio_commands(self) -> None:
         with self.client() as client:
@@ -2975,6 +3185,29 @@ class ClientTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as raised:
                     build_parser().parse_args([*path, "--help"])
             self.assertEqual(raised.exception.code, 0, " ".join(path))
+
+    def test_help_command_order_is_alphabetical(self) -> None:
+        import argparse
+        from client.sysagent import build_parser
+
+        def subcommands(parser: argparse.ArgumentParser) -> list[str]:
+            action = next(
+                (item for item in parser._actions
+                 if isinstance(item, argparse._SubParsersAction)),
+                None,
+            )
+            return list(action.choices) if action is not None else []
+
+        parser = build_parser()
+        top_level = subcommands(parser)
+        self.assertEqual(top_level, sorted(top_level))
+        top_action = next(
+            item for item in parser._actions
+            if isinstance(item, argparse._SubParsersAction))
+        for name, group_parser in top_action.choices.items():
+            children = subcommands(group_parser)
+            if children:
+                self.assertEqual(children, sorted(children), name)
 
     def test_missing_command_prints_full_help(self) -> None:
         import contextlib

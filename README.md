@@ -131,9 +131,12 @@ commands should follow this rule:
   remains open. It supports normal file and directory CRUD and can be controlled over the
   existing sys-agent TCP connection.
 - Grouped system-management commands report system, power, storage, network, account,
-  application, and process state. Additive actions cover normal reboot/shutdown, wireless and
-  lock-screen settings, system-clock adjustment, Internet clock synchronization,
-  foreground-application termination, and one-shot Hekate emuMMC reboot.
+  application, and process state. Network controls read the active IPv4/DNS configuration,
+  switch between DHCP/automatic DNS and manual IP/DNS settings, save them to the current
+  profile with readback verification, and manage wireless communication. Additive actions
+  cover normal reboot/shutdown, lock-screen settings, system-clock adjustment, Internet
+  clock synchronization, foreground-application termination, and one-shot Hekate emuMMC
+  reboot.
 - The system-management group also carries the boot unlock: an armed sysmodule looks at the
   screen after a reboot and presses HOME until Horizon's lock screen ("A 开始" / "A 继续") is
   gone, so it cannot time out into sleep and cut the console off. The judgement is picture

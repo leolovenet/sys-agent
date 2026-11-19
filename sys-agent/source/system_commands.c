@@ -60,6 +60,88 @@ static void printIpv4Bytes(const NifmIpV4Address* address)
     printf("%u.%u.%u.%u", address->addr[0], address->addr[1], address->addr[2], address->addr[3]);
 }
 
+static bool parseIpv4Address(const char* text, NifmIpV4Address* address)
+{
+    struct in_addr parsed = {0};
+    if (!text || !address || inet_pton(AF_INET, text, &parsed) != 1)
+        return false;
+    memcpy(address->addr, &parsed, sizeof(address->addr));
+    return true;
+}
+
+static bool isUnspecifiedIpv4(const NifmIpV4Address* address)
+{
+    return address->addr[0] == 0 && address->addr[1] == 0
+        && address->addr[2] == 0 && address->addr[3] == 0;
+}
+
+static bool isValidIpv4Mask(const NifmIpV4Address* address)
+{
+    u32 mask = 0;
+    memcpy(&mask, address->addr, sizeof(mask));
+    mask = ntohl(mask);
+    if (mask == 0)
+        return false;
+    u32 hostBits = ~mask;
+    return (hostBits & (hostBits + 1)) == 0;
+}
+
+static bool currentNetworkProfileAvailable(const NifmNetworkProfileData* profile)
+{
+    bool uuidIsZero = true;
+    for (size_t i = 0; i < sizeof(profile->uuid.uuid); i++)
+        uuidIsZero = uuidIsZero && profile->uuid.uuid[i] == 0;
+    return !uuidIsZero && profile->ip_setting_data.mtu != 0;
+}
+
+static bool getCurrentNetworkProfileForUpdate(NifmNetworkProfileData* profile)
+{
+    Result rc = nifmInitialize(NifmServiceType_Admin);
+    if (R_FAILED(rc)) {
+        printServiceError("nifm:a", rc);
+        return false;
+    }
+
+    rc = nifmGetCurrentNetworkProfile(profile);
+    nifmExit();
+    if (R_FAILED(rc)) {
+        printCommandError("getNetworkProfile", rc);
+        return false;
+    }
+    if (!currentNetworkProfileAvailable(profile)) {
+        printf("ERR code=NETWORK_NOT_CONNECTED\n");
+        return false;
+    }
+    return true;
+}
+
+static bool setAndVerifyNetworkProfile(NifmNetworkProfileData* profile,
+                                       NifmNetworkProfileData* readback)
+{
+    Result rc = nifmInitialize(NifmServiceType_Admin);
+    if (R_FAILED(rc)) {
+        printServiceError("nifm:a", rc);
+        return false;
+    }
+
+    Uuid updatedUuid = profile->uuid;
+    rc = nifmSetNetworkProfile(profile, &updatedUuid);
+    if (R_FAILED(rc)) {
+        nifmExit();
+        printCommandError("setNetworkProfile", rc);
+        return false;
+    }
+
+    Result readbackRc = nifmGetCurrentNetworkProfile(readback);
+    nifmExit();
+    if (R_FAILED(readbackRc)) {
+        printf("ERR code=COMMAND_FAILED stage=verifyNetworkProfile result=0x%X "
+            "writeResult=0x%X\n", readbackRc, rc);
+        return false;
+    }
+    return true;
+}
+
 static void systemInfo(void)
 {
     Result rc = setsysInitialize();
@@ -433,6 +515,139 @@ static void networkStatus(void)
     printf(" dns1="); if (R_SUCCEEDED(ipRc)) printIpv4(dns1); else printf("NA");
     printf(" dns2="); if (R_SUCCEEDED(ipRc)) printIpv4(dns2); else printf("NA");
     printf(" errors=wireless:0x%X,ethernet:0x%X,status:0x%X,ip:0x%X\n", wirelessRc, ethernetRc, statusRc, ipRc);
+}
+
+static void networkIpSet(bool automatic, const char* ipText, const char* maskText,
+                         const char* gatewayText)
+{
+    NifmIpV4Address ip = {0}, mask = {0}, gateway = {0};
+    if (!automatic
+        && (!parseIpv4Address(ipText, &ip) || isUnspecifiedIpv4(&ip)
+            || !parseIpv4Address(maskText, &mask) || !isValidIpv4Mask(&mask)
+            || !parseIpv4Address(gatewayText, &gateway))) {
+        printf("ERR code=INVALID_ARGUMENTS field=ipv4\n");
+        return;
+    }
+
+    NifmNetworkProfileData profile = {0};
+    if (!getCurrentNetworkProfileForUpdate(&profile))
+        return;
+
+    profile.ip_setting_data.ip_address_setting.is_automatic = automatic ? 1 : 0;
+    if (!automatic) {
+        profile.ip_setting_data.ip_address_setting.current_addr = ip;
+        profile.ip_setting_data.ip_address_setting.subnet_mask = mask;
+        profile.ip_setting_data.ip_address_setting.gateway = gateway;
+    }
+
+    NifmNetworkProfileData readback = {0};
+    if (!setAndVerifyNetworkProfile(&profile, &readback))
+        return;
+
+    const NifmIpAddressSetting* setting = &readback.ip_setting_data.ip_address_setting;
+    bool verified = setting->is_automatic == (automatic ? 1 : 0);
+    if (!automatic) {
+        verified = verified
+            && !memcmp(setting->current_addr.addr, ip.addr, sizeof(ip.addr))
+            && !memcmp(setting->subnet_mask.addr, mask.addr, sizeof(mask.addr))
+            && !memcmp(setting->gateway.addr, gateway.addr, sizeof(gateway.addr));
+    }
+    if (!verified) {
+        printf("ERR code=NETWORK_VERIFY_FAILED stage=verifyAddress "
+            "ip="); printIpv4Bytes(&setting->current_addr);
+        printf(" mask="); printIpv4Bytes(&setting->subnet_mask);
+        printf(" gateway="); printIpv4Bytes(&setting->gateway);
+        printf(" automatic=%u\n", setting->is_automatic);
+        return;
+    }
+
+    printf("OK action=");
+    if (automatic) {
+        printf("set-ip-automatic automatic=1");
+    } else {
+        printf("set-ip automatic=0 ip="); printIpv4Bytes(&ip);
+        printf(" mask="); printIpv4Bytes(&mask);
+        printf(" gateway="); printIpv4Bytes(&gateway);
+    }
+    printf(" mtu=%u verified=1\n", readback.ip_setting_data.mtu);
+}
+
+static void networkDnsGet(void)
+{
+    Result rc = initializeNifm();
+    if (R_FAILED(rc)) {
+        printServiceError("nifm:s", rc);
+        return;
+    }
+
+    NifmNetworkProfileData profile = {0};
+    Result profileRc = nifmGetCurrentNetworkProfile(&profile);
+    u32 ip = 0, mask = 0, gateway = 0, activeDns1 = 0, activeDns2 = 0;
+    Result activeRc = nifmGetCurrentIpConfigInfo(&ip, &mask, &gateway, &activeDns1, &activeDns2);
+    nifmExit();
+    if (R_FAILED(profileRc)) {
+        printCommandError("getNetworkProfile", profileRc);
+        return;
+    }
+
+    const NifmDnsSetting* dns = &profile.ip_setting_data.dns_setting;
+    printf("OK automatic=%u dns1=", dns->is_automatic);
+    printIpv4Bytes(&dns->primary_dns_server);
+    printf(" dns2="); printIpv4Bytes(&dns->secondary_dns_server);
+    printf(" activeDns1="); if (R_SUCCEEDED(activeRc)) printIpv4(activeDns1); else printf("NA");
+    printf(" activeDns2="); if (R_SUCCEEDED(activeRc)) printIpv4(activeDns2); else printf("NA");
+    printf(" mtu=%u errors=profile:0x%X,active:0x%X\n",
+        profile.ip_setting_data.mtu, profileRc, activeRc);
+}
+
+static void networkDnsSet(bool automatic, const char* primaryText,
+                          const char* secondaryText)
+{
+    NifmIpV4Address primary = {0}, secondary = {0};
+    if (!automatic
+        && (!parseIpv4Address(primaryText, &primary) || isUnspecifiedIpv4(&primary)
+            || (secondaryText && !parseIpv4Address(secondaryText, &secondary)))) {
+        printf("ERR code=INVALID_ARGUMENTS field=dns\n");
+        return;
+    }
+
+    NifmNetworkProfileData profile = {0};
+    if (!getCurrentNetworkProfileForUpdate(&profile))
+        return;
+
+    profile.ip_setting_data.dns_setting.is_automatic = automatic ? 1 : 0;
+    if (!automatic) {
+        profile.ip_setting_data.dns_setting.primary_dns_server = primary;
+        profile.ip_setting_data.dns_setting.secondary_dns_server = secondary;
+    }
+
+    NifmNetworkProfileData readback = {0};
+    if (!setAndVerifyNetworkProfile(&profile, &readback))
+        return;
+
+    const NifmDnsSetting* dns = &readback.ip_setting_data.dns_setting;
+    bool verified = dns->is_automatic == (automatic ? 1 : 0);
+    if (!automatic) {
+        verified = verified
+            && !memcmp(dns->primary_dns_server.addr, primary.addr, sizeof(primary.addr))
+            && !memcmp(dns->secondary_dns_server.addr, secondary.addr, sizeof(secondary.addr));
+    }
+    if (!verified) {
+        printf("ERR code=NETWORK_VERIFY_FAILED stage=verifyDns dns1=");
+        printIpv4Bytes(&dns->primary_dns_server);
+        printf(" dns2="); printIpv4Bytes(&dns->secondary_dns_server);
+        printf(" automatic=%u\n", dns->is_automatic);
+        return;
+    }
+
+    printf("OK action=");
+    if (automatic) {
+        printf("set-dns-automatic automatic=1");
+    } else {
+        printf("set-dns automatic=0 dns1="); printIpv4Bytes(&primary);
+        printf(" dns2="); printIpv4Bytes(&secondary);
+    }
+    printf(" mtu=%u verified=1\n", readback.ip_setting_data.mtu);
 }
 
 static void networkProfile(void)
@@ -2404,7 +2619,9 @@ bool systemCommandsDispatch(int argc, char** argv)
         || !strcmp(command, "systemTimeSync")
         || !strcmp(command, "powerStatus")
         || !strcmp(command, "storageStatus") || !strcmp(command, "networkStatus")
-        || !strcmp(command, "networkProfile") || !strcmp(command, "accountStatus")
+        || !strcmp(command, "networkProfile") || !strcmp(command, "networkIpSet")
+        || !strcmp(command, "networkDnsGet") || !strcmp(command, "networkDnsSet")
+        || !strcmp(command, "accountStatus")
         || !strcmp(command, "networkPublicIp") || !strcmp(command, "urlReq")
         || !strcmp(command, "networkHostsReload") || !strcmp(command, "networkResolve")
         || !strcmp(command, "accountBindings") || !strcmp(command, "accountUnlink")
@@ -2495,6 +2712,38 @@ bool systemCommandsDispatch(int argc, char** argv)
             return true;
         }
         networkResolve(argv[1]);
+        return true;
+    }
+    if (!strcmp(command, "networkIpSet")) {
+        if (argc == 2 && !strcmp(argv[1], "auto")) {
+            networkIpSet(true, NULL, NULL, NULL);
+            return true;
+        }
+        if (argc != 4) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        networkIpSet(false, argv[1], argv[2], argv[3]);
+        return true;
+    }
+    if (!strcmp(command, "networkDnsGet")) {
+        if (argc != 1) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        networkDnsGet();
+        return true;
+    }
+    if (!strcmp(command, "networkDnsSet")) {
+        if (argc == 2 && !strcmp(argv[1], "auto")) {
+            networkDnsSet(true, NULL, NULL);
+            return true;
+        }
+        if (argc < 2 || argc > 3) {
+            printf("ERR code=INVALID_ARGUMENTS\n");
+            return true;
+        }
+        networkDnsSet(false, argv[1], argc == 3 ? argv[2] : NULL);
         return true;
     }
     if (!strcmp(command, "urlReq")) {
@@ -2721,7 +2970,7 @@ bool systemCommandsDispatch(int argc, char** argv)
     }
 
     if (!strcmp(command, "systemCapabilities"))
-        printf("OK version=1 queries=systemInfo,systemTime,powerStatus,storageStatus,networkStatus,networkProfile,networkResolve,networkPublicIp,urlReq,accountStatus,accountBindings,applicationStatus,processList,lockScreenStatus actions=systemTimeSet,systemTimeSync,systemReboot,systemRebootEmuMMC,systemShutdown,systemSleep,networkSet,networkHostsReload,lockScreenSet,applicationTerminate,programTerminate,systemSaveDump,accountUnlink bootUnlock=status,arm,disarm,run unlockOnReboot=default,skipWithNoUnlock game=launchHeadless processPageMax=%d audio=volume,mute timeSet=local,user timeSetVerifySeconds=2 internetTimeSync=get,set sensitiveData=serial,account,wifiPassphrase authentication=none sleep=experimental rebootEmuMMCMariko=validated rebootEmuMMCErista=experimental\n", PROCESS_PAGE_MAX);
+        printf("OK version=1 queries=systemInfo,systemTime,powerStatus,storageStatus,networkStatus,networkProfile,networkResolve,networkDnsGet,networkPublicIp,urlReq,accountStatus,accountBindings,applicationStatus,processList,lockScreenStatus actions=systemTimeSet,systemTimeSync,systemReboot,systemRebootEmuMMC,systemShutdown,systemSleep,networkSet,networkIpSet,networkDnsSet,networkHostsReload,lockScreenSet,applicationTerminate,programTerminate,systemSaveDump,accountUnlink bootUnlock=status,arm,disarm,run unlockOnReboot=default,skipWithNoUnlock game=launchHeadless processPageMax=%d audio=volume,mute timeSet=local,user timeSetVerifySeconds=2 internetTimeSync=get,set networkConfig=ip-auto-manual,dns-auto-manual sensitiveData=serial,account,wifiPassphrase authentication=none sleep=experimental rebootEmuMMCMariko=validated rebootEmuMMCErista=experimental\n", PROCESS_PAGE_MAX);
     else if (!strcmp(command, "systemInfo")) systemInfo();
     else if (!strcmp(command, "systemTime")) systemTimeCommand();
     else if (!strcmp(command, "powerStatus")) powerStatus();

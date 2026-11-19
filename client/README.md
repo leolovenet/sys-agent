@@ -10,7 +10,7 @@ non-FTP sys-agent command behind grouped subcommands; FTP is intentionally not b
 version   Show the client version and the version the host reports
 backend   Inspect or configure the process-memory backend
 system    Query or control system state
-network   Resolve names, reload DNS hosts, or send requests from the console
+network   Inspect/configure IPv4 and DNS, resolve names, or send requests
 audio     Query or control system audio
 game      Launch, close, or inspect the running game
 debug     Trace instruction entry and inspect arbitrary processes
@@ -42,8 +42,8 @@ python3 client/sysagent.py --host switch utility version   # the console's versi
 ```
 
 ```text
-client    1.2.4
-sys-agent 2.19.2  (switch:6000)
+client    1.3.0
+sys-agent 2.20.0  (switch:6000)
 ```
 
 The `client` line needs no network and is printed first; if the console cannot be reached the
@@ -54,6 +54,13 @@ console's version working.
 ## Network
 
 ```bash
+python3 client/sysagent.py --host switch network get
+python3 client/sysagent.py --host switch network get-profile
+python3 client/sysagent.py --host switch network set auto
+python3 client/sysagent.py --host switch network set 192.168.1.20 255.255.255.0 192.168.1.1
+python3 client/sysagent.py --host switch network get-dns
+python3 client/sysagent.py --host switch network set-dns auto
+python3 client/sysagent.py --host switch network set-dns 1.1.1.1 1.0.0.1
 python3 client/sysagent.py --host switch network resolve example.com
 python3 client/sysagent.py --host switch network resolve example.com --json
 python3 client/sysagent.py --host switch network hosts-reload
@@ -62,7 +69,42 @@ python3 client/sysagent.py --host switch network public-ip --decode-body
 python3 client/sysagent.py --host switch network public-ip http://myip.ipip.net
 python3 client/sysagent.py --host switch network url-req https://ifconfig.co/json
 python3 client/sysagent.py --host switch network url-req https://ifconfig.co/json --decode-body
+python3 client/sysagent.py --host switch network wireless-disabled
+python3 client/sysagent.py --host switch network wireless-enabled
 ```
+
+`network get` shows link state, signal strength, and the active IPv4/DNS
+configuration. It is the promoted form of `system query network`; the latter remains a
+compatibility alias.
+
+`network get-profile` reads the current network profile, SSID, Wi-Fi passphrase, saved
+IPv4/DNS settings, and MTU. The response contains the Wi-Fi passphrase.
+
+`network set auto` switches the current profile back to DHCP. `network set <ip> <mask>
+<gateway>` saves manual addressing and switches that profile from automatic to manual
+addressing. The mask must be contiguous; use `0.0.0.0` for no gateway when the network does
+not have one. `network get-dns` shows both the DNS addresses stored in the profile
+(`dns1`/`dns2`) and the addresses currently active through NIFM
+(`activeDns1`/`activeDns2`), plus whether the profile uses automatic DNS.
+`network set-dns auto` enables DNS supplied by DHCP. `network set-dns <primary>
+[secondary]` saves manual DNS and disables automatic DNS; an omitted secondary address is
+stored as `0.0.0.0`.
+
+The console verifies each write by reading the current network profile back. The commands
+require an already connected Wi-Fi or Ethernet profile and return `NETWORK_NOT_CONNECTED`
+otherwise. A profile that was written successfully but did not read back as requested returns
+`NETWORK_VERIFY_FAILED`. Wi-Fi credentials are not changed. Changing the console's IP or DNS
+can make NIFM reconnect and drop the current sys-agent TCP session before its response arrives;
+reconnect using the new address and verify with `network get`/`network get-dns`. Use
+`network wireless-enabled` / `network wireless-disabled` for the wireless switch.
+
+When `network set` changes the console IP, `NETWORK_VERIFY_FAILED(stage=verifyAddress)` is the
+expected result from the connection using the old address. The client treats that exact error
+as an applied change and runs `network get` there. Manual mode uses the requested address;
+automatic mode tries the address reported by the profile, then the original host. It polls for
+up to 20 seconds while the console reconfigures and only prints a status after NIFM reports
+`status=4` with a usable IPv4 address and mask. A normal `OK` readback is printed as usual; any
+other error is still reported.
 
 `network resolve` uses the console's normal `getaddrinfo`/`sfdnsres` path and prints its
 deduplicated IPv4 addresses. Resolution failure is an error; the command does not fall back to
@@ -105,22 +147,21 @@ python3 client/sysagent.py --host switch system time-sync status
 python3 client/sysagent.py --host switch system time-sync enabled
 python3 client/sysagent.py --host switch system time-sync disabled
 python3 client/sysagent.py --host switch system log --count 8
-python3 client/sysagent.py --host switch system query network
+python3 client/sysagent.py --host switch system query network  # legacy alias for network get
 python3 client/sysagent.py --host switch system account-bindings
 python3 client/sysagent.py --host switch system save-dump 0x8000000000000010 account-before-experiment
 python3 client/sysagent.py --host switch system terminate-program 0x010000000000001E
 python3 client/sysagent.py --host switch system account-unlink 0xUID0 0xUID1
 python3 client/sysagent.py --host switch system process-list --offset 0 --count 64
-python3 client/sysagent.py --host switch system wireless enabled
 python3 client/sysagent.py --host switch system lock-screen status
 python3 client/sysagent.py --host switch system action reboot
 python3 client/sysagent.py --host switch system action reboot-emummc
 python3 client/sysagent.py --host switch system action reboot --no-unlock
 ```
 
-`system query network-profile` returns the Wi-Fi passphrase over an unauthenticated,
-unencrypted TCP connection. Use it only on a trusted isolated network. The client never
-automatically retries reboot, shutdown, sleep, wireless changes, or application termination.
+`network get-profile` returns the Wi-Fi passphrase over an unauthenticated, unencrypted TCP
+connection. Use it only on a trusted isolated network. The client never automatically retries
+reboot, shutdown, sleep, wireless changes, or application termination.
 `system set-time` takes UTC Unix seconds and changes the displayed `local` clock by default;
 use `--clock user` for the user-system clock. The sysmodule reads the clock back after setting
 it and reports `verified=1` when the observed value is within two seconds. It first disables
@@ -611,6 +652,6 @@ The Python API keeps the raw `dict[str, str]` returns and adds typed results whe
 
 This client is a power tool: memory writes (`memory poke*`, `memory pointer-poke`),
 `freeze add`, `screen off`, `config set`, input commands, and system actions execute
-immediately without confirmation. Port 6000 is unauthenticated, and `system query
-network-profile` exposes the Wi-Fi passphrase. Use only on a trusted isolated network and back
-up memory values before writing.
+immediately without confirmation. Port 6000 is unauthenticated, and `network get-profile`
+exposes the Wi-Fi passphrase. Use only on a trusted isolated network and back up memory values
+before writing.

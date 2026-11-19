@@ -40,6 +40,7 @@ TOOLBOX_REMOTE_NAME = "toolbox.json"
 TOOLBOX_TEMP_NAME = "toolbox.json.new"
 DOCKER_IMAGE = "devkitpro/devkita64:20260219"
 EXPECTED_AUDIO_CAPABILITY = "volume,mute"
+EXPECTED_NETWORK_CONFIG = "ip-auto-manual,dns-auto-manual"
 
 
 def run_build() -> None:
@@ -119,10 +120,11 @@ def upload_and_rename(host: str, ftp_port: int) -> None:
         upload_verified_and_rename(
             ftp, TOOLBOX_ARTIFACT, TOOLBOX_TEMP_NAME, TOOLBOX_REMOTE_NAME)
     finally:
-        try:
-            ftp.quit()
-        except (ftplib.error_temp, ftplib.error_perm, OSError):
-            pass
+        if ftp.sock is not None:
+            try:
+                ftp.quit()
+            except (ftplib.error_temp, ftplib.error_perm, OSError):
+                ftp.close()
 
 
 def request_reboot(host: str, cmd_port: int, reboot_command: str) -> None:
@@ -158,6 +160,7 @@ def verify_build(host: str, cmd_port: int, timeout: float) -> bool:
                 version = client.get_version()
                 capabilities = client.system_capabilities()
             audio = capabilities.get("audio", "")
+            network_config = capabilities.get("networkConfig", "")
             print(f"verified sys-agent version={version}")
             if audio == EXPECTED_AUDIO_CAPABILITY:
                 print(f"verified new build: systemCapabilities audio={audio}")
@@ -167,6 +170,15 @@ def verify_build(host: str, cmd_port: int, timeout: float) -> bool:
             else:
                 print("warning: installed build does not advertise the audio capability; "
                       "the console may still run an older sys-agent")
+            if network_config == EXPECTED_NETWORK_CONFIG:
+                print(f"verified network configuration: {network_config}")
+            elif network_config:
+                print(f"warning: installed build advertises "
+                      f"networkConfig={network_config!r}, "
+                      f"expected {EXPECTED_NETWORK_CONFIG!r}")
+            else:
+                print("warning: installed build does not advertise automatic/manual "
+                      "network configuration; the console may still run an older sys-agent")
             return True
         except OSError as error:
             last_error = error
